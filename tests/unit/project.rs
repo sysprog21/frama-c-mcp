@@ -131,12 +131,12 @@ fn custom_machdep_paths_are_accepted() {
         );
     }
 
-    for rejected in ["", "-machdeps/custom"] {
-        assert!(
-            validate_project_options(&with_machdep(rejected)).is_err(),
-            "{rejected} is not a machdep argument"
-        );
-    }
+    // The one case this test adds. The empty string is already covered by
+    // machdep_and_compilation_database_reject_a_leading_dash above.
+    assert!(
+        validate_project_options(&with_machdep("-machdeps/custom")).is_err(),
+        "a machdep path written as a flag must be rejected"
+    );
 
     // A database path is whatever the caller's tree is called. Refusing a space
     // here would be this validator inventing a restriction, not closing one.
