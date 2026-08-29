@@ -17,13 +17,6 @@ use frama_c_mcp::mcp::server::selfcheck::{
     buggy_fixture_reason, fixed_fixture_reason,
 };
 
-/// `check` used to report verdict "proved" on a program whose own alarm payload
-/// carried an undischarged RTE assertion.
-///
-/// The array shape here is what the alarms want really returns: the whole
-/// kernel property table, contract clauses included. An earlier version of this
-/// test used a hand-shaped one-element array and passed while the live payload
-/// made every contracted program report incomplete.
 /// Guidance is carried once per code, not once per entry.
 ///
 /// The text is a pure function of the code, so an array with 417 PROPERTY_DEAD
@@ -57,6 +50,13 @@ fn guidance_is_carried_once_per_code() {
     assert!(!map.contains_key(""));
 }
 
+/// `check` used to report verdict "proved" on a program whose own alarm payload
+/// carried an undischarged RTE assertion.
+///
+/// The array shape here is what the alarms want really returns: the whole
+/// kernel property table, contract clauses included. An earlier version of this
+/// test used a hand-shaped one-element array and passed while the live payload
+/// made every contracted program report incomplete.
 #[test]
 fn undischarged_rte_alarm_makes_check_incomplete() {
     let properties = json!([
