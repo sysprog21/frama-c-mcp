@@ -507,6 +507,104 @@ fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf>
     paths
 }
 
+/// Every Frama-C request this server calls is named in a self_check table.
+///
+/// self_check's tables were a hand-copied mirror of the call sites, and the
+/// copy had drifted: measured on 2026-08-29, 79 distinct request names were
+/// called outside selfcheck.rs and 11 appeared in no table, so self_check could
+/// report a healthy install while the request behind a tool was missing.
+///
+/// Naming a request does not mean probing it. Five of those 11 must not be
+/// probed, and UNPROBED_REQUESTS records each with its reason, which is the
+/// point: "deliberately not probed" and "forgotten" used to look identical from
+/// here.
+#[test]
+fn every_frama_c_request_is_named_in_a_probe_table() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    rust_files(&root.join("src"), &mut sources);
+    assert!(!sources.is_empty(), "found no sources to scan");
+
+    let known: std::collections::HashSet<&str> =
+        frama_c_mcp::mcp::server::selfcheck::known_request_names()
+            .into_iter()
+            .collect();
+    assert!(known.len() > 50, "the probe tables look empty: {}", known.len());
+
+    let mut missing: Vec<String> = Vec::new();
+    for path in &sources {
+        // selfcheck.rs is where the tables live, so its own literals are the
+        // answer rather than the question.
+        if path.ends_with("selfcheck.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for name in request_names_in(&text) {
+            if !known.contains(name.as_str()) {
+                missing.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "these requests are called but named in no self_check table, so self_check \
+         cannot tell a missing one from a working one: {missing:?}"
+    );
+
+    // And the other direction. UNPROBED_REQUESTS claims each of its entries is
+    // called and deliberately not probed; an entry whose call site has gone
+    // makes that claim about nothing, and the table starts agreeing with itself
+    // instead of with the code. That is the fault this whole guard exists
+    // against, and it is free to close here.
+    let called: std::collections::HashSet<String> = sources
+        .iter()
+        .filter(|path| !path.ends_with("selfcheck.rs"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|text| request_names_in(&text))
+        .collect();
+    let stale: Vec<&str> = frama_c_mcp::mcp::server::selfcheck::UNPROBED_REQUESTS
+        .iter()
+        .map(|&(request, _)| request)
+        .filter(|request| !called.contains(*request))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these are listed as deliberately unprobed but nothing calls them any more; \
+         drop them from UNPROBED_REQUESTS: {stale:?}"
+    );
+}
+
+/// Frama-C request-name literals in a Rust source.
+///
+/// A name is "kernel." or "plugins." followed by dotted segments, inside double
+/// quotes. Matched by hand rather than with a regex because the shape is fixed
+/// and this file has no other use for the dependency.
+fn request_names_in(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, _) in text.match_indices('"') {
+        let rest = &text[index + 1..];
+        let Some(end) = rest.find('"') else { continue };
+        let candidate = &rest[..end];
+        if !(candidate.starts_with("kernel.") || candidate.starts_with("plugins.")) {
+            continue;
+        }
+        if candidate.contains(' ') || !candidate.contains('.') {
+            continue;
+        }
+        if candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            found.push(candidate.to_string());
+        }
+    }
+    found
+}
+
 /// Every workflow file, sorted.
 ///
 /// The directory rather than ci.yml by name, which is the lesson
