@@ -9,6 +9,21 @@ mod receipt_fixture;
 
 use receipt_fixture::fixture_receipt_json as receipt_json;
 
+/// The hash a fixture receipt carries, for assertions that used to name one.
+///
+/// Fixtures hold real hashes now, because store_conclusion recomputes the value
+/// and refuses a receipt that disagrees with itself, so a test cannot pick a
+/// readable string and assert it back.
+fn receipt_sha(
+    label: &str,
+    environment: serde_json::Value,
+    goals: Vec<serde_json::Value>,
+) -> String {
+    receipt_fixture::fixture_receipt(label, environment, goals)["sha256"]
+        .as_str()
+        .expect("fixture receipt carries a sha256")
+        .to_string()
+}
 
 
 
@@ -830,7 +845,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
     assert_eq!(conclusions[0]["wp_summary"]["valid"], 1);
     assert_eq!(
         conclusions[0]["verified_with"]["proof_receipt_sha256"],
-        "sha-shape"
+        receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})])
     );
 
     let payload = tool_payload(&mcp.call_tool(
@@ -857,8 +872,8 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
     assert!(payload["callees"].is_array());
     assert!(payload["callee_spec_hashes"].is_object());
     assert!(payload["stale_dependencies"].is_array());
-    assert_eq!(payload["proof_receipt"]["sha256"], "sha-shape");
-    assert_eq!(payload["verified_with"]["proof_receipt_sha256"], "sha-shape");
+    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
+    assert_eq!(payload["verified_with"]["proof_receipt_sha256"], receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
     assert!(payload.get("proposed_requires").is_none());
     assert!(payload["wp_summary"].is_object());
     assert_eq!(payload["sandbox_clean"], true);
@@ -960,7 +975,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         r#"{"kind":"conclusions","function":"shape_env_a"}"#,
     ));
     assert_eq!(payload["status"], "in_progress");
-    assert_eq!(payload["proof_receipt"]["sha256"], "sha-a");
+    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-a", serde_json::json!({"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
     assert!(payload["proof_env_hash"].as_str().is_some());
     assert!(payload["stale_proof_environment"]["current_env_hash"].as_str().is_some());
 }

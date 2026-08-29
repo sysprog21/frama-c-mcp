@@ -3,7 +3,94 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mcp::server::receipt::{receipt_shape, schema_of, RECEIPT_SCHEMA};
+use crate::mcp::server::receipt::RECEIPT_SCHEMA;
+
+/// Why a receipt is not evidence this build can stand behind, or None.
+///
+/// One definition, because the two callers used to disagree. store_conclusion
+/// checked the name, the shape, the hash and the goals; the loader checked the
+/// name and shape alone, so a stored meta.json carrying this build's field set
+/// and nothing believable in it loaded as verified, and then could never be
+/// stored again because the store path applied the checks the loader had
+/// skipped. A conclusion that cannot be written should not be readable either.
+///
+/// The shape says the receipt has the fields this build writes. It does not say
+/// this build wrote the values, and nothing here can: the digest is computed
+/// from public data, so a caller willing to assemble a whole receipt can pass
+/// one. What these checks buy is that a receipt has to be internally coherent
+/// with the conclusion it supports, which is what catches the accidental cases,
+/// a truncated file or a hand-edited one, rather than a determined forger.
+pub fn proof_receipt_evidence_error(
+    receipt: &serde_json::Value,
+    goal_total: u32,
+) -> Option<String> {
+    let schema = receipt.get("schema").and_then(|v| v.as_str());
+    let shape = crate::mcp::server::receipt::schema_of(receipt);
+    let expected_shape = crate::mcp::server::receipt::receipt_shape();
+    if schema != Some(RECEIPT_SCHEMA) || shape != expected_shape {
+        return Some(format!(
+            "proof_receipt is not one this build wrote (name {:?}, expected {:?}; field shape {}, \
+             expected {}). Pass back the proof_receipt this server returned, unchanged.",
+            schema.unwrap_or("<missing>"),
+            RECEIPT_SCHEMA,
+            shape,
+            expected_shape
+        ));
+    }
+    let Some(stamped) = receipt.get("sha256").and_then(|v| v.as_str()) else {
+        return Some("missing proof_receipt sha256".to_string());
+    };
+
+    // Recomputed, not merely present. The shape says the receipt has the fields
+    // this build writes; the hash says the values are the ones it wrote them
+    // with, which is what catches a receipt edited after the fact while its
+    // field set stayed intact.
+    //
+    // Rebuilt by filtering rather than by removing the key, because a removal
+    // from an order-preserving map may reorder the rest and the hash is over
+    // the serialized bytes. proof_receipt_with_hash appends "sha256" last, so
+    // dropping it restores exactly the body that was hashed.
+    //
+    // This is not authentication and cannot be. The digest is over public data
+    // with no key, so a caller willing to assemble a whole receipt can produce
+    // a consistent one. A keyed MAC would not fit either: a receipt is meant to
+    // be comparable across processes and machines, and a per-process key makes
+    // two receipts incomparable while a stored key sits next to the receipts it
+    // guards. What this buys is that a receipt is coherent with itself, which
+    // is the accidental case, a truncated or hand-edited file, rather than a
+    // determined forger who could equally have run the proof.
+    let body: serde_json::Map<String, serde_json::Value> = match receipt.as_object() {
+        Some(fields) => fields
+            .iter()
+            .filter(|(key, _)| key.as_str() != "sha256")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        None => return Some("proof_receipt is not an object".to_string()),
+    };
+    let recomputed = sha256_hex(&serde_json::to_vec(&body).unwrap_or_default());
+    if recomputed != stamped {
+        return Some(format!(
+            "proof_receipt sha256 does not match its own contents (stamped {stamped}, \
+             recomputed {recomputed}); pass back the receipt this server returned, unchanged"
+        ));
+    }
+    let Some(goals) = receipt.get("goals").and_then(|v| v.as_array()) else {
+        return Some("missing proof_receipt goals".to_string());
+    };
+    if goals.is_empty() {
+        return Some("proof_receipt has no goals".to_string());
+    }
+    if goals.len() as u32 != goal_total {
+        return Some("proof_receipt goal count does not match wp_summary".to_string());
+    }
+    if goals
+        .iter()
+        .any(|goal| goal.get("status").and_then(|v| v.as_str()) != Some("valid"))
+    {
+        return Some("proof_receipt goals are not all valid".to_string());
+    }
+    None
+}
 
 /// A SHA-256 digest as lower case hex, two digits per byte, no separator.
 ///
@@ -855,45 +942,11 @@ impl SessionState {
         // the name alone did not do it: a hand-assembled four-key object
         // wearing the right name stored fine.
         //
-        // One shape, the one this build writes, asked of the writer rather than
-        // spelled here. Nothing carries backward compatibility except toward
-        // Frama-C, and a receipt is where accepting an older one actively costs
-        // something: every shape hashes differently over identical work, so a
-        // table holding two of them stores evidence in units that do not
-        // convert. The point of a receipt is that two are comparable, and a
-        // mixed table is exactly where that stops being true.
-        //
-        // Both halves are reported, because the shape is a digest nobody can
-        // guess and the two failures are not the same mistake.
-        let schema = receipt.get("schema").and_then(|v| v.as_str());
-        let shape = schema_of(receipt);
-        let expected_shape = receipt_shape();
-        if schema != Some(RECEIPT_SCHEMA) || shape != expected_shape {
+        if let Some(reason) = proof_receipt_evidence_error(receipt, summary.total) {
             return Err(format!(
-                "cannot store verified conclusion for '{}': proof_receipt is not one this build wrote \
-                 (name {:?}, expected {:?}; field shape {}, expected {}). Pass back the proof_receipt \
-                 this server returned, unchanged.",
-                entry.function,
-                schema.unwrap_or("<missing>"),
-                RECEIPT_SCHEMA,
-                shape,
-                expected_shape
+                "cannot store verified conclusion for '{}': {reason}",
+                entry.function
             ));
-        }
-        if receipt.get("sha256").and_then(|v| v.as_str()).is_none() {
-            return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt sha256", entry.function));
-        }
-        let Some(goals) = receipt.get("goals").and_then(|v| v.as_array()) else {
-            return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt goals", entry.function));
-        };
-        if goals.is_empty() {
-            return Err(format!("cannot store verified conclusion for '{}': proof_receipt has no goals", entry.function));
-        }
-        if goals.len() as u32 != summary.total {
-            return Err(format!("cannot store verified conclusion for '{}': proof_receipt goal count does not match wp_summary", entry.function));
-        }
-        if goals.iter().any(|goal| goal.get("status").and_then(|v| v.as_str()) != Some("valid")) {
-            return Err(format!("cannot store verified conclusion for '{}': proof_receipt goals are not all valid", entry.function));
         }
         Ok(())
     }

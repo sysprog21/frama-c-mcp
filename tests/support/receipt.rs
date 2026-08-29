@@ -12,20 +12,29 @@
 //! fixture cannot drift from the format at all.
 #![allow(dead_code)]
 
-use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody};
+use frama_c_mcp::mcp::server::receipt::{
+    proof_receipt_body, proof_receipt_with_hash, ProofReceiptBody,
+};
 
-/// A receipt carrying "goals", under a caller-chosen "sha256" and environment.
+/// A receipt carrying "goals", under a caller-chosen label and environment.
 ///
-/// The hash is passed in rather than computed, because several tests compare
-/// two conclusions by the environment they name and need the rest to stay put.
+/// The hash is real, computed by proof_receipt_with_hash over the body, because
+/// store_conclusion recomputes it and refuses a receipt whose hash does not
+/// match its own contents. A fixture stamping a readable string there stopped
+/// being loadable, which is the check doing its job: a fixture that could not
+/// be stored was never a fixture for a stored receipt.
+///
+/// The label reaches the body through the source file name, so two fixtures
+/// that differ only by label still get different hashes and the tests that tell
+/// two conclusions apart by their receipt keep working.
 pub fn fixture_receipt(
-    sha256: &str,
+    label: &str,
     environment: serde_json::Value,
     goals: Vec<serde_json::Value>,
 ) -> serde_json::Value {
-    let mut receipt = proof_receipt_body(ProofReceiptBody {
+    proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "check",
-        source_files: vec![serde_json::json!({"path": "a.c", "sha256": "h"})],
+        source_files: vec![serde_json::json!({"path": format!("{label}.c"), "sha256": "h"})],
         ast_digest: serde_json::json!("ast"),
         ast_digest_unavailable_reason: serde_json::json!(null),
         contracts: serde_json::json!({}),
@@ -35,16 +44,14 @@ pub fn fixture_receipt(
         goals,
         goals_status_source: "wp_fetch_goals",
         reported: serde_json::json!({}),
-    });
-    receipt["sha256"] = serde_json::json!(sha256);
-    receipt
+    }))
 }
 
 /// The same receipt as a compact JSON string, for payloads built as raw text.
 pub fn fixture_receipt_json(
-    sha256: &str,
+    label: &str,
     environment: serde_json::Value,
     goals: Vec<serde_json::Value>,
 ) -> String {
-    serde_json::to_string(&fixture_receipt(sha256, environment, goals)).unwrap()
+    serde_json::to_string(&fixture_receipt(label, environment, goals)).unwrap()
 }

@@ -558,7 +558,12 @@ fn round_trip_reachable_conclusion_fields() {
     assert_eq!(stored.wp_summary.as_ref().unwrap().valid, 1);
     assert_eq!(stored.notes, "ok");
     assert_eq!(stored.callees, vec!["g".to_string(), "h".to_string()]);
-    assert_eq!(stored.proof_receipt.as_ref().unwrap()["sha256"], "sha-env-a");
+    // Its own hash, not a chosen string: store_conclusion recomputes it, so a
+    // fixture carries the real one and the assertion has to ask the receipt.
+    assert_eq!(
+        stored.proof_receipt.as_ref().unwrap()["sha256"],
+        proof_receipt("env-a")["sha256"]
+    );
     assert!(stored.proof_env_hash.is_some());
 
     let original_json = serde_json::to_value(&stored).expect("serialize");
@@ -589,11 +594,14 @@ fn verified_requires_auditable_proof_evidence() {
         function: "F".into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some({
-            let mut receipt = proof_receipt("bad");
-            receipt["goals"][0]["status"] = serde_json::json!("unknown");
-            receipt
-        }),
+        // Built with the bad goal rather than spoiled afterwards. Editing a
+        // finished receipt invalidates its hash, so the hash check would fire
+        // first and this case would pass for the wrong reason.
+        proof_receipt: Some(crate::receipt_fixture::fixture_receipt(
+            "bad",
+            serde_json::json!({"frama_c_version": "env-a"}),
+            vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
+        )),
         ..Default::default()
     });
     assert!(bad_goal.unwrap_err().contains("not all valid"));

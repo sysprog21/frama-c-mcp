@@ -11,7 +11,6 @@ use std::path::{Component, Path, PathBuf};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 
-use crate::mcp::server::receipt::{receipt_shape, schema_of, RECEIPT_SCHEMA};
 use crate::state::VerificationStatus;
 
 use crate::state::{
@@ -636,15 +635,23 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
         // fail-loud rule inverted. ci_sets_rust_log_for_the_stdio_suite records
         // the same fact for the recovered-race warning.
         if conclusion.status == VerificationStatus::Verified {
-            let receipt = conclusion.proof_receipt.as_ref();
-            if receipt.and_then(|receipt| receipt["schema"].as_str()) != Some(RECEIPT_SCHEMA)
-                || receipt.map(schema_of).as_deref() != Some(receipt_shape())
-            {
+            // The same checks the store path applies, not a subset of them.
+            // Checking only the name and shape here left a receipt with this
+            // build's field set but no believable contents loading as verified,
+            // and then failing to store, so the conclusion could be read but
+            // never written again.
+            let total = conclusion.wp_summary.as_ref().map(|s| s.total).unwrap_or(0);
+            let reason = match conclusion.proof_receipt.as_ref() {
+                Some(receipt) => crate::state::proof_receipt_evidence_error(receipt, total),
+                None => Some("missing proof_receipt".to_string()),
+            };
+            if let Some(reason) = reason {
                 tracing::error!(
                     function = %func,
                     path = %path.display(),
-                    "proof_receipt was not written by this build; the conclusion is no longer \
-                     verified. Re-run verification to restore it."
+                    reason = %reason,
+                    "stored proof_receipt is not evidence this build can stand behind; the \
+                     conclusion is no longer verified. Re-run verification to restore it."
                 );
                 conclusion.status = VerificationStatus::InProgress;
                 conclusion.proof_receipt = None;
