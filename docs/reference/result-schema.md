@@ -36,6 +36,7 @@ null either way, not absent, and `incomplete[]` is what tells the two apart.
 | `schema` | string | `frama-c-mcp.check.v2` |
 | `verdict` | string | `proved` or `incomplete`. Nothing else; there is no `failed` |
 | `incomplete` | array | Empty exactly when `verdict` is `proved` |
+| `incomplete_guidance` | object | What to write to close a gap, keyed by `incomplete[].code`. Present for the codes that have advice and absent for the rest, so a lookup can miss. It lives here rather than on each entry because the text is a function of the code alone |
 | `detail` | string or null | `summary`, `full`, or null when the reload failed and nothing was summarized |
 | `reload` | object | Reload result, or its error |
 | `eva` | object or null | EVA run result; null when the reload failed or `want` excluded it |

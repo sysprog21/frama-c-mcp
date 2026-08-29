@@ -1093,7 +1093,7 @@ fn step_failure_gaps(
 /// been told a lemma is undischarged still has to know that no SMT prover will
 /// find the induction, and that waiting longer is not the fix. Codes whose
 /// remedy depends on the program say nothing here rather than guess.
-fn gap_guidance(code: &str) -> serde_json::Value {
+pub fn gap_guidance(code: &str) -> serde_json::Value {
     let guidance = match code {
         incomplete_code::LEMMA_NOT_PROVED => {
             "An SMT prover does not do induction, so a lemma over a recursive logic function or an \
@@ -1188,15 +1188,36 @@ fn property_row_gaps(
                 "descr": alarm.get("descr").cloned().unwrap_or_else(|| json!(null)),
                 "source_location": alarm.get("source_location").cloned().unwrap_or_else(|| json!(null)),
                 "status": property_normalized_status(alarm),
-
-                // What to write, where the gap has a known shape. The reason
-                // says what is missing; a reader still has to know which edit
-                // closes it, and for a lemma the obvious reading, that the
-                // prover needed longer, is the wrong one.
-                "guidance": gap_guidance(code),
             }));
         }
     }
+}
+
+/// The guidance for the codes an incomplete[] actually carries, keyed by code.
+///
+/// gap_guidance is a pure function of the code, so every entry sharing a code
+/// carried a byte-identical paragraph. Measured on a 1,144-line file: 110,509
+/// bytes across 418 entries and two distinct strings, so 110,240 of it was one
+/// of two paragraphs repeated. The array stays complete, which is what the
+/// fail-loud rule is about; only the repetition goes.
+///
+/// A map rather than one entry in N: a reader wanting the advice for an entry
+/// looks up its own "code", which it already has.
+pub fn incomplete_guidance(incomplete: &[serde_json::Value]) -> serde_json::Value {
+    let mut guidance = serde_json::Map::new();
+    for entry in incomplete {
+        let Some(code) = entry.get("code").and_then(|code| code.as_str()) else {
+            continue;
+        };
+        if guidance.contains_key(code) {
+            continue;
+        }
+        let text = gap_guidance(code);
+        if !text.is_null() {
+            guidance.insert(code.to_string(), text);
+        }
+    }
+    serde_json::Value::Object(guidance)
 }
 
 /// Gaps carried by WP's own goals.
@@ -2509,6 +2530,7 @@ impl FramaCMcpServer {
         let mut payload = json!({
             "schema": CHECK_SCHEMA,
             "verdict": "incomplete",
+            "incomplete_guidance": incomplete_guidance(&incomplete),
             "incomplete": incomplete,
 
             // Null rather than absent, and null rather than "summary": the
@@ -2807,6 +2829,7 @@ impl FramaCMcpServer {
         let mut payload = json!({
             "schema": CHECK_SCHEMA,
             "verdict": verdict,
+            "incomplete_guidance": incomplete_guidance(&incomplete),
             "incomplete": incomplete,
 
             // Same key order as the reload-failure payload above and as the

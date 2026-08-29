@@ -7268,6 +7268,7 @@ async fn check_returns_one_field_set_on_both_paths() {
         "eva",
         "eva_alarms",
         "incomplete",
+        "incomplete_guidance",
         "messages",
         "messages_truncated",
         "proof_receipt",
