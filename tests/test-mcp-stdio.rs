@@ -31,7 +31,10 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
-use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody, RECEIPT_SCHEMA};
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -62,28 +65,15 @@ fn unique_experiment_id(prefix: &str) -> String {
 }
 
 fn verified_conclusion_payload(function: &str) -> Value {
-    // The receipt goes through the real builder. store_conclusion checks the
-    // field set and not only the name, so a hand-written four-key object is
-    // refused; these fixtures were the thing exploiting the weaker check.
-    let mut receipt = proof_receipt_body(ProofReceiptBody {
-        tool: "check",
-        source_files: vec![json!({"path": "a.c", "sha256": "h"})],
-        ast_digest: json!("ast"),
-        ast_digest_unavailable_reason: json!(null),
-        contracts: json!({}),
-        environment: json!({"frama_c_version": "test"}),
-        wp_config: json!({}),
-        eva_config: json!({}),
-        goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
-        goals_status_source: "wp_fetch_goals",
-        reported: json!({}),
-    });
-    receipt["sha256"] = json!(format!("sha-{function}"));
     json!({
         "function": function,
         "status": "verified",
         "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
-        "proof_receipt": receipt
+        "proof_receipt": receipt_fixture::fixture_receipt(
+            &format!("sha-{function}"),
+            json!({"frama_c_version": "test"}),
+            vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+        )
     })
 }
 

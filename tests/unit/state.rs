@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use frama_c_mcp::state::*;
-use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody, RECEIPT_SCHEMA};
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 
 #[test]
 fn sandbox_metadata_serializes_without_runtime_handles() {
@@ -92,37 +92,15 @@ fn valid_wp_summary(total: u32) -> WpGoalSummary {
 }
 
 /// A receipt shaped the way this build writes them.
-///
-/// Built through proof_receipt_body rather than hand-assembled, because
-/// store_conclusion now checks the shape and not just the schema string. A
-/// four-key literal with the right string used to store fine, which is the hole
-/// that check closes; these fixtures were the thing exploiting it.
 fn proof_receipt_with_goals(env: &str, total: u32) -> serde_json::Value {
     let goals: Vec<_> = (0..total)
         .map(|i| serde_json::json!({"stable_goal_id": format!("g{i}"), "status": "valid"}))
         .collect();
-    let mut receipt = proof_receipt_body(ProofReceiptBody {
-        tool: "check",
-        source_files: vec![serde_json::json!({"path": "a.c", "sha256": "h"})],
-        ast_digest: serde_json::json!("ast"),
-        ast_digest_unavailable_reason: serde_json::json!(null),
-        contracts: serde_json::json!({}),
-        environment: serde_json::json!({
-            "frama_c_version": env,
-            "why3_provers": "Alt-Ergo"
-        }),
-        wp_config: serde_json::json!({}),
-        eva_config: serde_json::json!({}),
+    crate::receipt_fixture::fixture_receipt(
+        &format!("sha-{env}"),
+        serde_json::json!({"frama_c_version": env, "why3_provers": "Alt-Ergo"}),
         goals,
-        goals_status_source: "wp_fetch_goals",
-        reported: serde_json::json!({}),
-    });
-
-    // A fixed hash, so tests that compare two receipts by their environment are
-    // comparing the thing they name. proof_receipt_with_hash would make every
-    // fixture differ by its goals as well.
-    receipt["sha256"] = serde_json::json!(format!("sha-{env}"));
-    receipt
+    )
 }
 
 fn proof_receipt(env: &str) -> serde_json::Value {
@@ -612,9 +590,6 @@ fn verified_requires_auditable_proof_evidence() {
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary(1)),
         proof_receipt: Some({
-            // Through the builder, then spoiled. A hand-written literal stops
-            // at the shape check now and never reaches the goal check this case
-            // is about, so it would pass for the wrong reason.
             let mut receipt = proof_receipt("bad");
             receipt["goals"][0]["status"] = serde_json::json!("unknown");
             receipt

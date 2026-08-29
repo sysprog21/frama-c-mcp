@@ -7,7 +7,10 @@
 //! subagent guard; its content moved into `semiformal_proof.md`. The negative
 //! assertions below keep it from coming back.
 
-use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody, RECEIPT_SCHEMA};
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 use frama_c_mcp::mcp::store::{
     expected_sandbox_dir, load_conclusion_dir, load_conclusions_from_disk,
     load_sandbox_metadata_from_disk, persist_conclusion_at, read_long_texts_as_json,
@@ -34,25 +37,12 @@ fn valid_wp_summary() -> WpGoalSummary {
 }
 
 /// A receipt shaped the way this build writes them.
-///
-/// Through proof_receipt_body rather than a literal, because store_conclusion
-/// checks the receipt's field set and not just its schema string.
 fn proof_receipt() -> serde_json::Value {
-    let mut receipt = proof_receipt_body(ProofReceiptBody {
-        tool: "check",
-        source_files: vec![serde_json::json!({"path": "a.c", "sha256": "h"})],
-        ast_digest: serde_json::json!("ast"),
-        ast_digest_unavailable_reason: serde_json::json!(null),
-        contracts: serde_json::json!({}),
-        environment: serde_json::json!({"frama_c_version": "31.0"}),
-        wp_config: serde_json::json!({}),
-        eva_config: serde_json::json!({}),
-        goals: vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
-        goals_status_source: "wp_fetch_goals",
-        reported: serde_json::json!({}),
-    });
-    receipt["sha256"] = serde_json::json!("receipt-sha");
-    receipt
+    receipt_fixture::fixture_receipt(
+        "receipt-sha",
+        serde_json::json!({"frama_c_version": "31.0"}),
+        vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
+    )
 }
 
 /// A conclusion whose receipt this build did not write loads as unverified,

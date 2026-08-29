@@ -4,35 +4,13 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
-/// A receipt shaped the way this build writes them, as compact JSON.
-///
-/// These payloads are raw JSON strings handed to the tool, and store_conclusion
-/// checks the receipt's field set rather than only its schema string, so a
-/// hand-written four-key object no longer stores. Built through the real
-/// builder and serialized, so a fixture cannot drift from the format.
-fn receipt_json(
-    sha: &str,
-    environment: serde_json::Value,
-    goals: Vec<serde_json::Value>,
-) -> String {
-    let mut receipt = frama_c_mcp::mcp::server::receipt::proof_receipt_body(
-        frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
-            tool: "check",
-            source_files: vec![serde_json::json!({"path": "a.c", "sha256": "h"})],
-            ast_digest: serde_json::json!("ast"),
-            ast_digest_unavailable_reason: serde_json::json!(null),
-            contracts: serde_json::json!({}),
-            environment,
-            wp_config: serde_json::json!({}),
-            eva_config: serde_json::json!({}),
-            goals,
-            goals_status_source: "wp_fetch_goals",
-            reported: serde_json::json!({}),
-        },
-    );
-    receipt["sha256"] = serde_json::json!(sha);
-    serde_json::to_string(&receipt).unwrap()
-}
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
+use receipt_fixture::fixture_receipt_json as receipt_json;
+
+
+
 
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};

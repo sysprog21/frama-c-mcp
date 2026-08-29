@@ -8,6 +8,9 @@
 //! Every module needs an explicit path: this file is a target root, so its
 //! module directory is tests/ rather than tests/unit/.
 
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
 #[path = "unit/acsl-shapes.rs"]
 mod acsl_shapes;
 #[path = "unit/check-gaps.rs"]
