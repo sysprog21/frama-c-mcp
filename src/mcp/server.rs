@@ -2069,7 +2069,7 @@ fn scope_for_function(function: &str) -> FunctionScope<'_> {
 /// field existed.
 ///
 /// The text block stays, and stays pretty-printed. Clients below 2025-06-18 see
-/// only content, docs/reference/result-schema.md is written against that text,
+/// only content, docs/architecture.md is written against that text,
 /// and this server's own readers parse it: see tool_result_json and the stdio
 /// tests. CallToolResult::structured is not used for the same reason, since it
 /// writes the compact form into content.
@@ -4100,7 +4100,7 @@ impl ServerHandler for FramaCMcpServer {
         if !structured_is_known {
             if let rmcp::model::CallToolResponse::Complete(result) = &mut response {
                 // The text block carries the same document, so nothing is lost:
-                // docs/reference/result-schema.md is written against it and it
+                // docs/architecture.md is written against it and it
                 // is what these revisions have always read.
                 result.structured_content = None;
             }

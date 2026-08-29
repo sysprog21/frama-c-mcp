@@ -400,7 +400,7 @@ step that did not run, timed out, or was skipped becomes an `incomplete[]`
 entry, and the verdict falls back to `incomplete` even when nothing failed.
 
 Every entry carries a `code`, and only the code is frozen; see
-[docs/reference/result-schema.md](docs/reference/result-schema.md) for the
+[docs/architecture.md](docs/architecture.md) for the
 payload contract and the change rule. The full set:
 
 <!-- incomplete-codes -->
@@ -437,11 +437,11 @@ run, each with its plugin and source location. A generated `assigns` for an
 uncontracted callee is announced there and nowhere else, and it weakens every
 proof above it.
 
-`check`, `run_wp`, and stored conclusions carry a `proof_receipt`
-(`frama-c-mcp.proof-receipt.v4`): the source-file hash, an `ast_digest`, the
-Frama-C and prover environment, the effective EVA and WP configurations, per-goal
-statuses, and a sha256 over all of it. Two runs are comparable exactly when
-their receipts match.
+`check`, `run_wp`, and stored conclusions carry a `proof_receipt`: the
+source-file hash, an `ast_digest`, the
+Frama-C and prover environment, the effective EVA and WP configurations,
+per-goal statuses, and a sha256 over all of it. Two runs are comparable exactly
+when their receipts match.
 
 What it reports about `incomplete[]` is a digest, `{count, codes, sha256}`, not
 the array. The array is already one key away at the payload's top level, and
@@ -515,7 +515,7 @@ had none, which happens when the ast-utils plug-in is absent or printing the AST
 outran its budget, and a non-zero count also forces `incomplete`: those variants
 were compared to nothing, and a comparison that did not happen must not read as
 one that happened and found nothing. Field list in
-[docs/reference/result-schema.md](docs/reference/result-schema.md), under the
+[docs/architecture.md](docs/architecture.md), under the
 `frama-c-mcp.check-variants.v1` schema this call returns instead of the usual
 one.
 

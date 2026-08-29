@@ -9,7 +9,7 @@ use frama_c_mcp::mcp::server::selfcheck;
 /// The check payload's frozen vocabulary, in the three places it is written.
 ///
 /// The incomplete codes are a published contract: agents branch on them,
-/// README tabulates them, and docs/reference/result-schema.md freezes them.
+/// README tabulates them and docs/architecture.md freezes the schema string.
 /// They were thirteen string literals with nothing connecting the emitters to
 /// the documents, and the set drifted twice before anyone noticed. Deriving
 /// both tables from the documents and comparing against the one list in the
@@ -57,22 +57,21 @@ fn incomplete_codes_match_their_documentation() {
         "README's code table disagrees with incomplete_code::ALL"
     );
 
-    let schema = std::fs::read_to_string(concat!(
+    // The table is in README once, not in two documents. It used to be in a
+    // second reference page as well, and keeping three copies in step is the
+    // drift this test exists against; one document and one source list is the
+    // smallest pair that still catches it.
+    //
+    // The architecture page carries the compatibility history instead, so a
+    // schema bump in the code with no row explaining it fails here too.
+    let architecture = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/reference/result-schema.md"
+        "/docs/architecture.md"
     ))
-    .expect("read docs/reference/result-schema.md");
-    assert_eq!(
-        table_codes(&schema),
-        source,
-        "result-schema.md disagrees with incomplete_code::ALL"
-    );
-
-    // The document names the schema string it freezes, so a version bump in the
-    // code with no compatibility-history row fails here too.
+    .expect("read docs/architecture.md");
     assert!(
-        schema.contains(&format!("| `{CHECK_SCHEMA}` |")),
-        "result-schema.md has no compatibility-history row for {CHECK_SCHEMA}"
+        architecture.contains(&format!("| `{CHECK_SCHEMA}` |")),
+        "docs/architecture.md has no compatibility-history row for {CHECK_SCHEMA}"
     );
 }
 
@@ -685,13 +684,12 @@ fn workflow_jobs(text: &str) -> Vec<(String, String)> {
         }
 
         // A trailing comment does not stop a line from naming a job, and YAML
-        // allows one. Testing the raw line for a closing colon made
-        // "  build:  # note" fail the test, which merged that job into its
-        // predecessor and let a caller searching one body read two jobs as one.
-        // The spacing in that example is the point and is not reflowed: two
-        // spaces of YAML indent, two before the comment marker. Found by a
-        // control that added such a comment; the guard it broke was failing
-        // green.
+        // allows one. Testing the raw line for a closing colon made " build: #
+        // note" fail the test, which merged that job into its predecessor and
+        // let a caller searching one body read two jobs as one. The spacing in
+        // that example is the point and is not reflowed: two spaces of YAML
+        // indent, two before the comment marker. Found by a control that added
+        // such a comment; the guard it broke was failing green.
         let header = match line.split_once(" #") {
             Some((before, _)) => before,
             None => line,

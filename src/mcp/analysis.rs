@@ -909,7 +909,7 @@ pub fn check_blocked_reason(incomplete: &[serde_json::Value]) -> String {
 
 /// Every reason check can put in its incomplete array, named once.
 ///
-/// These are a published vocabulary: docs/reference/result-schema.md freezes
+/// These are a published vocabulary: docs/architecture.md freezes
 /// them, README tabulates them, and agents branch on them. They were thirteen
 /// string literals spread over one match and eight push sites, so nothing
 /// connected the emitters to the documents, and the set drifted twice before
@@ -2833,7 +2833,7 @@ impl FramaCMcpServer {
             "incomplete": incomplete,
 
             // Same key order as the reload-failure payload above and as the
-            // table in docs/reference/result-schema.md, so the two build sites
+            // table in docs/architecture.md, so the two build sites
             // of one field set can be read side by side.
             "detail": if summarize { "summary" } else { "full" },
             "reload": reload,
