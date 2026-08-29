@@ -9,7 +9,7 @@ use frama_c_mcp::mcp::server::selfcheck;
 /// The check payload's frozen vocabulary, in the three places it is written.
 ///
 /// The incomplete codes are a published contract: agents branch on them,
-/// README tabulates them, and docs/reference/result-schema.md freezes them.
+/// README tabulates them and docs/architecture.md freezes the schema string.
 /// They were thirteen string literals with nothing connecting the emitters to
 /// the documents, and the set drifted twice before anyone noticed. Deriving
 /// both tables from the documents and comparing against the one list in the
@@ -57,22 +57,21 @@ fn incomplete_codes_match_their_documentation() {
         "README's code table disagrees with incomplete_code::ALL"
     );
 
-    let schema = std::fs::read_to_string(concat!(
+    // The table is in README once, not in two documents. It used to be in a
+    // second reference page as well, and keeping three copies in step is the
+    // drift this test exists against; one document and one source list is the
+    // smallest pair that still catches it.
+    //
+    // The architecture page carries the compatibility history instead, so a
+    // schema bump in the code with no row explaining it fails here too.
+    let architecture = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/docs/reference/result-schema.md"
+        "/docs/architecture.md"
     ))
-    .expect("read docs/reference/result-schema.md");
-    assert_eq!(
-        table_codes(&schema),
-        source,
-        "result-schema.md disagrees with incomplete_code::ALL"
-    );
-
-    // The document names the schema string it freezes, so a version bump in the
-    // code with no compatibility-history row fails here too.
+    .expect("read docs/architecture.md");
     assert!(
-        schema.contains(&format!("| `{CHECK_SCHEMA}` |")),
-        "result-schema.md has no compatibility-history row for {CHECK_SCHEMA}"
+        architecture.contains(&format!("| `{CHECK_SCHEMA}` |")),
+        "docs/architecture.md has no compatibility-history row for {CHECK_SCHEMA}"
     );
 }
 
@@ -507,9 +506,108 @@ fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf>
     paths
 }
 
+/// Every Frama-C request this server calls is named in a self_check table.
+///
+/// self_check's tables were a hand-copied mirror of the call sites, and the
+/// copy had drifted: measured on 2026-08-29, 79 distinct request names were
+/// called outside selfcheck.rs and 11 appeared in no table, so self_check could
+/// report a healthy install while the request behind a tool was missing.
+///
+/// Naming a request does not mean probing it. Five of those 11 must not be
+/// probed, and UNPROBED_REQUESTS records each with its reason, which is the
+/// point: "deliberately not probed" and "forgotten" used to look identical from
+/// here.
+#[test]
+fn every_frama_c_request_is_named_in_a_probe_table() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    rust_files(&root.join("src"), &mut sources);
+    assert!(!sources.is_empty(), "found no sources to scan");
+
+    let known: std::collections::HashSet<&str> =
+        frama_c_mcp::mcp::server::selfcheck::known_request_names()
+            .into_iter()
+            .collect();
+    assert!(known.len() > 50, "the probe tables look empty: {}", known.len());
+
+    let mut missing: Vec<String> = Vec::new();
+    for path in &sources {
+        // selfcheck.rs is where the tables live, so its own literals are the
+        // answer rather than the question.
+        if path.ends_with("selfcheck.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for name in request_names_in(&text) {
+            if !known.contains(name.as_str()) {
+                missing.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "these requests are called but named in no self_check table, so self_check \
+         cannot tell a missing one from a working one: {missing:?}"
+    );
+
+    // And the other direction. UNPROBED_REQUESTS claims each of its entries is
+    // called and deliberately not probed; an entry whose call site has gone
+    // makes that claim about nothing, and the table starts agreeing with itself
+    // instead of with the code. That is the fault this whole guard exists
+    // against, and it is free to close here.
+    let called: std::collections::HashSet<String> = sources
+        .iter()
+        .filter(|path| !path.ends_with("selfcheck.rs"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|text| request_names_in(&text))
+        .collect();
+    let stale: Vec<&str> = frama_c_mcp::mcp::server::selfcheck::UNPROBED_REQUESTS
+        .iter()
+        .map(|&(request, _)| request)
+        .filter(|request| !called.contains(*request))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these are listed as deliberately unprobed but nothing calls them any more; \
+         drop them from UNPROBED_REQUESTS: {stale:?}"
+    );
+}
+
+/// Frama-C request-name literals in a Rust source.
+///
+/// A name is "kernel." or "plugins." followed by dotted segments, inside double
+/// quotes. Matched by hand rather than with a regex because the shape is fixed
+/// and this file has no other use for the dependency.
+fn request_names_in(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, _) in text.match_indices('"') {
+        let rest = &text[index + 1..];
+        let Some(end) = rest.find('"') else { continue };
+        let candidate = &rest[..end];
+        if !(candidate.starts_with("kernel.") || candidate.starts_with("plugins.")) {
+            continue;
+        }
+        if candidate.contains(' ') || !candidate.contains('.') {
+            continue;
+        }
+        if candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            found.push(candidate.to_string());
+        }
+    }
+    found
+}
+
 /// Every workflow file, sorted.
 ///
-/// The directory rather than ci.yml by name, which is the lesson ci_command_text
+/// The directory rather than ci.yml by name, which is the lesson
+/// ci_command_text
 /// above records: the artifact scan once lived in a second workflow file and a
 /// guard reading one file by name reported all clear having compared nothing.
 fn workflow_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -584,12 +682,14 @@ fn workflow_jobs(text: &str) -> Vec<(String, String)> {
         if !in_jobs {
             continue;
         }
+
         // A trailing comment does not stop a line from naming a job, and YAML
-        // allows one. Testing the raw line for a closing colon made
-        // "  build:  # note" fail the test, which merged that job into its
-        // predecessor and let a caller searching one body read two jobs as one.
-        // Found by a control that added such a comment; the guard it broke was
-        // failing green.
+        // allows one. Testing the raw line for a closing colon made " build: #
+        // note" fail the test, which merged that job into its predecessor and
+        // let a caller searching one body read two jobs as one. The spacing in
+        // that example is the point and is not reflowed: two spaces of YAML
+        // indent, two before the comment marker. Found by a control that added
+        // such a comment; the guard it broke was failing green.
         let header = match line.split_once(" #") {
             Some((before, _)) => before,
             None => line,
@@ -1307,9 +1407,11 @@ fn ci_still_scans_dependencies_for_advisories() {
 /// A job that runs and is not among the release job's needs can be red while
 /// the rolling tag is republished, which is a green badge over a binary nothing
 /// vouched for. Measured on 2026-08-28: release needs five jobs while CLAUDE.md
-/// described four, having dropped plugin-floor, so the document did not say that
+/// described four, having dropped plugin-floor, so the document did not say
+/// that
 /// a Frama-C 32.1 build failure blocks a release. No guard can read that
-/// document, since it is never checked in, so this pins the fact rather than the
+/// document, since it is never checked in, so this pins the fact rather than
+/// the
 /// prose.
 ///
 /// A job that deliberately does not gate a release will fail here. That is the
@@ -1366,7 +1468,8 @@ fn the_release_waits_for_every_lane() {
 /// src/main.rs builds its subscriber from the environment, and EnvFilter admits
 /// ERROR only when RUST_LOG is unset, so the recovered-race warn that
 /// scripts/check-stdio-refusal.sh counts exists only when this variable is set.
-/// Drop it from either caller and the script prints "0 recovered" for every run,
+/// Drop it from either caller and the script prints "0 recovered" for every
+/// run,
 /// which is exactly what a healthy run prints. That is the silent-drift shape
 /// this file already has several tests about, and it arrived with the two
 /// callers rather than by drift between them.

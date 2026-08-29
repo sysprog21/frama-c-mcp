@@ -262,6 +262,7 @@ impl FramaCMcpServer {
             stdout_log_path: Some(stdout_log_path),
             stderr_log_path: Some(stderr_log_path),
         };
+
         // spawn_blocking because this takes an advisory lock on the state
         // directory, and LOCK_EX waits without a deadline. Every other caller
         // of it is another frama-c-mcp process, so the wait is on a process
@@ -344,6 +345,7 @@ impl FramaCMcpServer {
         });
 
         self.cleanup_sandbox(&exp_id).await;
+
         // Off the executor for the same reason as the write in create_sandbox:
         // it waits on a lock another process holds.
         let marked = tokio::task::spawn_blocking({

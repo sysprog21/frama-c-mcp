@@ -106,12 +106,61 @@ const CORE_REQUESTS: &[RequestSpec] = &[
     // 33.0 has no setProvers, so probing it reported a missing request on every
     // correct install.
     ("wp", "plugins.wp.getProvers", ProbeKind::Get),
+    ("wp", "plugins.wp.getTimeout", ProbeKind::Get),
     ("wp", "plugins.wp.setTimeout", ProbeKind::Set),
     ("wp", "plugins.wp.startProofs", ProbeKind::Exec),
 ];
 
+/// Requests this server calls and deliberately does not probe, with the reason.
+///
+/// Named rather than merely absent. A request a tool calls and no table
+/// mentions is the gap this list closes: self_check would report a healthy
+/// install while the request behind a tool is missing, and nothing could tell
+/// the difference between "deliberately unprobed" and "forgotten". The guard in
+/// tests/unit/repo-guards.rs fails when a request literal in src/ appears in no
+/// table at all, so adding a call site now forces a decision here.
+///
+/// Every one of these exists on Frama-C 33.0, verified in a -server-doc dump;
+/// the reason each is skipped is what it would do to the session, not whether
+/// it is there.
+pub const UNPROBED_REQUESTS: &[(&str, &str)] = &[
+
+    // Fallback spellings, reached only when the primary answers Rejected. A
+    // live probe reports a missing request on every correct install, which is
+    // the same reason setProvers is not probed.
+    ("plugins.eva.general.compute", "fallback for plugins.eva.analysis.compute"),
+    ("plugins.eva.general.getComputationState", "fallback for plugins.eva.analysis.getComputationState"),
+    ("plugins.eva.general.getProgramStats", "fallback for plugins.eva.stats.getProgramStats"),
+    ("plugins.eva.general.getCallers", "fallback for plugins.eva.ast.getCallers"),
+    ("plugins.wp.setProvers", "absent on 33.0; probing reports a missing request on a correct install"),
+
+    // Probing these would leave the session configured differently from what
+    // the caller asked for. setTimeout is probed and these are not, which reads
+    // as inconsistent until you count what each one costs: a timeout is
+    // overwritten by the next run_wp, a cache mode and a prover's enabled state
+    // are not.
+    ("plugins.wp.setCacheMode", "SET; would change the cache mode every later proof runs under"),
+    ("plugins.wp.setProverState", "SET; would enable or disable a prover for the session"),
+
+    // Probing this would cancel a proof that is actually running.
+    ("plugins.wp.cancelProofTasks", "SET; would cancel a live proof run"),
+
+    // Needs a PVDecl tag the server table has already seen, and injects RTE
+    // guards into the AST. Same rule as startProofs, and the same reason
+    // getMarkerFunction is registered-but-unprobed.
+    ("plugins.wp.generateRTEGuards", "EXEC; mutates the AST and needs a registered tag"),
+    ("kernel.ast.getMarkerAt", "GET, but its input is a marker nothing has registered at probe time"),
+];
+
 /// Kernel setters and recompute entry points, probed last because they would
 /// otherwise perturb the requests above.
+///
+/// The EVA readback getters are not here. They are probed too, but the list of
+/// them is EVA_READBACK_REQUESTS, and parameter_requests chains that rather
+/// than restating it. Two hand-written copies of one request list is the shape
+/// the ast-utils probe table is already faulted for: the sets agreed 16 for 16
+/// the day this was written, which is a coincidence a reader mistakes for a
+/// check, and nothing would have caught the next name added to one side alone.
 const PARAMETER_REQUESTS: &[RequestSpec] = &[
     ("kernel", "kernel.parameters.setMain", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaPrecision", ProbeKind::Set),
@@ -149,8 +198,32 @@ fn required_requests() -> Vec<RequiredRequest> {
         .collect()
 }
 
+/// The readback getters first, then the setters that would disturb them.
+///
+/// Derived from the same constant run_eva_payload reads through, so a request
+/// added to the receipt is probed by construction and cannot be probed by
+/// somebody remembering to add it here too.
+/// Every request name this server knows about, probed or not.
+///
+/// The guard over src/ compares against this, so a call site added without a
+/// decision here fails a test rather than going quietly unprobed.
+pub fn known_request_names() -> Vec<&'static str> {
+    CORE_REQUESTS
+        .iter()
+        .map(|&(_, request, _)| request)
+        .chain(PARAMETER_REQUESTS.iter().map(|&(_, request, _)| request))
+        .chain(analysis::EVA_READBACK_REQUESTS.iter().map(|&(_, request)| request))
+        .chain(AST_UTILS_REQUESTS.iter().map(|&(request, _, _)| request))
+        .chain(UNPROBED_REQUESTS.iter().map(|&(request, _)| request))
+        .collect()
+}
+
 fn parameter_requests() -> Vec<RequiredRequest> {
-    PARAMETER_REQUESTS.iter().map(spec).collect()
+    analysis::EVA_READBACK_REQUESTS
+        .iter()
+        .map(|&(_, request)| RequiredRequest { domain: "kernel", request, kind: ProbeKind::Get })
+        .chain(PARAMETER_REQUESTS.iter().map(spec))
+        .collect()
 }
 
 fn probe_payload(request: &str) -> serde_json::Value {

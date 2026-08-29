@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 
+use crate::state::VerificationStatus;
+
 use crate::state::{
     sha256_hex, FunctionVerificationState, ProjectVerificationState, SandboxMetadata,
 };
@@ -254,7 +256,8 @@ pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Resul
 /// Two shapes produce one: Path::parent answers Some("") for a bare file name
 /// rather than None, and FRAMA_C_MCP_STATE_DIR set to an empty string makes
 /// conclusion_base_dir itself empty. Both mean the working directory to every
-/// caller, but the filesystem disagrees about which calls accept it. create_dir_all
+/// caller, but the filesystem disagrees about which calls accept it.
+/// create_dir_all
 /// and join take "" happily; read_dir and a temp file creation both fail on it,
 /// so a sweep would quietly do nothing and a write would error. One conversion
 /// here rather than a different guess at each call site.
@@ -608,9 +611,53 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
             Some(s) if is_safe_path_segment(s) => s.to_string(),
             _ => continue,
         };
-        if let Some(c) = load_conclusion_dir(&path) {
-            out.insert(func, c);
+        let Some(mut conclusion) = load_conclusion_dir(&path) else {
+            continue;
+        };
+
+        // A verified conclusion whose receipt this build could not have written
+        // stops being verified, and says so. Nothing here carries backward
+        // compatibility except toward Frama-C, so the receipt cannot be
+        // honoured and the "verified" claim resting on it has to go.
+        //
+        // Downgraded rather than dropped. The first cut of this deleted the
+        // entry, which loses the notes, the specs, the callee list and the
+        // record that the function was ever worked on, for a reason the user
+        // did not ask for and cannot undo. Keeping the row and moving it to
+        // in_progress says the same thing without destroying the work, and the
+        // next store_conclusion for that function merges into a row that is
+        // still there.
+        //
+        // Reported at error level, not warn. The subscriber in main.rs is
+        // EnvFilter::from_default_env(), which admits ERROR only when RUST_LOG
+        // is unset, so a warn here is invisible in ordinary use: the conclusion
+        // would change under the user with no message at all, which is the
+        // fail-loud rule inverted. ci_sets_rust_log_for_the_stdio_suite records
+        // the same fact for the recovered-race warning.
+        if conclusion.status == VerificationStatus::Verified {
+            // The same checks the store path applies, not a subset of them.
+            // Checking only the name and shape here left a receipt with this
+            // build's field set but no believable contents loading as verified,
+            // and then failing to store, so the conclusion could be read but
+            // never written again.
+            let total = conclusion.wp_summary.as_ref().map(|s| s.total).unwrap_or(0);
+            let reason = match conclusion.proof_receipt.as_ref() {
+                Some(receipt) => crate::state::proof_receipt_evidence_error(receipt, total),
+                None => Some("missing proof_receipt".to_string()),
+            };
+            if let Some(reason) = reason {
+                tracing::error!(
+                    function = %func,
+                    path = %path.display(),
+                    reason = %reason,
+                    "stored proof_receipt is not evidence this build can stand behind; the \
+                     conclusion is no longer verified. Re-run verification to restore it."
+                );
+                conclusion.status = VerificationStatus::InProgress;
+                conclusion.proof_receipt = None;
+            }
         }
+        out.insert(func, conclusion);
     }
     out
 }

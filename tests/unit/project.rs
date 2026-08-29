@@ -77,6 +77,72 @@ fn a_define_written_as_a_flag_is_rejected() {
     assert!(validate_project_options(&with_defines(&["-D_Atomic="])).is_err());
 }
 
+fn with_machdep(machdep: &str) -> ProjectLoadOptions {
+    ProjectLoadOptions {
+        machdep: Some(machdep.to_string()),
+        ..Default::default()
+    }
+}
+
+fn with_compilation_database(path: &str) -> ProjectLoadOptions {
+    ProjectLoadOptions {
+        compilation_database: Some(path.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn machdep_and_compilation_database_reject_a_leading_dash() {
+    // Both become their own argv token beside the three preprocessor lists, so
+    // a value the caller wrote as a flag is the same mistake there as here.
+    assert!(validate_project_options(&with_machdep("gcc_x86_64")).is_ok());
+    assert!(validate_project_options(&with_machdep("-machdep")).is_err());
+    assert!(validate_project_options(&with_machdep("")).is_err());
+
+    assert!(validate_project_options(&with_compilation_database("build/compile_commands.json")).is_ok());
+    assert!(validate_project_options(&with_compilation_database("-json-compilation-database")).is_err());
+    assert!(validate_project_options(&with_compilation_database("")).is_err());
+}
+
+#[test]
+fn custom_machdep_paths_are_accepted() {
+    // Every name "frama-c -machdep help" lists on this Frama-C, so the rule is
+    // not tighter than the thing it validates.
+    for name in [
+        "avr_16", "avr_8", "gcc_rv64", "gcc_x86_16", "gcc_x86_32", "gcc_x86_64", "macos_arm",
+        "msvc_x86_64", "ppc_32", "x86_16", "x86_32", "x86_64",
+    ] {
+        assert!(
+            validate_project_options(&with_machdep(name)).is_ok(),
+            "{name} is a supported machine and must validate"
+        );
+    }
+
+    // Frama-C detects a custom machdep file from its contents, not its suffix.
+    for accepted in [
+        "machdeps/custom.yaml",
+        "machdep_arm-none-eabi.YAML",
+        "./custom-machdep",
+        "/abs/path/to/custom machdep",
+    ] {
+        assert!(
+            validate_project_options(&with_machdep(accepted)).is_ok(),
+            "{accepted} is the documented file form and must validate"
+        );
+    }
+
+    // The one case this test adds. The empty string is already covered by
+    // machdep_and_compilation_database_reject_a_leading_dash above.
+    assert!(
+        validate_project_options(&with_machdep("-machdeps/custom")).is_err(),
+        "a machdep path written as a flag must be rejected"
+    );
+
+    // A database path is whatever the caller's tree is called. Refusing a space
+    // here would be this validator inventing a restriction, not closing one.
+    assert!(validate_project_options(&with_compilation_database("my build/compile_commands.json")).is_ok());
+}
+
 #[test]
 fn an_empty_define_is_rejected() {
     assert!(validate_project_options(&with_defines(&[""])).is_err());

@@ -5,6 +5,8 @@ use frama_c_mcp::error::FramaCError;
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
     check_blocked_reason,
+    gap_guidance,
+    incomplete_guidance,
     check_incomplete_items,
     check_variants_summary,
     goal_needs_failure_classification,
@@ -14,6 +16,39 @@ use frama_c_mcp::mcp::server::analysis::{
 use frama_c_mcp::mcp::server::selfcheck::{
     buggy_fixture_reason, fixed_fixture_reason,
 };
+
+/// Guidance is carried once per code, not once per entry.
+///
+/// The text is a pure function of the code, so an array with 417 PROPERTY_DEAD
+/// entries repeated one paragraph 417 times: measured at 110,509 bytes across
+/// 418 entries and two distinct strings on a 1,144-line file. The entries stay,
+/// because a verification gap must be loud and the array being complete is what
+/// makes "verdict" mean anything; only the repetition goes.
+#[test]
+fn guidance_is_carried_once_per_code() {
+    let entries = vec![
+        json!({"code": "PROPERTY_DEAD", "descr": "a"}),
+        json!({"code": "PROPERTY_DEAD", "descr": "b"}),
+        json!({"code": "GOAL_NOT_VALID", "descr": "c"}),
+        json!({"code": "NOT_A_REAL_CODE", "descr": "d"}),
+        json!({"descr": "no code at all"}),
+    ];
+    let guidance = incomplete_guidance(&entries);
+    let map = guidance.as_object().expect("guidance object");
+
+    // One key per distinct code that has advice, and nothing for a code that
+    // has none. A consumer looks up its own entry's code and may miss.
+    assert!(map.contains_key("PROPERTY_DEAD"));
+    assert!(!map.contains_key("NOT_A_REAL_CODE"), "{map:?}");
+    assert_eq!(map.get("PROPERTY_DEAD"), Some(&gap_guidance("PROPERTY_DEAD")));
+
+    // Repetition is what this removes, so a second entry of a known code adds
+    // nothing, and the map never grows past the number of distinct codes.
+    assert!(map.len() <= 2, "{map:?}");
+
+    // An entry with no code is skipped rather than panicking or keying on null.
+    assert!(!map.contains_key(""));
+}
 
 /// `check` used to report verdict "proved" on a program whose own alarm payload
 /// carried an undischarged RTE assertion.

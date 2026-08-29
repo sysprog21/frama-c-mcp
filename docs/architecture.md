@@ -83,7 +83,7 @@ hands back subtly wrong C is the failure mode with the highest cost.
 
 Verdict and completeness are separate axes. `check` reports `verdict: "proved"` only when `incomplete[]` is empty, so a step that did not run cannot read as a clean result; the CLI's `--require-complete` turns any `incomplete[]` entry into a non-zero exit.
 
-Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt` (`frama-c-mcp.proof-receipt.v4`) holding the source hash, AST digest, environment, effective WP configuration, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
+Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt`, whose `schema` names the format and carries no version, and whose field shape a reader can recompute to tell whether two receipts are the same format, holding the source hash, AST digest, environment, effective EVA and WP configurations, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. The EVA half is read back off the Frama-C process rather than taken from the request, because EVA's settings outlive one call: a profile that leaves a parameter unset issues no setter, so an earlier call's value is still in force. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
 
 ## Design Decisions
 
@@ -141,9 +141,21 @@ whichever switch built the tree first.
 The framing and command set above are unchanged between Frama-C 31.0 and 33.0.
 Request names are not: 33.0 rejects the `plugins.eva.general.*` group that 31.0
 used, and drops `plugins.wp.setProvers`. The client tries the 33.0 name first
-and falls back where a fallback exists. See
-[reference/frama-c-server-protocol-guide.md](reference/frama-c-server-protocol-guide.md)
-for the full list and how to regenerate it.
+and falls back where a fallback exists. `frama-c -server-doc <dir>` regenerates
+the full request list from the installed Frama-C, which is the only version of
+it worth trusting; `self_check` probes the subset this server depends on, and
+`UNPROBED_REQUESTS` in `src/mcp/selfcheck.rs` names the ones it deliberately
+does not probe, with the reason each would disturb the session.
+
+Three protocol details are load-bearing and not obvious from the command list.
+`SET` and `EXEC` are queued, so a caller must `POLL` for intermediate `SIGNAL`
+messages and the final result rather than expecting a reply to the command
+itself. The fetch API is a cursor: `fetchFunctions` returns everything only
+after a `reloadFunctions` reset and deltas afterwards, so a full list needs the
+reload first. And markers are registered as a side effect of printing: a request
+taking a marker answers `invalid marker` for any tag the server table has not
+seen, which is why `startProofs` needs the PVDecl tag (`#v<vid>`) rather than
+`AST.Decl` (`#F<vid>`), and why `getMarkerAt` cannot be probed cold.
 
 **AST reload**: `setFiles([])` → `setFiles(files)` → `compute` is required; direct `setFiles(same value)` is a no-op (due to Frama-C's state dependency system). Same as Ivette's `reparseFiles()`.
 
@@ -159,3 +171,102 @@ advertised. That is what let `inject_all_annotations` move to a single tagged
 `annotations` array without breaking a caller.
 
 **JSON key order**: `serde_json` turns on `preserve_order` to preserve the source code order of the plugin emit (otherwise alphabetical traversal will reverse structures such as `then_body`/`else_body`).
+
+
+## The `check` payload contract
+
+`frama-c-mcp.check.v2`, in the `schema` field. This is what agents and CI
+parse, so it is a contract rather than a description.
+
+v2 is additive: new top-level fields and new `incomplete[]` codes can appear in
+any release. Removing a field, renaming one, or removing a code needs
+`frama-c-mcp.check.v3`. A consumer that does not recognise the `schema` string
+should stop rather than guess, and one that meets an unknown `incomplete[]` code
+should treat the run as incomplete, which is what the code means. The whole
+point of the array is that silence and clean are different answers.
+
+Every field below is present on every successful `check`, including the one
+returned when the reload itself fails. A tool call that errors outright returns
+no payload. The field set is the only shape guarantee: the nested objects under
+`reload`, `eva`, `wp` and `proof_receipt` are not frozen and follow Frama-C's
+own payloads.
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | string | `frama-c-mcp.check.v2` |
+| `verdict` | string | `proved` or `incomplete`. Nothing else; there is no `failed` |
+| `incomplete` | array | Empty exactly when `verdict` is `proved` |
+| `incomplete_guidance` | object | What to write to close a gap, keyed by `incomplete[].code`. Present only for codes that have advice, so a lookup can miss. It lives here rather than on each entry because the text is a function of the code alone |
+| `detail` | string or null | `summary`, `full`, or null when the reload failed |
+| `reload` | object | Reload result, or its error |
+| `eva` | object or null | EVA run result; null when the reload failed or `want` excluded it |
+| `eva_alarms` | array, object, or null | Object when summarized, array when `detail` is `full`, null when EVA did not run |
+| `wp` | object or null | WP run result; null when the reload failed or `want` excluded it |
+| `wp_goals` | array, object, or null | Object when summarized, array when `detail` is `full`, null when WP did not run |
+| `wp_backend_diagnosis` | object or null | Non-null when the message stream shows a Why3 abort, so a `FAILED` goal is a crashed prover and not a verdict. Non-null does not imply `incomplete` |
+| `messages` | array | Frama-C diagnostics drained for this run |
+| `messages_truncated` | boolean | The drain hit its cap |
+| `recommended_next_call` | object | `{tool, args, reason}`. `args` names tool parameters and is not frozen |
+| `temporary_source_dir` | string or null | Set only when `source` was passed instead of `files` |
+| `proof_receipt` | object | Carries its own `schema` |
+
+`verdict` is `proved` only when `incomplete` is empty. "No alarms were reported"
+and "everything was checked" are different claims, and the pair of fields keeps
+them apart.
+
+Only an entry's `code` is frozen. The rest of an entry varies with what produced
+it, and `PROPERTY_DEAD` has two shapes, one from an EVA property row and one
+from a WP goal in unreachable code. Branch on `code`. README tabulates every
+code with its meaning, and `incomplete_code::ALL` in `src/mcp/analysis.rs` names
+them once; a test compares the two, so a code added in one place and not the
+other fails the build rather than a consumer.
+
+### Where the payload appears in an MCP result
+
+Twice, and identically, whenever it is a JSON object. `content[0]` is a text
+block holding it pretty-printed, always set, and the only thing a client below
+protocol revision 2025-06-18 sees. `structuredContent` is the same document as
+JSON, set only when it is an object. They are the same value moved rather than
+serialized twice, so a consumer may read either.
+
+The object condition is not a nicety: the schema types `structuredContent` as an
+object, and a client validating against it rejects the whole response rather
+than the one field. Five of the six kinds `list` answers are arrays, so those
+set the text block alone.
+
+One function, `json_result`, does this for every tool that returns JSON, which
+is what makes it true of all of them rather than most. The exception returns no
+JSON: `context {want: ["source"]}` answers with raw C, which must not be wrapped
+in a JSON string. There is no `outputSchema` on any tool, because the payloads
+are ad-hoc JSON rather than derived from Rust types, and a hand-written schema
+that drifted from this page would be worse than none.
+
+Both copies carry the full payload, so a client that reads `structuredContent`
+still receives the pretty-printed text alongside it. On a 1,144-line input that
+is 1.9 MB for an 800 KB payload.
+
+### A second shape: `check {variants: [...]}`
+
+A call carrying `variants` returns a different top-level payload and says so:
+`schema` is `frama-c-mcp.check-variants.v1`. Nothing above applies to it, and a
+caller only reaches it by asking. It carries `verdict`, `variant_count`,
+`distinct_asts`, `duplicate_ast_count`, `ast_digest_unavailable_count`, `reason`
+and `variants[]`. `verdict` is `proved` only when every variant proved, no two
+shared an AST, and every variant had a digest to compare.
+
+Each entry carries its `label`, effective `defines`, `machdep` and `model`, its
+own `verdict`, its `incomplete[]` codes as bare strings, its `ast_digest`, its
+`wp_backend_diagnosis`, and the `proof_receipt_sha256` of the run. An entry that
+asked for different code and got a byte-identical AST gains `duplicate_ast`
+naming the earlier entry. The digests are the point: two configurations that
+select the same code produce identical goal counts and identical verdicts, so
+nothing but the normalised AST separates a matrix that was really checked from
+one configuration checked twice.
+
+### Compatibility history
+
+| Version | Date | Change |
+|---|---|---|
+| `frama-c-mcp.check-variants.v1` | 2026-08-24 | First frozen. Does not change `frama-c-mcp.check.v2`, which is still what a call without `variants` returns |
+| `frama-c-mcp.check.v2` | 2026-08-12 | `want` selects the analyses, so `eva`, `eva_alarms`, `wp` and `wp_goals` are null for a second reason and two codes tell it from a failure. `run_eva` folded in and removed |
+| `frama-c-mcp.check.v1` | 2026-08-12 | First frozen. Thirteen `incomplete[]` codes. `detail` added to the reload-failure payload so both paths carry one field set |

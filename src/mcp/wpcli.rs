@@ -195,6 +195,7 @@ impl FramaCMcpServer {
                 tool: "run_wp",
                 source_files: files,
                 wp_config: response["effective_wp_config"].clone(),
+                eva_config: eva_config_absent("tool_does_not_run_eva"),
                 goals: &[],
                 stable_scope: None,
                 goals_status_source: "unavailable_isolated_cli_retry",

@@ -3,6 +3,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 pub const VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES: usize = 16 * 1024;
+
+/// What check_proof_receipt needs from the check it is describing.
+///
+/// Grouped for the same reason ProofReceiptRequest is: three of these are
+/// borrowed Values in a row and two more are borrowed strs, so a transposed
+/// pair would compile and describe the wrong run.
+struct CheckReceiptInputs<'a> {
+    payload: &'a serde_json::Value,
+    receipt_files: Vec<String>,
+    eva: &'a serde_json::Value,
+    wp: &'a serde_json::Value,
+    goals: &'a [serde_json::Value],
+    wanted_eva: bool,
+    stable_scope: Option<&'a str>,
+    properties: &'a std::collections::HashMap<String, serde_json::Value>,
+}
 const VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS: usize = 16;
 
 /// How many non-valid goals and undischarged alarms `check {detail: "summary"}`
@@ -94,6 +110,67 @@ async fn exec_eva_compute(client: &FramaCClient) -> Result<Vec<serde_json::Value
         }
         Err(err) => Err(err),
     }
+}
+
+/// The EVA parameters a receipt records, as receipt key against server request.
+///
+/// Deliberately not the same list as what eva-precision expands to. The
+/// receipt describes what EVA ran with, so anything that moves the analysis
+/// belongs here whether or not the meta-option is what moved it:
+/// eva-default-loop-unroll is set by hand rather than by precision, and getMain
+/// names the entry point the whole run is relative to. Read the other
+/// direction, every option the 33.0 expansion touches is here, which is the
+/// half that goes stale: an option added to the expansion and not to this table
+/// is a run two matching receipts cannot tell apart.
+///
+/// Per-function overrides (eva-slevel-function and its siblings) are absent
+/// because nothing here can set them. Frama-C is spawned with a fixed command
+/// line and no user argument reaches it.
+pub const EVA_READBACK_REQUESTS: &[(&str, &str)] = &[
+    ("main_function", "kernel.parameters.getMain"),
+    ("precision", "kernel.parameters.getEvaPrecision"),
+    ("slevel", "kernel.parameters.getEvaSlevel"),
+    ("ilevel", "kernel.parameters.getEvaIlevel"),
+    ("domains", "kernel.parameters.getEvaDomains"),
+    ("plevel", "kernel.parameters.getEvaPlevel"),
+    ("widening_delay", "kernel.parameters.getEvaWideningDelay"),
+    ("subdivide_non_linear", "kernel.parameters.getEvaSubdivideNonLinear"),
+    ("partition_history", "kernel.parameters.getEvaPartitionHistory"),
+    ("auto_loop_unroll", "kernel.parameters.getEvaAutoLoopUnroll"),
+    ("min_loop_unroll", "kernel.parameters.getEvaMinLoopUnroll"),
+    ("default_loop_unroll", "kernel.parameters.getEvaDefaultLoopUnroll"),
+    ("remove_redundant_alarms", "kernel.parameters.getEvaRemoveRedundantAlarms"),
+    ("split_return", "kernel.parameters.getEvaSplitReturn"),
+    ("equality_through_calls", "kernel.parameters.getEvaEqualityThroughCalls"),
+    ("octagon_through_calls", "kernel.parameters.getEvaOctagonThroughCalls"),
+];
+
+/// What EVA actually ran with, read back rather than asserted.
+///
+/// The settings live on the Frama-C process and outlive one call. A profile
+/// that leaves a parameter unset issues no setter, so whatever an earlier call
+/// wrote is still in force, and reading it back is the only way a receipt can
+/// describe the run rather than the request.
+///
+/// Issued after compute and never before. eva-precision is a meta-option that
+/// expands at analysis time, measured on 32.1 and 33.0 alike, so a readback
+/// taken before compute reports the values the expansion was about to
+/// overwrite, which is the receipt lying in the other direction.
+///
+/// Best effort per key. A request this Frama-C does not answer costs its own
+/// entry a reason and nothing else. Propagating instead would lose an analysis
+/// that already ran to a failure in the code whose only job is to describe it,
+/// and the caller would read that as EVA not having run.
+async fn read_effective_eva_options(client: &FramaCClient) -> serde_json::Value {
+    let mut effective = serde_json::Map::new();
+    for (key, request) in EVA_READBACK_REQUESTS {
+        let value = match client.get(request, json!(null)).await {
+            Ok(value) => value,
+            Err(error) => json!({"unavailable": error.to_string()}),
+        };
+        effective.insert((*key).to_string(), value);
+    }
+    serde_json::Value::Object(effective)
 }
 
 async fn get_eva_computation_state(
@@ -832,7 +909,7 @@ pub fn check_blocked_reason(incomplete: &[serde_json::Value]) -> String {
 
 /// Every reason check can put in its incomplete array, named once.
 ///
-/// These are a published vocabulary: docs/reference/result-schema.md freezes
+/// These are a published vocabulary: docs/architecture.md freezes
 /// them, README tabulates them, and agents branch on them. They were thirteen
 /// string literals spread over one match and eight push sites, so nothing
 /// connected the emitters to the documents, and the set drifted twice before
@@ -1016,7 +1093,7 @@ fn step_failure_gaps(
 /// been told a lemma is undischarged still has to know that no SMT prover will
 /// find the induction, and that waiting longer is not the fix. Codes whose
 /// remedy depends on the program say nothing here rather than guess.
-fn gap_guidance(code: &str) -> serde_json::Value {
+pub fn gap_guidance(code: &str) -> serde_json::Value {
     let guidance = match code {
         incomplete_code::LEMMA_NOT_PROVED => {
             "An SMT prover does not do induction, so a lemma over a recursive logic function or an \
@@ -1111,15 +1188,36 @@ fn property_row_gaps(
                 "descr": alarm.get("descr").cloned().unwrap_or_else(|| json!(null)),
                 "source_location": alarm.get("source_location").cloned().unwrap_or_else(|| json!(null)),
                 "status": property_normalized_status(alarm),
-
-                // What to write, where the gap has a known shape. The reason
-                // says what is missing; a reader still has to know which edit
-                // closes it, and for a lemma the obvious reading, that the
-                // prover needed longer, is the wrong one.
-                "guidance": gap_guidance(code),
             }));
         }
     }
+}
+
+/// The guidance for the codes an incomplete[] actually carries, keyed by code.
+///
+/// gap_guidance is a pure function of the code, so every entry sharing a code
+/// carried a byte-identical paragraph. Measured on a 1,144-line file: 110,509
+/// bytes across 418 entries and two distinct strings, so 110,240 of it was one
+/// of two paragraphs repeated. The array stays complete, which is what the
+/// fail-loud rule is about; only the repetition goes.
+///
+/// A map rather than one entry in N: a reader wanting the advice for an entry
+/// looks up its own "code", which it already has.
+pub fn incomplete_guidance(incomplete: &[serde_json::Value]) -> serde_json::Value {
+    let mut guidance = serde_json::Map::new();
+    for entry in incomplete {
+        let Some(code) = entry.get("code").and_then(|code| code.as_str()) else {
+            continue;
+        };
+        if guidance.contains_key(code) {
+            continue;
+        }
+        let text = gap_guidance(code);
+        if !text.is_null() {
+            guidance.insert(code.to_string(), text);
+        }
+    }
+    serde_json::Value::Object(guidance)
 }
 
 /// Gaps carried by WP's own goals.
@@ -2068,6 +2166,14 @@ impl FramaCMcpServer {
         ))
     }
 
+    /// Configure EVA, compute, and read back what it actually ran with.
+    ///
+    /// The caller holds main_eva_lock. It is taken in check_eva_step rather
+    /// than here because the transaction does not end at this function: the
+    /// alarms belong to the same run, and a guard released on return would let
+    /// a concurrent check recompute between the readback and the alarm fetch,
+    /// pairing one run's settings with another run's alarms. That is the same
+    /// torn-receipt failure this lock exists to stop, one call further out.
     async fn run_eva_payload(&self, params: RunEvaParams) -> Result<serde_json::Value, McpError> {
         let requested_profile = params.profile.clone();
         let (params, profile) = Self::expand_eva_profile(params)?;
@@ -2108,6 +2214,7 @@ impl FramaCMcpServer {
 
         let client = self.require_client().await?;
         let protocol_diagnostics = exec_eva_compute(&client).await.map_err(McpError::from)?;
+        let effective_options = read_effective_eva_options(&client).await;
         let comp_state = get_eva_computation_state(&client)
             .await
             .map_err(McpError::from)?;
@@ -2124,6 +2231,7 @@ impl FramaCMcpServer {
             "computation_state": comp_state,
             "program_stats": stats,
             "frama_c_options": frama_c_options,
+            "effective_options": effective_options,
             "frama_c_protocol": protocol_diagnostics,
             "requested_options": {
                 "profile": requested_profile,
@@ -2338,6 +2446,16 @@ impl FramaCMcpServer {
         eva_params: RunEvaParams,
         function: Option<&str>,
     ) -> (serde_json::Value, serde_json::Value) {
+        // Held across the whole EVA half: configure, compute, readback, and the
+        // alarms. EVA's parameters and its results are both process-global
+        // while the client mutex covers one request, so two checks that
+        // interleave produce a payload whose effective_options came from one
+        // run and whose alarms came from the other, under one receipt. Ending
+        // the guard when run_eva_payload returned left exactly that window.
+        //
+        // Ordered after main_wp_lock, never before: reload_project takes wp
+        // then eva, and nothing takes eva then wp.
+        let _eva_op_guard = self.main_eva_lock.lock().await;
         let eva = match self.run_eva_payload(eva_params).await {
             Ok(payload) => payload,
             Err(error) => check_step_error(&error),
@@ -2412,6 +2530,7 @@ impl FramaCMcpServer {
         let mut payload = json!({
             "schema": CHECK_SCHEMA,
             "verdict": "incomplete",
+            "incomplete_guidance": incomplete_guidance(&incomplete),
             "incomplete": incomplete,
 
             // Null rather than absent, and null rather than "summary": the
@@ -2444,12 +2563,13 @@ impl FramaCMcpServer {
                 tool: "check",
                 source_files: receipt_files,
                 wp_config: serde_json::Value::Null,
+                eva_config: eva_config_absent("reload_failed"),
                 goals: &[],
                 stable_scope: function,
                 goals_status_source: "not_run_reload_failed",
                 reported: json!({
                     "verdict": payload["verdict"].clone(),
-                    "incomplete": payload["incomplete"].clone(),
+                    "incomplete": incomplete_digest(&payload["incomplete"]),
                 }),
                 // No goals, so nothing to discriminate.
                 properties: &HashMap::new(),
@@ -2709,11 +2829,12 @@ impl FramaCMcpServer {
         let mut payload = json!({
             "schema": CHECK_SCHEMA,
             "verdict": verdict,
+            "incomplete_guidance": incomplete_guidance(&incomplete),
             "incomplete": incomplete,
 
             // Same key order as the reload-failure payload above and as the
-            // table in docs/reference/result-schema.md, so the two build sites
-            // of one field set can be read side by side.
+            // table in docs/architecture.md, so the two build sites of one
+            // field set can be read side by side.
             "detail": if summarize { "summary" } else { "full" },
             "reload": reload,
             "eva": eva,
@@ -2726,27 +2847,74 @@ impl FramaCMcpServer {
             "recommended_next_call": recommended_next_call,
             "temporary_source_dir": temporary_source_dir,
         });
-        let receipt = self
-            .proof_receipt(None, ProofReceiptRequest {
-                tool: "check",
-                source_files: receipt_files,
-                wp_config: wp
-                    .get("effective_wp_config")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::Value::Null),
+        payload["proof_receipt"] = self
+            .check_proof_receipt(CheckReceiptInputs {
+                payload: &payload,
+                receipt_files,
+                eva: &eva,
+                wp: &wp,
                 goals: &goals,
+                wanted_eva: wanted.eva,
                 stable_scope: params.function.as_deref(),
-                goals_status_source: "check_wp_goals",
-                reported: json!({
-                    "verdict": payload["verdict"].clone(),
-                    "incomplete": payload["incomplete"].clone(),
-                    "wp_failure_kind": wp.get("failure_kind").cloned().unwrap_or_else(|| json!(null)),
-                }),
                 properties: &receipt_properties,
             })
             .await;
-        payload["proof_receipt"] = receipt;
         Ok(payload)
+    }
+
+    /// The receipt for one check, lifted out of check_payload.
+    ///
+    /// One caller, which this tree usually treats as a reason not to extract.
+    /// The exception is the length ceiling: check_payload is the function the
+    /// ceiling was last raised to fit, and it had grown back to exactly the new
+    /// limit, so the next edit to it would have failed a gate over whatever
+    /// that
+    /// edit happened to be. Moving the ceiling a second time for the same
+    /// function would make the rule follow the code rather than bound it.
+    ///
+    /// It is also the one block in check_payload with a boundary: everything
+    /// above assembles the response, and this reads that finished response back
+    /// to describe what produced it.
+    async fn check_proof_receipt(&self, inputs: CheckReceiptInputs<'_>) -> serde_json::Value {
+        let CheckReceiptInputs {
+            payload,
+            receipt_files,
+            eva,
+            wp,
+            goals,
+            wanted_eva,
+            stable_scope,
+            properties,
+        } = inputs;
+        self.proof_receipt(None, ProofReceiptRequest {
+            tool: "check",
+            source_files: receipt_files,
+            wp_config: wp
+                .get("effective_wp_config")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Null),
+
+            // Absent for two different reasons that the payload can tell apart
+            // and a stored receipt cannot, so the reason is written in rather
+            // than left to a null.
+            eva_config: eva.get("effective_options").cloned().unwrap_or_else(|| {
+                eva_config_absent(if wanted_eva {
+                    "eva_did_not_complete"
+                } else {
+                    "not_requested"
+                })
+            }),
+            goals,
+            stable_scope,
+            goals_status_source: "check_wp_goals",
+            reported: json!({
+                "verdict": payload["verdict"].clone(),
+                "incomplete": incomplete_digest(&payload["incomplete"]),
+                "wp_failure_kind": wp.get("failure_kind").cloned().unwrap_or_else(|| json!(null)),
+            }),
+            properties,
+        })
+        .await
     }
 
     #[tool(
@@ -3172,7 +3340,24 @@ impl FramaCMcpServer {
             .await?;
             self.state.write().await.update_functions(&entries);
             let state = self.state.read().await;
-            return Ok(state.functions.values().cloned().collect());
+
+            // Sorted, because this list is the run's identity and a HashMap
+            // does not have one. It becomes wp_config.functions in the receipt
+            // and it is the order main_contract_shape_findings walks, so its
+            // findings reach incomplete[] in whatever order the map iterated.
+            // Both are hashed into proof_receipt.sha256. Measured on
+            // tests/fixtures/test_comprehensive.c before this line was sorted:
+            // three identical runs produced three different receipts, which is
+            // the exact opposite of what a receipt is for, and it reproduced on
+            // an unmodified build so it was never a symptom of the code above.
+            //
+            // Whole-project WP has no meaningful target order to preserve, so
+            // alphabetical costs nothing. The explicit-names path below already
+            // follows the caller's order and must keep doing so.
+            let mut targets: Vec<crate::state::FunctionInfo> =
+                state.functions.values().cloned().collect();
+            targets.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(targets);
         };
         let mut infos = Vec::new();
         for name in names {
@@ -3323,15 +3508,15 @@ impl FramaCMcpServer {
 
         // Held across the whole transaction below: config, target resolution,
         // scheduling, drain, and goal fetch all act on process-global WP state,
-        // and the client mutex only covers one request at a time. Without
-        // this, two concurrent runs overwrite each other's config mid-flight
-        // and each reports the union of both runs' goals. cancel_wp_queue
-        // takes no lock, so a run stuck in drain can still be cancelled.
+        // and the client mutex only covers one request at a time. Without this,
+        // two concurrent runs overwrite each other's config mid-flight and each
+        // reports the union of both runs' goals. cancel_wp_queue takes no lock,
+        // so a run stuck in drain can still be cancelled.
         let _wp_op_guard = self.main_wp_lock.lock().await;
 
-        // Rechecked under the lock: verify_program_step can set the flag
-        // while this call waits for a run ahead of it, and the check at
-        // the top of the handler was read before that wait.
+        // Rechecked under the lock: verify_program_step can set the flag while
+        // this call waits for a run ahead of it, and the check at the top of
+        // the handler was read before that wait.
         if *self.project_locked.read().await {
             return Err(project_locked_error(
                 "run_wp",
@@ -4473,13 +4658,12 @@ impl FramaCMcpServer {
         );
 
         // The writer takes the WP transaction lock too: setting the flag
-        // declares that no WP run is mutating the main instance from here
-        // on, and without the lock that declaration can go out while a run
-        // that rechecked the flag is still mid-flight. Queuing behind it
-        // makes the ordering real; the recheck in run_wp closes the other
-        // half, a run starting after the flag is already set. This can wait
-        // as long as a run can; cancel_wp_queue takes no lock and remains
-        // the escape.
+        // declares that no WP run is mutating the main instance from here on,
+        // and without the lock that declaration can go out while a run that
+        // rechecked the flag is still mid-flight. Queuing behind it makes the
+        // ordering real; the recheck in run_wp closes the other half, a run
+        // starting after the flag is already set. This can wait as long as a
+        // run can; cancel_wp_queue takes no lock and remains the escape.
         if params.lock_project != Some(false) {
             let _wp_op_guard = self.main_wp_lock.lock().await;
             *self.project_locked.write().await = true;

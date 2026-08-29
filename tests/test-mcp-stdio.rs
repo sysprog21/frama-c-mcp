@@ -31,6 +31,11 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -64,12 +69,11 @@ fn verified_conclusion_payload(function: &str) -> Value {
         "function": function,
         "status": "verified",
         "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
-        "proof_receipt": {
-            "schema": "frama-c-mcp.proof-receipt.v2",
-            "sha256": format!("sha-{function}"),
-            "environment": {"frama_c_version": "test"},
-            "goals": [{"stable_goal_id": "g0", "status": "valid"}]
-        }
+        "proof_receipt": receipt_fixture::fixture_receipt(
+            &format!("sha-{function}"),
+            json!({"frama_c_version": "test"}),
+            vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+        )
     })
 }
 
@@ -4326,6 +4330,184 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
 }
 
 #[tokio::test]
+async fn check_receipt_reports_eva_settings_left_by_an_earlier_call() {
+    let c_file = tutorial_c("eva-rotate.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let deep = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "profile": "deep",
+        "function": "eva_main",
+    }))
+    .await
+    .unwrap();
+    let default = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "profile": "default",
+        "function": "eva_main",
+    }))
+    .await
+    .unwrap();
+
+    let deep_config = deep["proof_receipt"]["eva"].clone();
+    assert!(deep_config.is_object(), "deep EVA config missing: {deep:?}");
+    assert_eq!(default["eva"]["requested_options"]["profile"], "default");
+
+    // Every key answered. The readback is best effort per key so that one
+    // unanswerable request cannot throw away an analysis that already ran, and
+    // the cost of that is a wrong request name degrading silently into
+    // {"unavailable": ...} instead of failing. This is what makes it loud
+    // again, and it is the only thing pinning the sixteen request names against
+    // a real Frama-C.
+    for config in [&deep_config, &default["proof_receipt"]["eva"]] {
+        let entries = config.as_object().expect("EVA config object");
+        assert!(entries.len() >= 16, "too few EVA settings read back: {entries:?}");
+        for (key, value) in entries {
+            assert!(
+                value.get("unavailable").is_none(),
+                "EVA setting {key} was not readable: {value:?}"
+            );
+        }
+    }
+
+    // And what it ran with is the deep configuration, because nothing resets
+    // EVA between calls: the default profile leaves precision, slevel and
+    // ilevel unset, so it issues no setter and the earlier call's values are
+    // still in force on the shared process.
+    //
+    // This assertion deliberately encodes present behavior. Resetting the
+    // settings between calls is a separate change, and when it lands this line
+    // goes red. That is the fix arriving, not a regression: update it to assert
+    // the two configurations differ. Do not delete it, or nothing pins that the
+    // receipt follows the process rather than the request.
+    assert_eq!(default["proof_receipt"]["eva"], deep_config);
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn check_receipts_distinguish_eva_entry_points() {
+    let c_file = workspace_path("tests/fixtures/test_abs.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let main = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "function": "main",
+    }))
+    .await
+    .unwrap();
+    let abs_val = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "function": "abs_val",
+    }))
+    .await
+    .unwrap();
+
+    assert_eq!(main["proof_receipt"]["eva"]["main_function"], "main");
+    assert_eq!(abs_val["proof_receipt"]["eva"]["main_function"], "abs_val");
+
+    // The entry point is the only thing that moved, so it must be the only key
+    // that differs. A sha256 comparison would say nothing here: analysing
+    // abs_val with an unknown int argument raises an overflow alarm that main
+    // does not, so the two receipts differ in "reported" whether or not the EVA
+    // configuration is in them at all.
+    let mut main_config = main["proof_receipt"]["eva"].clone();
+    let mut abs_config = abs_val["proof_receipt"]["eva"].clone();
+    for config in [&mut main_config, &mut abs_config] {
+        config
+            .as_object_mut()
+            .expect("EVA config object")
+            .remove("main_function")
+            .expect("main_function key");
+    }
+    assert_eq!(main_config, abs_config);
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn two_identical_runs_produce_one_receipt() {
+    // The claim this server rests on is that two runs are comparable exactly
+    // when their receipts match, and nothing pinned it. Measured on an
+    // unmodified build: three identical runs of this fixture produced three
+    // different receipt hashes, because whole-project WP targets came out of a
+    // HashMap. That order reached the receipt twice over, as wp.functions and
+    // as the order main_contract_shape_findings walked its findings into
+    // incomplete[], and both are hashed. resolve_wp_targets sorts now.
+    //
+    // Both halves, because they failed for different reasons. Across processes
+    // the HashMap order was the whole problem. Within one process there was a
+    // second: property markers are session-scoped and a live Frama-C renumbers
+    // them, so an identical second check saw the same alarm under a new marker
+    // and those markers were hashed. incomplete_digest strips them and sorts.
+    let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
+
+    let first_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let first = call_tool_json(&first_client, "check", json!({})).await.unwrap();
+    let repeated = call_tool_json(&first_client, "check", json!({})).await.unwrap();
+    let _ = first_client.cancel().await;
+
+    let second_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let second = call_tool_json(&second_client, "check", json!({})).await.unwrap();
+    let _ = second_client.cancel().await;
+
+    // Same server, second call. The markers differ between these two and the
+    // receipt must not.
+    assert_eq!(
+        first["proof_receipt"]["sha256"], repeated["proof_receipt"]["sha256"],
+        "a repeated check on one server produced a different receipt"
+    );
+
+    let first_receipt = &first["proof_receipt"];
+    let second_receipt = &second["proof_receipt"];
+
+    // Named separately before the hash, because a bare hash mismatch says
+    // nothing about which field moved, and these are the two a future change is
+    // most likely to reorder again.
+    assert_eq!(
+        first_receipt["wp"]["functions"], second_receipt["wp"]["functions"],
+        "WP target order moved between identical runs"
+    );
+    assert_eq!(
+        first_receipt["reported"]["incomplete"], second_receipt["reported"]["incomplete"],
+        "the incomplete digest moved between identical runs"
+    );
+    assert_eq!(
+        first_receipt["sha256"], second_receipt["sha256"],
+        "identical runs produced different receipts: {first_receipt:?} vs {second_receipt:?}"
+    );
+}
+
+#[tokio::test]
+async fn wp_targets_do_not_reorder_within_one_session() {
+    // The narrower half of the same fix, and the one that reproduces fastest.
+    // Whole-project WP has no caller-supplied order, so its target list is
+    // whatever resolve_wp_targets returns; unsorted, that was HashMap order and
+    // it differed run to run inside one process too.
+    let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let first = call_tool_json(&client, "check", json!({})).await.unwrap();
+    let second = call_tool_json(&client, "check", json!({})).await.unwrap();
+
+    let functions = first["proof_receipt"]["wp"]["functions"].clone();
+    assert!(
+        functions.as_array().is_some_and(|names| names.len() > 1),
+        "fixture should give WP more than one target: {functions:?}"
+    );
+    assert_eq!(functions, second["proof_receipt"]["wp"]["functions"]);
+
+    // Sorted, which is what makes it a property rather than a coincidence of
+    // this fixture's map layout.
+    let names: Vec<&str> = functions.as_array().unwrap().iter().filter_map(|n| n.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "WP targets are not in a defined order");
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn context_callers_returns_stable_shape_after_eva() {
     let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
     let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
@@ -6670,8 +6852,8 @@ async fn self_check_probes_rather_than_reporting_every_request_unprobed() {
             .as_array()
             .unwrap_or_else(|| panic!("{field} is not an array: {report}"));
 
-        // An empty array would satisfy the loop below without checking anything,
-        // which is the shape of a guard that passes by not running.
+        // An empty array would satisfy the loop below without checking
+        // anything, which is the shape of a guard that passes by not running.
         assert!(!requests.is_empty(), "{field} is empty: {report}");
 
         let undone: Vec<&Value> = requests
@@ -7076,6 +7258,7 @@ async fn check_returns_one_field_set_on_both_paths() {
         "eva",
         "eva_alarms",
         "incomplete",
+        "incomplete_guidance",
         "messages",
         "messages_truncated",
         "proof_receipt",
@@ -7186,7 +7369,7 @@ async fn the_receipt_records_the_contract_it_proved_under() {
     inject("x >= 0 && x <= 1").await.unwrap();
     let narrow = prove().await.unwrap()["proof_receipt"].clone();
 
-    assert_eq!(narrow["schema"], "frama-c-mcp.proof-receipt.v4", "{narrow:?}");
+    assert_eq!(narrow["schema"], RECEIPT_SCHEMA, "{narrow:?}");
 
     // The file never moved, and the receipt is right to say so. That is exactly
     // why the file hashes cannot carry this.

@@ -400,7 +400,7 @@ step that did not run, timed out, or was skipped becomes an `incomplete[]`
 entry, and the verdict falls back to `incomplete` even when nothing failed.
 
 Every entry carries a `code`, and only the code is frozen; see
-[docs/reference/result-schema.md](docs/reference/result-schema.md) for the
+[docs/architecture.md](docs/architecture.md) for the
 payload contract and the change rule. The full set:
 
 <!-- incomplete-codes -->
@@ -437,11 +437,31 @@ run, each with its plugin and source location. A generated `assigns` for an
 uncontracted callee is announced there and nowhere else, and it weakens every
 proof above it.
 
-`check`, `run_wp`, and stored conclusions carry a `proof_receipt`
-(`frama-c-mcp.proof-receipt.v4`): the source-file hash, an `ast_digest`, the
-Frama-C and prover environment, the effective WP configuration, per-goal
-statuses, and a sha256 over all of it. Two runs are comparable exactly when
-their receipts match.
+`check`, `run_wp`, and stored conclusions carry a `proof_receipt`: the
+source-file hash, an `ast_digest`, the
+Frama-C and prover environment, the effective EVA and WP configurations,
+per-goal statuses, and a sha256 over all of it. Two runs are comparable exactly
+when their receipts match.
+
+What it reports about `incomplete[]` is a digest, `{count, codes, sha256}`, not
+the array. The array is already one key away at the payload's top level, and
+embedding it a second time measured 509 KB of a 1.4 MB response on a 1,144-line
+file, almost all of it repeated `guidance` and `source_location` text. The hash
+is over the array as it stands, so any change to any entry still moves the
+receipt and the comparison guarantee is unchanged.
+
+The EVA half of that is read back off the Frama-C process, not copied from the
+request, and the two can disagree on purpose. EVA's settings outlive one call: a
+profile that leaves `precision`, `slevel` or `ilevel` unset issues no setter, so
+whatever an earlier call wrote is still in force, and `-eva-precision` is a
+meta-option that moves a dozen further parameters when it is set. So `check
+{profile: "deep"}` followed by `check {profile: "default"}` reports an empty
+`eva.frama_c_options`, because this run set nothing, beside a
+`proof_receipt.eva` still holding the deep values, because that is what the
+analysis ran with. Read `frama_c_options` as what this call asked for and
+`proof_receipt.eva` as what it got; where they differ, the receipt is the one
+describing the run. `self_check` writes to the same parameters, so a self-check
+shows up in every later receipt the same way.
 
 `ast_digest` is a hash of the normalised AST, and it answers a question the
 source-file hash cannot: what was actually analysed. Different `defines`,
@@ -495,7 +515,7 @@ had none, which happens when the ast-utils plug-in is absent or printing the AST
 outran its budget, and a non-zero count also forces `incomplete`: those variants
 were compared to nothing, and a comparison that did not happen must not read as
 one that happened and found nothing. Field list in
-[docs/reference/result-schema.md](docs/reference/result-schema.md), under the
+[docs/architecture.md](docs/architecture.md), under the
 `frama-c-mcp.check-variants.v1` schema this call returns instead of the usual
 one.
 

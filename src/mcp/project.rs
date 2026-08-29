@@ -23,12 +23,12 @@ async fn reload_health_get(
         .map_err(|error| reload_health_error(request, error))
 }
 
-// Holds fetch_lock across the pair: these are the same process-global
-// cursors every other reader uses, and a health check that bypasses the
-// lock can split one cursor with a concurrent reader (measured: 2 of 50
-// concurrent counts reads came back empty mid-reload before this). The
-// guard is taken directly rather than via client.reload_fetch so each
-// step's error keeps its own request label.
+// Holds fetch_lock across the pair: these are the same process-global cursors
+// every other reader uses, and a health check that bypasses the lock can split
+// one cursor with a concurrent reader (measured: 2 of 50 concurrent counts
+// reads came back empty mid-reload before this). The guard is taken directly
+// rather than via client.reload_fetch so each step's error keeps its own
+// request label.
 async fn reload_health_fetch_all(
     client: &FramaCClient,
     reload_request: &str,
@@ -134,13 +134,18 @@ impl FramaCMcpServer {
         };
         validate_project_options(&project_options)?;
 
-        // Serialized with run_wp on the main instance: the steps below
-        // read the live instance (marker snapshot) and ensure_main_spawned
-        // can respawn or re-parse the very process a proof run is draining
-        // on. The flag is rechecked under the lock because
-        // verify_program_step can set it while this call waits for a run
-        // ahead of it.
+        // Serialized with run_wp on the main instance: the steps below read the
+        // live instance (marker snapshot) and ensure_main_spawned can respawn
+        // or re-parse the very process a proof run is draining on. The flag is
+        // rechecked under the lock because verify_program_step can set it while
+        // this call waits for a run ahead of it.
         let _wp_op_guard = self.main_wp_lock.lock().await;
+
+        // And the EVA transaction, because a re-parse swaps the AST that a
+        // concurrent check's alarms are read against. Taken after the WP lock
+        // and never before it: this is the only site that holds both, so the
+        // order here is the whole ordering rule.
+        let _eva_op_guard = self.main_eva_lock.lock().await;
         if *self.project_locked.read().await {
             return Err(project_locked_error(
                 "reload_project",
@@ -176,10 +181,10 @@ impl FramaCMcpServer {
                 match client_opt {
                     Some(c) if c.is_poisoned() => {
                         // The dead transport cannot answer getFiles, so the
-                        // file list comes from the session's cache of the
-                        // last load instead. ensure_main_spawned reads the
-                        // same flag and respawns, which is what makes the
-                        // fallback a recovery rather than a stale answer.
+                        // file list comes from the session's cache of the last
+                        // load instead. ensure_main_spawned reads the same flag
+                        // and respawns, which is what makes the fallback a
+                        // recovery rather than a stale answer.
                         let files = self
                             .main_frama_c_state
                             .lock()
@@ -731,18 +736,36 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
         "force_includes entries must be non-empty header names of [A-Za-z0-9_./+-] \
          without a leading dash (write \"builtins.h\", not \"-include builtins.h\")",
     )?;
-    if options.machdep.as_deref().is_some_and(str::is_empty) {
-        return Err(McpError::invalid_params("machdep must not be empty", None));
+
+    // These two land in the same argv as the three lists above, as their own
+    // tokens, so the leading-dash rule applies to them for the same reason it
+    // applies there. It used to stop at the three, and the gap read as
+    // deliberate because the error text above teaches the rule.
+    //
+    // compilation_database gets only the dash rule, because it is a path the
+    // caller chose and a real one can hold a character the preprocessor
+    // allowlist was never written for. Refusing those would be this validator
+    // inventing a restriction rather than closing one.
+    //
+    // Frama-C decides whether a non-name machdep argument is YAML from its
+    // contents, so do not infer that from a filename suffix.
+    if let Some(machdep) = options.machdep.as_deref() {
+        if machdep.is_empty() || machdep.starts_with('-') {
+            return Err(McpError::invalid_params(
+                "machdep must be a non-empty predefined name or YAML machdep file path without a \
+                 leading dash (write \"gcc_x86_64\" or \"machdeps/custom\", not \"-machdep gcc_x86_64\")",
+                None,
+            ));
+        }
     }
-    if options
-        .compilation_database
-        .as_deref()
-        .is_some_and(str::is_empty)
-    {
-        return Err(McpError::invalid_params(
-            "compilation_database must not be empty",
-            None,
-        ));
+    if let Some(compilation_database) = options.compilation_database.as_deref() {
+        if compilation_database.is_empty() || compilation_database.starts_with('-') {
+            return Err(McpError::invalid_params(
+                "compilation_database must be a non-empty path without a leading dash \
+                 (write \"build/compile_commands.json\", not \"-json-compilation-database build\")",
+                None,
+            ));
+        }
     }
     Ok(())
 }

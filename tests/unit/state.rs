@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use frama_c_mcp::state::*;
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 
 #[test]
 fn sandbox_metadata_serializes_without_runtime_handles() {
@@ -90,19 +91,16 @@ fn valid_wp_summary(total: u32) -> WpGoalSummary {
     }
 }
 
+/// A receipt shaped the way this build writes them.
 fn proof_receipt_with_goals(env: &str, total: u32) -> serde_json::Value {
     let goals: Vec<_> = (0..total)
         .map(|i| serde_json::json!({"stable_goal_id": format!("g{i}"), "status": "valid"}))
         .collect();
-    serde_json::json!({
-        "schema": "frama-c-mcp.proof-receipt.v2",
-        "sha256": format!("sha-{env}"),
-        "environment": {
-            "frama_c_version": env,
-            "why3_provers": "Alt-Ergo"
-        },
-        "goals": goals
-    })
+    crate::receipt_fixture::fixture_receipt(
+        &format!("sha-{env}"),
+        serde_json::json!({"frama_c_version": env, "why3_provers": "Alt-Ergo"}),
+        goals,
+    )
 }
 
 fn proof_receipt(env: &str) -> serde_json::Value {
@@ -560,7 +558,13 @@ fn round_trip_reachable_conclusion_fields() {
     assert_eq!(stored.wp_summary.as_ref().unwrap().valid, 1);
     assert_eq!(stored.notes, "ok");
     assert_eq!(stored.callees, vec!["g".to_string(), "h".to_string()]);
-    assert_eq!(stored.proof_receipt.as_ref().unwrap()["sha256"], "sha-env-a");
+
+    // Its own hash, not a chosen string: store_conclusion recomputes it, so a
+    // fixture carries the real one and the assertion has to ask the receipt.
+    assert_eq!(
+        stored.proof_receipt.as_ref().unwrap()["sha256"],
+        proof_receipt("env-a")["sha256"]
+    );
     assert!(stored.proof_env_hash.is_some());
 
     let original_json = serde_json::to_value(&stored).expect("serialize");
@@ -591,12 +595,15 @@ fn verified_requires_auditable_proof_evidence() {
         function: "F".into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some(serde_json::json!({
-            "schema": "frama-c-mcp.proof-receipt.v2",
-            "sha256": "sha-bad",
-            "environment": {},
-            "goals": [{"stable_goal_id": "g0", "status": "unknown"}]
-        })),
+
+        // Built with the bad goal rather than spoiled afterwards. Editing a
+        // finished receipt invalidates its hash, so the hash check would fire
+        // first and this case would pass for the wrong reason.
+        proof_receipt: Some(crate::receipt_fixture::fixture_receipt(
+            "bad",
+            serde_json::json!({"frama_c_version": "env-a"}),
+            vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
+        )),
         ..Default::default()
     });
     assert!(bad_goal.unwrap_err().contains("not all valid"));
@@ -611,35 +618,63 @@ fn verified_requires_auditable_proof_evidence() {
     assert!(mismatched_summary.unwrap_err().contains("goal count"));
     assert!(state.get_conclusion("F").is_none());
 
-    // Every version the accept list names. A receipt whose body changed shape
-    // hashes differently, which is what the bump exists to signal, and older
-    // stored work stays readable rather than being invalidated to gain nothing.
-    for version in [
-        "frama-c-mcp.proof-receipt.v2",
-        "frama-c-mcp.proof-receipt.v3",
-        "frama-c-mcp.proof-receipt.v4",
-    ] {
-        let mut receipt = proof_receipt("env-a");
-        receipt["schema"] = serde_json::json!(version);
-        state
-            .store_conclusion(FunctionConclusionUpdate {
-                function: "F".into(),
-                status: Some(VerificationStatus::Verified),
-                wp_summary: Some(valid_wp_summary(1)),
-                proof_receipt: Some(receipt),
-                ..Default::default()
-            })
-            .unwrap_or_else(|e| panic!("{version} should be accepted: {e}"));
-    }
+    // The one version this build writes, taken from the constant the writer
+    // uses, so a bump cannot make the writer and this test disagree.
+    let mut receipt = proof_receipt("env-a");
+    receipt["schema"] = serde_json::json!(RECEIPT_SCHEMA);
+    state
+        .store_conclusion(FunctionConclusionUpdate {
+            function: "F".into(),
+            status: Some(VerificationStatus::Verified),
+            wp_summary: Some(valid_wp_summary(1)),
+            proof_receipt: Some(receipt),
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("{RECEIPT_SCHEMA} should be accepted: {e}"));
 
-    // And the half that was not covered. Accepting the known versions passes
-    // just as well with no guard at all, which is exactly what happened:
-    // deleting the whole schema check left all 366 tests green. A receipt this
-    // server never wrote must not be storable as evidence.
+    // A receipt carrying the right label and the wrong shape. This is what the
+    // string comparison alone let through, and it is the case the guard's own
+    // comment has always described: anyone can write the id, only a receipt
+    // with this build's field set can reproduce it from its own keys. Deleting
+    // the shape half of that check leaves every other case here passing.
+    let relabelled = state.store_conclusion(FunctionConclusionUpdate {
+        function: "G".into(),
+        status: Some(VerificationStatus::Verified),
+        wp_summary: Some(valid_wp_summary(1)),
+        proof_receipt: Some(serde_json::json!({
+            "schema": RECEIPT_SCHEMA,
+            "sha256": "hand-written",
+            "environment": {},
+            "goals": [{"stable_goal_id": "g0", "status": "valid"}]
+        })),
+        ..Default::default()
+    });
+    assert!(
+        relabelled.unwrap_err().contains("not one this build wrote"),
+        "a hand-written receipt wearing this build's name was stored"
+    );
+    assert!(state.get_conclusion("G").is_none());
+
+    // Everything else, superseded versions included. Nothing here carries
+    // backward compatibility except toward Frama-C, and a receipt is the one
+    // artifact where accepting an older format actively costs something: each
+    // shape hashes differently over identical work, so a table holding two of
+    // them stores evidence in units that do not convert.
+    //
+    // The guard also has to exist at all. Accepting the right name passes just
+    // as well with no check, which is exactly what happened: deleting the whole
+    // schema check once left all 366 tests green. Anything that is not the
+    // name. There is no list of superseded versions to enumerate here, and
+    // enumerating one would put the idea back: the schema is a plain name, so
+    // every wrong value is wrong the same way and none of them is a format this
+    // build once wrote. A suffix on the right name is the near miss worth
+    // keeping, because a suffix is exactly what a version used to be.
     for version in [
-        serde_json::json!("frama-c-mcp.proof-receipt.v5"),
-        serde_json::json!("frama-c-mcp.proof-receipt.v1"),
-        serde_json::json!("something-else.v1"),
+        serde_json::json!(format!("{RECEIPT_SCHEMA}.anything")),
+        serde_json::json!(format!("{RECEIPT_SCHEMA}-not-this-one")),
+        serde_json::json!(format!("{RECEIPT_SCHEMA} ")),
+        serde_json::json!(RECEIPT_SCHEMA.replace("receipt", "reciept")),
+        serde_json::json!("some-other-tool.receipt"),
         serde_json::json!(""),
         serde_json::json!(null),
     ] {
@@ -656,7 +691,7 @@ fn verified_requires_auditable_proof_evidence() {
             stored
                 .as_ref()
                 .err()
-                .is_some_and(|e| e.contains("invalid proof_receipt schema")),
+                .is_some_and(|e| e.contains("not one this build wrote")),
             "schema {version} must be refused, got {stored:?}"
         );
     }

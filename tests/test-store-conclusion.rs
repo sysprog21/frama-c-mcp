@@ -7,11 +7,16 @@
 //! subagent guard; its content moved into `semiformal_proof.md`. The negative
 //! assertions below keep it from coming back.
 
+#[path = "support/receipt.rs"]
+mod receipt_fixture;
+
+use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 use frama_c_mcp::mcp::store::{
     expected_sandbox_dir, load_conclusion_dir, load_conclusions_from_disk,
     load_sandbox_metadata_from_disk, persist_conclusion_at, read_long_texts_as_json,
 };
 use frama_c_mcp::state::{
+    proof_receipt_evidence_error,
     FunctionConclusionUpdate, SessionState, VerificationStatus, WpGoalSummary,
 };
 use std::path::Path;
@@ -32,13 +37,138 @@ fn valid_wp_summary() -> WpGoalSummary {
     }
 }
 
+/// A receipt shaped the way this build writes them.
 fn proof_receipt() -> serde_json::Value {
-    serde_json::json!({
-        "schema": "frama-c-mcp.proof-receipt.v2",
-        "sha256": "receipt-sha",
-        "environment": {"frama_c_version": "31.0"},
-        "goals": [{"stable_goal_id": "g0", "status": "valid"}]
-    })
+    receipt_fixture::fixture_receipt(
+        "receipt-sha",
+        serde_json::json!({"frama_c_version": "31.0"}),
+        vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
+    )
+}
+
+/// A conclusion whose receipt this build did not write loads as unverified,
+/// keeps everything else, and says so.
+///
+/// This path had no test at all when it was written, which mattered more than
+/// usual: it is the only code in the tree that changes a stored verification
+/// result without the user asking, it runs once per session at server
+/// construction, and its first version reported through tracing::warn!, which
+/// the default subscriber filters out entirely.
+#[test]
+fn a_conclusion_from_another_build_loads_as_unverified() {
+    let tmp = TempDir::new().unwrap();
+
+    let write = |function: &str, receipt: serde_json::Value| {
+        let dir = tmp.path().join(function);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "function": function,
+            "status": "verified",
+            "specs": [],
+            "notes": "worth keeping",
+            "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
+            "proof_receipt": receipt,
+            "callees": ["helper"],
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    };
+
+    // The current body under a name this build does not write. Derived from the
+    // real name rather than spelled out, so the case stays about "not ours"
+    // instead of naming a version to point at.
+    write("stale", {
+        let mut receipt = proof_receipt();
+        receipt["schema"] = serde_json::json!(format!("{RECEIPT_SCHEMA}-from-another-build"));
+        receipt
+    });
+    write("current", proof_receipt());
+
+    // A receipt with this build's field set and nothing believable in it. The
+    // loader used to check the name and the shape only, so this loaded as
+    // verified and then could not be stored again, because the store path
+    // applies checks the loader skipped. A conclusion that cannot be written
+    // must not be readable either.
+    //
+    // Each is built with the goals it is meant to have rather than edited
+    // afterwards. Editing a finished receipt invalidates its hash, and the hash
+    // is checked before the goals, so a mutated fixture would be refused for
+    // the wrong reason and these branches would never run.
+    //
+    // Bound before writing, so the reason asserted below is the reason for
+    // these exact bytes rather than for a similar receipt built beside them.
+    let env = || serde_json::json!({"frama_c_version": "31.0"});
+    let hollow = receipt_fixture::fixture_receipt("hollow", env(), vec![]);
+    let wrong_status = receipt_fixture::fixture_receipt(
+        "wrong_status",
+        env(),
+        vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
+    );
+    let wrong_count = receipt_fixture::fixture_receipt(
+        "wrong_count",
+        env(),
+        vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
+    );
+    write("hollow", hollow.clone());
+    write("wrong_status", wrong_status.clone());
+    write(
+        "wrong_status",
+        receipt_fixture::fixture_receipt(
+            "wrong_status",
+            env(),
+            vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
+        ),
+    );
+
+    let loaded = load_conclusions_from_disk(tmp.path());
+
+    // The row survives. Dropping it would lose the notes, the callee list and
+    // the record that the function was ever worked on, none of which the
+    // receipt has anything to do with.
+    let stale = loaded.get("stale").expect("the conclusion is kept, not dropped");
+    assert_eq!(stale.status, VerificationStatus::InProgress);
+    assert_eq!(stale.notes, "worth keeping");
+    assert_eq!(stale.callees, vec!["helper".to_string()]);
+
+    // And the claim that rested on the unreadable receipt is gone with it, so
+    // nothing downstream can read this as proved.
+    assert!(stale.proof_receipt.is_none());
+
+    for hollow in ["hollow", "wrong_status"] {
+        let entry = loaded.get(hollow).expect("the conclusion is kept, not dropped");
+        assert_eq!(entry.status, VerificationStatus::InProgress, "{hollow}");
+        assert!(entry.proof_receipt.is_none(), "{hollow}");
+    }
+
+    // And each for the reason it was built for, on the very receipt that went
+    // through the loader. Asserting against a receipt built beside it would
+    // prove the branch exists without proving the fixture reaches it, so a
+    // fixture that started failing on its hash would still look right here.
+    //
+    // wp_summary above says one goal, which is what makes the counts meaningful.
+    assert_eq!(
+        proof_receipt_evidence_error(&hollow, 1).as_deref(),
+        Some("proof_receipt has no goals")
+    );
+    assert_eq!(
+        proof_receipt_evidence_error(&wrong_status, 1).as_deref(),
+        Some("proof_receipt goals are not all valid")
+    );
+
+    // The count branch has no fixture on disk, because a conclusion whose
+    // wp_summary disagrees with its own receipt is a different defect from the
+    // two above. It is named here so the branch is not the only one untested.
+    assert_eq!(
+        proof_receipt_evidence_error(&wrong_count, 2).as_deref(),
+        Some("proof_receipt goal count does not match wp_summary")
+    );
+
+    // And the receipt this build did write passes every one of them.
+    assert_eq!(proof_receipt_evidence_error(&proof_receipt(), 1), None);
+
+    // A receipt this build did write is untouched.
+    let current = loaded.get("current").expect("current conclusion loads");
+    assert_eq!(current.status, VerificationStatus::Verified);
+    assert!(current.proof_receipt.is_some());
 }
 
 #[test]
@@ -211,7 +341,13 @@ fn handler_workflow_long_plus_short() {
     let loaded = load_conclusion_dir(&dir).unwrap();
     assert!(matches!(loaded.status, VerificationStatus::Verified));
     assert_eq!(loaded.notes, "ok");
-    assert_eq!(loaded.proof_receipt.as_ref().unwrap()["sha256"], "receipt-sha");
+
+    // Its own hash: a fixture carries the real one, because store_conclusion
+    // recomputes it and refuses a receipt that disagrees with itself.
+    assert_eq!(
+        loaded.proof_receipt.as_ref().unwrap()["sha256"],
+        proof_receipt()["sha256"]
+    );
     assert!(loaded.proof_env_hash.is_some());
 
     let mut value = serde_json::to_value(&loaded).unwrap();

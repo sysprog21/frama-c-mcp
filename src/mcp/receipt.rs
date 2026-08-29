@@ -119,7 +119,7 @@ pub fn proof_receipt_goals(
 pub fn proof_receipt_with_hash(mut body: serde_json::Value) -> serde_json::Value {
     let digest_input = serde_json::to_vec(&body).unwrap_or_default();
     if let Some(object) = body.as_object_mut() {
-        object.insert("sha256".to_string(), json!(sha256_hex(&digest_input)));
+        object.insert(POST_BODY_KEY.to_string(), json!(sha256_hex(&digest_input)));
     }
     body
 }
@@ -193,15 +193,18 @@ pub fn strip_generated_label(text: &str) -> String {
 
 /// What a receipt is a receipt of, as the caller states it.
 ///
-/// Grouped rather than passed loose because the list runs to eight and four of
+/// Grouped rather than passed loose because the list runs to nine and five of
 /// them are strings or Values in a row: "tool" and "goals_status_source" are
-/// both string slices, and three of the rest are JSON values, so two
+/// both string slices, and four of the rest are JSON values, so two
 /// transposed arguments would compile and produce a receipt that describes a
-/// different run. Named fields make that a build error.
+/// different run. Named fields make that a build error. "wp_config" and
+/// "eva_config" are the sharpest case, being adjacent, same-typed, and both
+/// object-shaped.
 pub struct ProofReceiptRequest<'a> {
     pub tool: &'a str,
     pub source_files: Vec<String>,
     pub wp_config: serde_json::Value,
+    pub eva_config: serde_json::Value,
     pub goals: &'a [serde_json::Value],
     pub stable_scope: Option<&'a str>,
     pub goals_status_source: &'a str,
@@ -221,9 +224,116 @@ pub struct ProofReceiptBody<'a> {
     pub contracts: serde_json::Value,
     pub environment: serde_json::Value,
     pub wp_config: serde_json::Value,
+    pub eva_config: serde_json::Value,
     pub goals: Vec<serde_json::Value>,
     pub goals_status_source: &'a str,
     pub reported: serde_json::Value,
+}
+
+/// What a proof receipt calls itself. A name, not a version.
+pub const RECEIPT_SCHEMA: &str = "frama-c-mcp.proof-receipt";
+
+/// The one key added to a receipt after its body is built.
+///
+/// Named once because two places must agree about it: proof_receipt_with_hash
+/// writes it, and schema_of excludes it so a finished receipt still reproduces
+/// its own shape. A literal in both is the drift this whole change exists to
+/// remove, one level down.
+const POST_BODY_KEY: &str = "sha256";
+
+/// Remove the fields that name something within one Frama-C session, at any
+/// depth.
+///
+/// Depth is the point. A VALID_UNDER_HYP entry carries a "hypotheses" array
+/// whose elements each hold their own "property", so a pass over the entry's
+/// own keys leaves markers behind and the digest still moves: measured, that
+/// was 9 of 29 entries still differing after a top-level strip, all of them
+/// this shape.
+fn strip_session_scoped(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for session_scoped in ["property", "property_marker", "kinstr_marker"] {
+                fields.remove(session_scoped);
+            }
+            for nested in fields.values_mut() {
+                strip_session_scoped(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_session_scoped(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The incomplete[] array as a receipt should carry it: counted, keyed by code,
+/// and hashed over what identifies the gap rather than over the whole entry.
+///
+/// The receipt used to embed the array verbatim, which measured 508,699 bytes
+/// of a 1,426,266-byte check on a 1,144-line file, 36 percent of the response,
+/// and every one of those bytes was already present at the payload's top level.
+/// The guidance and source_location strings are the weight, and a receipt needs
+/// neither: it exists to say whether two runs agree, not to re-explain the gaps
+/// to a reader who has them one key away.
+///
+/// The hash is what keeps the guarantee intact. Any edit to any entry moves the
+/// digest and therefore the receipt sha256, so two runs still match exactly
+/// when
+/// their receipts match. The counts make the receipt legible on its own, which
+/// the raw array was not at that size.
+pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
+    let entries = incomplete.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut codes: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in entries {
+        let code = entry.get("code").and_then(|code| code.as_str()).unwrap_or("UNKNOWN");
+        *codes.entry(code).or_default() += 1;
+    }
+
+    // Session-scoped fields come out before hashing, and the array is sorted.
+    //
+    // A property marker like "#p108" names a property within one Frama-C
+    // session and is renumbered as a live server accumulates them: measured on
+    // tests/fixtures/test_comprehensive.c, a second identical check reported
+    // the same index_bound alarm as "#p190", and the alarms moved order with
+    // it. Hashing those made the receipt a function of when in a session a run
+    // happened, so two checks against one server never matched and the whole
+    // comparison claim held only across fresh processes.
+    //
+    // The marker stays in the payload. It is the handle a caller uses against
+    // the live project, and eva_alarms and the property table are keyed by it;
+    // it is identity for a session and not for a run, which is the distinction
+    // the receipt has to make and the payload does not.
+    //
+    // Sorting is the other half. A stable set of entries in an unstable order
+    // still moves a hash, and nothing about incomplete[] gives its order
+    // meaning: it is grouped by the pass that produced each entry, not ranked.
+    let mut identities: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let mut stripped = entry.clone();
+            strip_session_scoped(&mut stripped);
+            serde_json::to_string(&stripped).unwrap_or_default()
+        })
+        .collect();
+    identities.sort();
+
+    json!({
+        "count": entries.len(),
+        "codes": codes,
+        "sha256": sha256_hex(&serde_json::to_vec(&identities).unwrap_or_default()),
+    })
+}
+
+/// Why a receipt carries no EVA configuration.
+///
+/// Same argument as ast_digest_unavailable_reason below: a receipt travels and
+/// is stored, while the reason a field is empty lives in the check payload's
+/// incomplete[], which does not. The reason goes in the receipt or it is lost,
+/// and four different runs collapse into one shape.
+pub fn eva_config_absent(reason: &str) -> serde_json::Value {
+    json!({"ran": false, "reason": reason})
 }
 
 /// Not a pure function of its input: a null ast_digest draws a fresh nonce, so
@@ -238,13 +348,17 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
         contracts,
         environment,
         wp_config,
+        eva_config,
         goals,
         goals_status_source,
         reported,
     } = body;
     let source_hash = sha256_hex(&serde_json::to_vec(&source_files).unwrap_or_default());
-    json!({
-        "schema": "frama-c-mcp.proof-receipt.v4",
+    let receipt = json!({
+        // The name of the document, carrying no version and no shape. What
+        // shape it is, is schema_of; asking that question needs the receipt,
+        // not a string inside it.
+        "schema": RECEIPT_SCHEMA,
         "subject": {
             "tool": tool,
             "source_hash": source_hash,
@@ -287,9 +401,102 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
         },
         "environment": environment,
         "wp": wp_config,
+
+        // What EVA ran with, read off the process rather than taken from the
+        // request. A profile that leaves a parameter unset issues no setter, so
+        // an earlier call's value is still in force and the request names a run
+        // that did not happen. Absent EVA is an object with a reason rather
+        // than a null, because null would say "not asked for", "reload failed",
+        // "this tool does not run EVA" and "could not be read" all at once, and
+        // the incomplete[] entry that would tell them apart does not travel
+        // with a stored receipt.
+        "eva": eva_config,
         "goals_status_source": goals_status_source,
         "goals": goals,
         "reported": reported,
+    });
+    receipt
+}
+
+/// The shape of a receipt, as a digest of the field names it carries.
+///
+/// Not a version, and not written into the receipt. Versioning is what failed
+/// here: the body gained an "eva" key while the literal still said v4, and it
+/// took a reviewer to notice, because a number a human types is a claim about
+/// the shape that nothing checks. This is the shape itself, recomputed from any
+/// receipt on demand, so there is no claim to keep in step and no counter to
+/// bump.
+///
+/// The receipt's own "schema" field is the plain name RECEIPT_SCHEMA and
+/// carries
+/// no shape information. It says what the document is; this says whether two of
+/// them agree, and store_conclusion is the one caller that needs to ask.
+///
+/// Over the keys proof_receipt_body writes and no deeper. Top level and
+/// "subject" are fixed by that literal, so they move exactly when the format
+/// moves. Everything under "environment", "wp", "eva", "goals" and "reported"
+/// is handed in by callers and differs between tools and between installs, so
+/// including it would make the identifier a property of the run rather than of
+/// the format, and no two receipts would share one.
+///
+/// That boundary is also the historical record: v3 added "subject.contracts",
+/// v4 added "subject.ast_digest", v5 added top-level "eva". Every bump this
+/// format ever had is a key at one of these two levels.
+pub fn schema_of(receipt: &serde_json::Value) -> String {
+    // "sha256" is excluded, and the exclusion is what makes the id reproducible
+    // from a finished receipt. proof_receipt_with_hash adds that key after this
+    // runs, so a receipt on the wire carries nine top-level keys while its own
+    // id was derived from eight. Without this line, schema_of applied to a real
+    // receipt disagrees with the schema that receipt is stamped with, and any
+    // check built on recomputing it would reject every receipt this server
+    // wrote. The hash is a statement about the body, not part of its shape.
+    let names = |value: &serde_json::Value, prefix: &str| -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|fields| {
+                fields
+                    .keys()
+                    .filter(|key| !(prefix.is_empty() && key.as_str() == POST_BODY_KEY))
+                    .map(|key| format!("{prefix}{key}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    let mut skeleton = names(receipt, "");
+    skeleton.extend(names(&receipt["subject"], "subject."));
+    sha256_hex(skeleton.join("\n").as_bytes())[..12].to_string()
+}
+
+/// The shape this build writes, for callers that need it without a receipt in
+/// hand.
+///
+/// Derived by building one, so the writer is the only definition and a checker
+/// cannot drift from it.
+///
+/// proof_receipt_body must never call this. It would re-enter the OnceLock this
+/// caches in, which deadlocks rather than failing, and the derivation would be
+/// circular anyway: the id is a function of the body's keys. schema_of is the
+/// piece that function needs, and it takes the body as an argument for exactly
+/// that reason.
+pub fn receipt_shape() -> &'static str {
+    static SCHEMA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let probe = proof_receipt_body(ProofReceiptBody {
+            tool: "",
+            source_files: Vec::new(),
+            ast_digest: json!(""),
+            ast_digest_unavailable_reason: json!(null),
+            contracts: json!({}),
+            environment: json!({}),
+            wp_config: json!({}),
+            eva_config: json!({}),
+            goals: Vec::new(),
+            goals_status_source: "",
+            reported: json!({}),
+        });
+        schema_of(&probe)
     })
 }
 
@@ -503,6 +710,7 @@ impl FramaCMcpServer {
             tool,
             source_files,
             wp_config,
+            eva_config,
             goals,
             stable_scope,
             goals_status_source,
@@ -547,6 +755,7 @@ impl FramaCMcpServer {
             contracts,
             environment,
             wp_config,
+            eva_config,
             goals: proof_receipt_goals(goals, stable_scope, properties),
             goals_status_source,
             reported,
