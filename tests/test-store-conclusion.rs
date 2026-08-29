@@ -7,6 +7,7 @@
 //! subagent guard; its content moved into `semiformal_proof.md`. The negative
 //! assertions below keep it from coming back.
 
+use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody, RECEIPT_SCHEMA};
 use frama_c_mcp::mcp::store::{
     expected_sandbox_dir, load_conclusion_dir, load_conclusions_from_disk,
     load_sandbox_metadata_from_disk, persist_conclusion_at, read_long_texts_as_json,
@@ -32,13 +33,82 @@ fn valid_wp_summary() -> WpGoalSummary {
     }
 }
 
+/// A receipt shaped the way this build writes them.
+///
+/// Through proof_receipt_body rather than a literal, because store_conclusion
+/// checks the receipt's field set and not just its schema string.
 fn proof_receipt() -> serde_json::Value {
-    serde_json::json!({
-        "schema": "frama-c-mcp.proof-receipt.v2",
-        "sha256": "receipt-sha",
-        "environment": {"frama_c_version": "31.0"},
-        "goals": [{"stable_goal_id": "g0", "status": "valid"}]
-    })
+    let mut receipt = proof_receipt_body(ProofReceiptBody {
+        tool: "check",
+        source_files: vec![serde_json::json!({"path": "a.c", "sha256": "h"})],
+        ast_digest: serde_json::json!("ast"),
+        ast_digest_unavailable_reason: serde_json::json!(null),
+        contracts: serde_json::json!({}),
+        environment: serde_json::json!({"frama_c_version": "31.0"}),
+        wp_config: serde_json::json!({}),
+        goals: vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
+        goals_status_source: "wp_fetch_goals",
+        reported: serde_json::json!({}),
+    });
+    receipt["sha256"] = serde_json::json!("receipt-sha");
+    receipt
+}
+
+/// A conclusion whose receipt this build did not write loads as unverified,
+/// keeps everything else, and says so.
+///
+/// This path had no test at all when it was written, which mattered more than
+/// usual: it is the only code in the tree that changes a stored verification
+/// result without the user asking, it runs once per session at server
+/// construction, and its first version reported through tracing::warn!, which
+/// the default subscriber filters out entirely.
+#[test]
+fn a_conclusion_from_another_build_loads_as_unverified() {
+    let tmp = TempDir::new().unwrap();
+
+    let write = |function: &str, receipt: serde_json::Value| {
+        let dir = tmp.path().join(function);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "function": function,
+            "status": "verified",
+            "specs": [],
+            "notes": "worth keeping",
+            "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
+            "proof_receipt": receipt,
+            "callees": ["helper"],
+        });
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    };
+
+    // The current body under a name this build does not write. Derived from the
+    // real name rather than spelled out, so the case stays about "not ours"
+    // instead of naming a version to point at.
+    write("stale", {
+        let mut receipt = proof_receipt();
+        receipt["schema"] = serde_json::json!(format!("{RECEIPT_SCHEMA}-from-another-build"));
+        receipt
+    });
+    write("current", proof_receipt());
+
+    let loaded = load_conclusions_from_disk(tmp.path());
+
+    // The row survives. Dropping it would lose the notes, the callee list and
+    // the record that the function was ever worked on, none of which the
+    // receipt has anything to do with.
+    let stale = loaded.get("stale").expect("the conclusion is kept, not dropped");
+    assert_eq!(stale.status, VerificationStatus::InProgress);
+    assert_eq!(stale.notes, "worth keeping");
+    assert_eq!(stale.callees, vec!["helper".to_string()]);
+
+    // And the claim that rested on the unreadable receipt is gone with it, so
+    // nothing downstream can read this as proved.
+    assert!(stale.proof_receipt.is_none());
+
+    // A receipt this build did write is untouched.
+    let current = loaded.get("current").expect("current conclusion loads");
+    assert_eq!(current.status, VerificationStatus::Verified);
+    assert!(current.proof_receipt.is_some());
 }
 
 #[test]

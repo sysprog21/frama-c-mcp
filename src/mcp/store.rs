@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 
+use crate::mcp::server::receipt::{receipt_shape, schema_of, RECEIPT_SCHEMA};
+use crate::state::VerificationStatus;
+
 use crate::state::{
     sha256_hex, FunctionVerificationState, ProjectVerificationState, SandboxMetadata,
 };
@@ -609,9 +612,45 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
             Some(s) if is_safe_path_segment(s) => s.to_string(),
             _ => continue,
         };
-        if let Some(c) = load_conclusion_dir(&path) {
-            out.insert(func, c);
+        let Some(mut conclusion) = load_conclusion_dir(&path) else {
+            continue;
+        };
+
+        // A verified conclusion whose receipt this build could not have written
+        // stops being verified, and says so. Nothing here carries backward
+        // compatibility except toward Frama-C, so the receipt cannot be
+        // honoured and the "verified" claim resting on it has to go.
+        //
+        // Downgraded rather than dropped. The first cut of this deleted the
+        // entry, which loses the notes, the specs, the callee list and the
+        // record that the function was ever worked on, for a reason the user
+        // did not ask for and cannot undo. Keeping the row and moving it to
+        // in_progress says the same thing without destroying the work, and the
+        // next store_conclusion for that function merges into a row that is
+        // still there.
+        //
+        // Reported at error level, not warn. The subscriber in main.rs is
+        // EnvFilter::from_default_env(), which admits ERROR only when RUST_LOG
+        // is unset, so a warn here is invisible in ordinary use: the conclusion
+        // would change under the user with no message at all, which is the
+        // fail-loud rule inverted. ci_sets_rust_log_for_the_stdio_suite records
+        // the same fact for the recovered-race warning.
+        if conclusion.status == VerificationStatus::Verified {
+            let receipt = conclusion.proof_receipt.as_ref();
+            if receipt.and_then(|receipt| receipt["schema"].as_str()) != Some(RECEIPT_SCHEMA)
+                || receipt.map(schema_of).as_deref() != Some(receipt_shape())
+            {
+                tracing::error!(
+                    function = %func,
+                    path = %path.display(),
+                    "proof_receipt was not written by this build; the conclusion is no longer \
+                     verified. Re-run verification to restore it."
+                );
+                conclusion.status = VerificationStatus::InProgress;
+                conclusion.proof_receipt = None;
+            }
         }
+        out.insert(func, conclusion);
     }
     out
 }

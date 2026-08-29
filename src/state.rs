@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mcp::server::receipt::{receipt_shape, schema_of, RECEIPT_SCHEMA};
+
 /// A SHA-256 digest as lower case hex, two digits per byte, no separator.
 ///
 /// Spelled out rather than reached through "{:x}", because sha2 0.11 returns an
@@ -845,19 +847,38 @@ impl SessionState {
             return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt", entry.function));
         };
 
-        // Older receipts stay accepted. v3 added the contract snapshot and v4
-        // added the AST digest, so neither compares byte-for-byte with newer
-        // receipts. Rejecting stored work would gain nothing.
+        // The name, and then the shape. The name says what the document is and
+        // nothing more, so anyone can write it; only a receipt carrying this
+        // build's field set reproduces the shape from its own keys. That is
+        // what this guard's test has always claimed to enforce, "a receipt this
+        // server never wrote must not be storable as evidence", and checking
+        // the name alone did not do it: a hand-assembled four-key object
+        // wearing the right name stored fine.
+        //
+        // One shape, the one this build writes, asked of the writer rather than
+        // spelled here. Nothing carries backward compatibility except toward
+        // Frama-C, and a receipt is where accepting an older one actively costs
+        // something: every shape hashes differently over identical work, so a
+        // table holding two of them stores evidence in units that do not
+        // convert. The point of a receipt is that two are comparable, and a
+        // mixed table is exactly where that stops being true.
+        //
+        // Both halves are reported, because the shape is a digest nobody can
+        // guess and the two failures are not the same mistake.
         let schema = receipt.get("schema").and_then(|v| v.as_str());
-        if !matches!(
-            schema,
-            Some(
-                "frama-c-mcp.proof-receipt.v2"
-                    | "frama-c-mcp.proof-receipt.v3"
-                    | "frama-c-mcp.proof-receipt.v4"
-            )
-        ) {
-            return Err(format!("cannot store verified conclusion for '{}': invalid proof_receipt schema", entry.function));
+        let shape = schema_of(receipt);
+        let expected_shape = receipt_shape();
+        if schema != Some(RECEIPT_SCHEMA) || shape != expected_shape {
+            return Err(format!(
+                "cannot store verified conclusion for '{}': proof_receipt is not one this build wrote \
+                 (name {:?}, expected {:?}; field shape {}, expected {}). Pass back the proof_receipt \
+                 this server returned, unchanged.",
+                entry.function,
+                schema.unwrap_or("<missing>"),
+                RECEIPT_SCHEMA,
+                shape,
+                expected_shape
+            ));
         }
         if receipt.get("sha256").and_then(|v| v.as_str()).is_none() {
             return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt sha256", entry.function));

@@ -31,6 +31,8 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
+use frama_c_mcp::mcp::server::receipt::{proof_receipt_body, ProofReceiptBody, RECEIPT_SCHEMA};
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -60,16 +62,27 @@ fn unique_experiment_id(prefix: &str) -> String {
 }
 
 fn verified_conclusion_payload(function: &str) -> Value {
+    // The receipt goes through the real builder. store_conclusion checks the
+    // field set and not only the name, so a hand-written four-key object is
+    // refused; these fixtures were the thing exploiting the weaker check.
+    let mut receipt = proof_receipt_body(ProofReceiptBody {
+        tool: "check",
+        source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+        ast_digest: json!("ast"),
+        ast_digest_unavailable_reason: json!(null),
+        contracts: json!({}),
+        environment: json!({"frama_c_version": "test"}),
+        wp_config: json!({}),
+        goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+        goals_status_source: "wp_fetch_goals",
+        reported: json!({}),
+    });
+    receipt["sha256"] = json!(format!("sha-{function}"));
     json!({
         "function": function,
         "status": "verified",
         "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
-        "proof_receipt": {
-            "schema": "frama-c-mcp.proof-receipt.v2",
-            "sha256": format!("sha-{function}"),
-            "environment": {"frama_c_version": "test"},
-            "goals": [{"stable_goal_id": "g0", "status": "valid"}]
-        }
+        "proof_receipt": receipt
     })
 }
 
@@ -7186,7 +7199,7 @@ async fn the_receipt_records_the_contract_it_proved_under() {
     inject("x >= 0 && x <= 1").await.unwrap();
     let narrow = prove().await.unwrap()["proof_receipt"].clone();
 
-    assert_eq!(narrow["schema"], "frama-c-mcp.proof-receipt.v4", "{narrow:?}");
+    assert_eq!(narrow["schema"], RECEIPT_SCHEMA, "{narrow:?}");
 
     // The file never moved, and the receipt is right to say so. That is exactly
     // why the file hashes cannot carry this.
