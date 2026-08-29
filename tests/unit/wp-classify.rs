@@ -581,6 +581,43 @@ fn the_receipt_digests_incomplete_rather_than_copying_it() {
     // An empty run and a missing key agree, because both mean no gaps.
     assert_eq!(incomplete_digest(&json!([]))["count"], 0);
     assert_eq!(incomplete_digest(&json!(null))["count"], 0);
+    // Session-scoped markers do not reach the hash, at any depth. A property
+    // marker names a property within one Frama-C session and a live server
+    // renumbers them, so hashing one made the receipt depend on when in a
+    // session the run happened. The nested case is the one that matters: a
+    // VALID_UNDER_HYP entry keeps its markers inside "hypotheses", where a pass
+    // over the entry's own keys never reaches them.
+    let with_markers = json!([{
+        "code": "VALID_UNDER_HYP",
+        "frama_c_goal_name": "Assigns nothing (exit)",
+        "property": "#p61",
+        "hypotheses": [{"normalized_status": "valid", "property": "#p61"}],
+    }]);
+    let renumbered = json!([{
+        "code": "VALID_UNDER_HYP",
+        "frama_c_goal_name": "Assigns nothing (exit)",
+        "property": "#p176",
+        "hypotheses": [{"normalized_status": "valid", "property": "#p176"}],
+    }]);
+    assert_eq!(
+        incomplete_digest(&with_markers)["sha256"],
+        incomplete_digest(&renumbered)["sha256"],
+        "renumbered markers moved the digest"
+    );
+
+    // But a real difference beside a renumbered marker still moves it.
+    let mut real_change = renumbered.clone();
+    real_change[0]["hypotheses"][0]["normalized_status"] = json!("unknown");
+    assert_ne!(
+        incomplete_digest(&with_markers)["sha256"],
+        incomplete_digest(&real_change)["sha256"]
+    );
+
+    // Order does not, since incomplete[] is grouped by producing pass and not
+    // ranked, and a stable set in an unstable order still moves a hash.
+    let one = json!([entry("PROPERTY_DEAD", "a"), entry("GOAL_NOT_VALID", "b")]);
+    let other = json!([entry("GOAL_NOT_VALID", "b"), entry("PROPERTY_DEAD", "a")]);
+    assert_eq!(incomplete_digest(&one)["sha256"], incomplete_digest(&other)["sha256"]);
 
 }
 

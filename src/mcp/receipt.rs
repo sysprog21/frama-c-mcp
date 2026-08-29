@@ -318,8 +318,35 @@ pub fn receipt_shape() -> &'static str {
     })
 }
 
+/// Remove the fields that name something within one Frama-C session, at any
+/// depth.
+///
+/// Depth is the point. A VALID_UNDER_HYP entry carries a "hypotheses" array
+/// whose elements each hold their own "property", so a pass over the entry's
+/// own keys leaves markers behind and the digest still moves: measured, that
+/// was 9 of 29 entries still differing after a top-level strip, all of them
+/// this shape.
+fn strip_session_scoped(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for session_scoped in ["property", "property_marker", "kinstr_marker"] {
+                fields.remove(session_scoped);
+            }
+            for nested in fields.values_mut() {
+                strip_session_scoped(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_session_scoped(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The incomplete[] array as a receipt should carry it: counted, keyed by code,
-/// and hashed.
+/// and hashed over what identifies the gap rather than over the whole entry.
 ///
 /// The receipt used to embed the array verbatim, which measured 508,699 bytes
 /// of a 1,426,266-byte check on a 1,144-line file, 36 percent of the response,
@@ -341,12 +368,38 @@ pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
         *codes.entry(code).or_default() += 1;
     }
 
+    // Session-scoped fields come out before hashing, and the array is sorted.
+    //
+    // A property marker like "#p108" names a property within one Frama-C
+    // session and is renumbered as a live server accumulates them: measured on
+    // tests/fixtures/test_comprehensive.c, a second identical check reported
+    // the same index_bound alarm as "#p190", and the alarms moved order with
+    // it. Hashing those made the receipt a function of when in a session a run
+    // happened, so two checks against one server never matched and the whole
+    // comparison claim held only across fresh processes.
+    //
+    // The marker stays in the payload. It is the handle a caller uses against
+    // the live project, and eva_alarms and the property table are keyed by it;
+    // it is identity for a session and not for a run, which is the distinction
+    // the receipt has to make and the payload does not.
+    //
+    // Sorting is the other half. A stable set of entries in an unstable order
+    // still moves a hash, and nothing about incomplete[] gives its order
+    // meaning: it is grouped by the pass that produced each entry, not ranked.
+    let mut identities: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let mut stripped = entry.clone();
+            strip_session_scoped(&mut stripped);
+            serde_json::to_string(&stripped).unwrap_or_default()
+        })
+        .collect();
+    identities.sort();
+
     json!({
         "count": entries.len(),
         "codes": codes,
-        // Over the array as it stands, so the digest is a function of the
-        // same bytes the payload reports.
-        "sha256": sha256_hex(&serde_json::to_vec(incomplete).unwrap_or_default()),
+        "sha256": sha256_hex(&serde_json::to_vec(&identities).unwrap_or_default()),
     })
 }
 

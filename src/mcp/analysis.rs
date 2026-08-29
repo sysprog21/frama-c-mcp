@@ -3172,7 +3172,24 @@ impl FramaCMcpServer {
             .await?;
             self.state.write().await.update_functions(&entries);
             let state = self.state.read().await;
-            return Ok(state.functions.values().cloned().collect());
+
+            // Sorted, because this list is the run's identity and a HashMap
+            // does not have one. It becomes wp_config.functions in the receipt
+            // and it is the order main_contract_shape_findings walks, so its
+            // findings reach incomplete[] in whatever order the map iterated.
+            // Both are hashed into proof_receipt.sha256. Measured on
+            // tests/fixtures/test_comprehensive.c before this line was sorted:
+            // three identical runs produced three different receipts, which is
+            // the exact opposite of what a receipt is for, and it reproduced on
+            // an unmodified build so it was never a symptom of the code above.
+            //
+            // Whole-project WP has no meaningful target order to preserve, so
+            // alphabetical costs nothing. The explicit-names path below already
+            // follows the caller's order and must keep doing so.
+            let mut targets: Vec<crate::state::FunctionInfo> =
+                state.functions.values().cloned().collect();
+            targets.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(targets);
         };
         let mut infos = Vec::new();
         for name in names {
