@@ -254,7 +254,8 @@ pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Resul
 /// Two shapes produce one: Path::parent answers Some("") for a bare file name
 /// rather than None, and FRAMA_C_MCP_STATE_DIR set to an empty string makes
 /// conclusion_base_dir itself empty. Both mean the working directory to every
-/// caller, but the filesystem disagrees about which calls accept it. create_dir_all
+/// caller, but the filesystem disagrees about which calls accept it.
+/// create_dir_all
 /// and join take "" happily; read_dir and a temp file creation both fail on it,
 /// so a sweep would quietly do nothing and a write would error. One conversion
 /// here rather than a different guess at each call site.

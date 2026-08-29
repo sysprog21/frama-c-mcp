@@ -509,7 +509,8 @@ fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf>
 
 /// Every workflow file, sorted.
 ///
-/// The directory rather than ci.yml by name, which is the lesson ci_command_text
+/// The directory rather than ci.yml by name, which is the lesson
+/// ci_command_text
 /// above records: the artifact scan once lived in a second workflow file and a
 /// guard reading one file by name reported all clear having compared nothing.
 fn workflow_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -584,12 +585,15 @@ fn workflow_jobs(text: &str) -> Vec<(String, String)> {
         if !in_jobs {
             continue;
         }
+
         // A trailing comment does not stop a line from naming a job, and YAML
         // allows one. Testing the raw line for a closing colon made
         // "  build:  # note" fail the test, which merged that job into its
         // predecessor and let a caller searching one body read two jobs as one.
-        // Found by a control that added such a comment; the guard it broke was
-        // failing green.
+        // The spacing in that example is the point and is not reflowed: two
+        // spaces of YAML indent, two before the comment marker. Found by a
+        // control that added such a comment; the guard it broke was failing
+        // green.
         let header = match line.split_once(" #") {
             Some((before, _)) => before,
             None => line,
@@ -1307,9 +1311,11 @@ fn ci_still_scans_dependencies_for_advisories() {
 /// A job that runs and is not among the release job's needs can be red while
 /// the rolling tag is republished, which is a green badge over a binary nothing
 /// vouched for. Measured on 2026-08-28: release needs five jobs while CLAUDE.md
-/// described four, having dropped plugin-floor, so the document did not say that
+/// described four, having dropped plugin-floor, so the document did not say
+/// that
 /// a Frama-C 32.1 build failure blocks a release. No guard can read that
-/// document, since it is never checked in, so this pins the fact rather than the
+/// document, since it is never checked in, so this pins the fact rather than
+/// the
 /// prose.
 ///
 /// A job that deliberately does not gate a release will fail here. That is the
@@ -1366,7 +1372,8 @@ fn the_release_waits_for_every_lane() {
 /// src/main.rs builds its subscriber from the environment, and EnvFilter admits
 /// ERROR only when RUST_LOG is unset, so the recovered-race warn that
 /// scripts/check-stdio-refusal.sh counts exists only when this variable is set.
-/// Drop it from either caller and the script prints "0 recovered" for every run,
+/// Drop it from either caller and the script prints "0 recovered" for every
+/// run,
 /// which is exactly what a healthy run prints. That is the silent-drift shape
 /// this file already has several tests about, and it arrived with the two
 /// callers rather than by drift between them.

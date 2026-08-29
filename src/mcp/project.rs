@@ -23,12 +23,12 @@ async fn reload_health_get(
         .map_err(|error| reload_health_error(request, error))
 }
 
-// Holds fetch_lock across the pair: these are the same process-global
-// cursors every other reader uses, and a health check that bypasses the
-// lock can split one cursor with a concurrent reader (measured: 2 of 50
-// concurrent counts reads came back empty mid-reload before this). The
-// guard is taken directly rather than via client.reload_fetch so each
-// step's error keeps its own request label.
+// Holds fetch_lock across the pair: these are the same process-global cursors
+// every other reader uses, and a health check that bypasses the lock can split
+// one cursor with a concurrent reader (measured: 2 of 50 concurrent counts
+// reads came back empty mid-reload before this). The guard is taken directly
+// rather than via client.reload_fetch so each step's error keeps its own
+// request label.
 async fn reload_health_fetch_all(
     client: &FramaCClient,
     reload_request: &str,
@@ -134,12 +134,11 @@ impl FramaCMcpServer {
         };
         validate_project_options(&project_options)?;
 
-        // Serialized with run_wp on the main instance: the steps below
-        // read the live instance (marker snapshot) and ensure_main_spawned
-        // can respawn or re-parse the very process a proof run is draining
-        // on. The flag is rechecked under the lock because
-        // verify_program_step can set it while this call waits for a run
-        // ahead of it.
+        // Serialized with run_wp on the main instance: the steps below read the
+        // live instance (marker snapshot) and ensure_main_spawned can respawn
+        // or re-parse the very process a proof run is draining on. The flag is
+        // rechecked under the lock because verify_program_step can set it while
+        // this call waits for a run ahead of it.
         let _wp_op_guard = self.main_wp_lock.lock().await;
         if *self.project_locked.read().await {
             return Err(project_locked_error(
@@ -731,6 +730,7 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
         "force_includes entries must be non-empty header names of [A-Za-z0-9_./+-] \
          without a leading dash (write \"builtins.h\", not \"-include builtins.h\")",
     )?;
+
     if options.machdep.as_deref().is_some_and(str::is_empty) {
         return Err(McpError::invalid_params("machdep must not be empty", None));
     }
