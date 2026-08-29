@@ -112,6 +112,7 @@ fn proof_receipt_with_goals(env: &str, total: u32) -> serde_json::Value {
             "why3_provers": "Alt-Ergo"
         }),
         wp_config: serde_json::json!({}),
+        eva_config: serde_json::json!({}),
         goals,
         goals_status_source: "wp_fetch_goals",
         reported: serde_json::json!({}),

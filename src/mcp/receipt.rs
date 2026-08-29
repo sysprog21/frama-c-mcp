@@ -193,15 +193,18 @@ pub fn strip_generated_label(text: &str) -> String {
 
 /// What a receipt is a receipt of, as the caller states it.
 ///
-/// Grouped rather than passed loose because the list runs to eight and four of
+/// Grouped rather than passed loose because the list runs to nine and five of
 /// them are strings or Values in a row: "tool" and "goals_status_source" are
-/// both string slices, and three of the rest are JSON values, so two
+/// both string slices, and four of the rest are JSON values, so two
 /// transposed arguments would compile and produce a receipt that describes a
-/// different run. Named fields make that a build error.
+/// different run. Named fields make that a build error. "wp_config" and
+/// "eva_config" are the sharpest case, being adjacent, same-typed, and both
+/// object-shaped.
 pub struct ProofReceiptRequest<'a> {
     pub tool: &'a str,
     pub source_files: Vec<String>,
     pub wp_config: serde_json::Value,
+    pub eva_config: serde_json::Value,
     pub goals: &'a [serde_json::Value],
     pub stable_scope: Option<&'a str>,
     pub goals_status_source: &'a str,
@@ -221,6 +224,7 @@ pub struct ProofReceiptBody<'a> {
     pub contracts: serde_json::Value,
     pub environment: serde_json::Value,
     pub wp_config: serde_json::Value,
+    pub eva_config: serde_json::Value,
     pub goals: Vec<serde_json::Value>,
     pub goals_status_source: &'a str,
     pub reported: serde_json::Value,
@@ -236,87 +240,6 @@ pub const RECEIPT_SCHEMA: &str = "frama-c-mcp.proof-receipt";
 /// its own shape. A literal in both is the drift this whole change exists to
 /// remove, one level down.
 const POST_BODY_KEY: &str = "sha256";
-
-/// The shape of a receipt, as a digest of the field names it carries.
-///
-/// Not a version, and not written into the receipt. Versioning is what failed
-/// here: the body gained an "eva" key while the literal still said v4, and it
-/// took a reviewer to notice, because a number a human types is a claim about
-/// the shape that nothing checks. This is the shape itself, recomputed from any
-/// receipt on demand, so there is no claim to keep in step and no counter to
-/// bump.
-///
-/// The receipt's own "schema" field is the plain name RECEIPT_SCHEMA and
-/// carries
-/// no shape information. It says what the document is; this says whether two of
-/// them agree, and store_conclusion is the one caller that needs to ask.
-///
-/// Over the keys proof_receipt_body writes and no deeper. Top level and
-/// "subject" are fixed by that literal, so they move exactly when the format
-/// moves. Everything under "environment", "wp", "eva", "goals" and "reported"
-/// is handed in by callers and differs between tools and between installs, so
-/// including it would make the identifier a property of the run rather than of
-/// the format, and no two receipts would share one.
-///
-/// That boundary is also the historical record: v3 added "subject.contracts",
-/// v4 added "subject.ast_digest", v5 added top-level "eva". Every bump this
-/// format ever had is a key at one of these two levels.
-pub fn schema_of(receipt: &serde_json::Value) -> String {
-    // "sha256" is excluded, and the exclusion is what makes the id reproducible
-    // from a finished receipt. proof_receipt_with_hash adds that key after this
-    // runs, so a receipt on the wire carries nine top-level keys while its own
-    // id was derived from eight. Without this line, schema_of applied to a real
-    // receipt disagrees with the schema that receipt is stamped with, and any
-    // check built on recomputing it would reject every receipt this server
-    // wrote. The hash is a statement about the body, not part of its shape.
-    let names = |value: &serde_json::Value, prefix: &str| -> Vec<String> {
-        let mut keys: Vec<String> = value
-            .as_object()
-            .map(|fields| {
-                fields
-                    .keys()
-                    .filter(|key| !(prefix.is_empty() && key.as_str() == POST_BODY_KEY))
-                    .map(|key| format!("{prefix}{key}"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        keys.sort();
-        keys
-    };
-    let mut skeleton = names(receipt, "");
-    skeleton.extend(names(&receipt["subject"], "subject."));
-    sha256_hex(skeleton.join("\n").as_bytes())[..12].to_string()
-}
-
-/// The shape this build writes, for callers that need it without a receipt in
-/// hand.
-///
-/// Derived by building one, so the writer is the only definition and a checker
-/// cannot drift from it.
-///
-/// proof_receipt_body must never call this. It would re-enter the OnceLock this
-/// caches in, which deadlocks rather than failing, and the derivation would be
-/// circular anyway: the id is a function of the body's keys. schema_of is the
-/// piece that function needs, and it takes the body as an argument for exactly
-/// that reason.
-pub fn receipt_shape() -> &'static str {
-    static SCHEMA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SCHEMA.get_or_init(|| {
-        let probe = proof_receipt_body(ProofReceiptBody {
-            tool: "",
-            source_files: Vec::new(),
-            ast_digest: json!(""),
-            ast_digest_unavailable_reason: json!(null),
-            contracts: json!({}),
-            environment: json!({}),
-            wp_config: json!({}),
-            goals: Vec::new(),
-            goals_status_source: "",
-            reported: json!({}),
-        });
-        schema_of(&probe)
-    })
-}
 
 /// Remove the fields that name something within one Frama-C session, at any
 /// depth.
@@ -403,6 +326,16 @@ pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Why a receipt carries no EVA configuration.
+///
+/// Same argument as ast_digest_unavailable_reason below: a receipt travels and
+/// is stored, while the reason a field is empty lives in the check payload's
+/// incomplete[], which does not. The reason goes in the receipt or it is lost,
+/// and four different runs collapse into one shape.
+pub fn eva_config_absent(reason: &str) -> serde_json::Value {
+    json!({"ran": false, "reason": reason})
+}
+
 /// Not a pure function of its input: a null ast_digest draws a fresh nonce, so
 /// two calls on identical bodies differ by design. Every other input is
 /// deterministic.
@@ -415,12 +348,16 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
         contracts,
         environment,
         wp_config,
+        eva_config,
         goals,
         goals_status_source,
         reported,
     } = body;
     let source_hash = sha256_hex(&serde_json::to_vec(&source_files).unwrap_or_default());
-    json!({
+    let receipt = json!({
+        // The name of the document, carrying no version and no shape. What
+        // shape it is, is schema_of; asking that question needs the receipt,
+        // not a string inside it.
         "schema": RECEIPT_SCHEMA,
         "subject": {
             "tool": tool,
@@ -464,9 +401,102 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
         },
         "environment": environment,
         "wp": wp_config,
+
+        // What EVA ran with, read off the process rather than taken from the
+        // request. A profile that leaves a parameter unset issues no setter, so
+        // an earlier call's value is still in force and the request names a run
+        // that did not happen. Absent EVA is an object with a reason rather
+        // than a null, because null would say "not asked for", "reload failed",
+        // "this tool does not run EVA" and "could not be read" all at once, and
+        // the incomplete[] entry that would tell them apart does not travel
+        // with a stored receipt.
+        "eva": eva_config,
         "goals_status_source": goals_status_source,
         "goals": goals,
         "reported": reported,
+    });
+    receipt
+}
+
+/// The shape of a receipt, as a digest of the field names it carries.
+///
+/// Not a version, and not written into the receipt. Versioning is what failed
+/// here: the body gained an "eva" key while the literal still said v4, and it
+/// took a reviewer to notice, because a number a human types is a claim about
+/// the shape that nothing checks. This is the shape itself, recomputed from any
+/// receipt on demand, so there is no claim to keep in step and no counter to
+/// bump.
+///
+/// The receipt's own "schema" field is the plain name RECEIPT_SCHEMA and
+/// carries
+/// no shape information. It says what the document is; this says whether two of
+/// them agree, and store_conclusion is the one caller that needs to ask.
+///
+/// Over the keys proof_receipt_body writes and no deeper. Top level and
+/// "subject" are fixed by that literal, so they move exactly when the format
+/// moves. Everything under "environment", "wp", "eva", "goals" and "reported"
+/// is handed in by callers and differs between tools and between installs, so
+/// including it would make the identifier a property of the run rather than of
+/// the format, and no two receipts would share one.
+///
+/// That boundary is also the historical record: v3 added "subject.contracts",
+/// v4 added "subject.ast_digest", v5 added top-level "eva". Every bump this
+/// format ever had is a key at one of these two levels.
+pub fn schema_of(receipt: &serde_json::Value) -> String {
+    // "sha256" is excluded, and the exclusion is what makes the id reproducible
+    // from a finished receipt. proof_receipt_with_hash adds that key after this
+    // runs, so a receipt on the wire carries nine top-level keys while its own
+    // id was derived from eight. Without this line, schema_of applied to a real
+    // receipt disagrees with the schema that receipt is stamped with, and any
+    // check built on recomputing it would reject every receipt this server
+    // wrote. The hash is a statement about the body, not part of its shape.
+    let names = |value: &serde_json::Value, prefix: &str| -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .map(|fields| {
+                fields
+                    .keys()
+                    .filter(|key| !(prefix.is_empty() && key.as_str() == POST_BODY_KEY))
+                    .map(|key| format!("{prefix}{key}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    let mut skeleton = names(receipt, "");
+    skeleton.extend(names(&receipt["subject"], "subject."));
+    sha256_hex(skeleton.join("\n").as_bytes())[..12].to_string()
+}
+
+/// The shape this build writes, for callers that need it without a receipt in
+/// hand.
+///
+/// Derived by building one, so the writer is the only definition and a checker
+/// cannot drift from it.
+///
+/// proof_receipt_body must never call this. It would re-enter the OnceLock this
+/// caches in, which deadlocks rather than failing, and the derivation would be
+/// circular anyway: the id is a function of the body's keys. schema_of is the
+/// piece that function needs, and it takes the body as an argument for exactly
+/// that reason.
+pub fn receipt_shape() -> &'static str {
+    static SCHEMA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let probe = proof_receipt_body(ProofReceiptBody {
+            tool: "",
+            source_files: Vec::new(),
+            ast_digest: json!(""),
+            ast_digest_unavailable_reason: json!(null),
+            contracts: json!({}),
+            environment: json!({}),
+            wp_config: json!({}),
+            eva_config: json!({}),
+            goals: Vec::new(),
+            goals_status_source: "",
+            reported: json!({}),
+        });
+        schema_of(&probe)
     })
 }
 
@@ -680,6 +710,7 @@ impl FramaCMcpServer {
             tool,
             source_files,
             wp_config,
+            eva_config,
             goals,
             stable_scope,
             goals_status_source,
@@ -724,6 +755,7 @@ impl FramaCMcpServer {
             contracts,
             environment,
             wp_config,
+            eva_config,
             goals: proof_receipt_goals(goals, stable_scope, properties),
             goals_status_source,
             reported,

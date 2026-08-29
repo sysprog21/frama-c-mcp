@@ -2004,6 +2004,26 @@ pub struct FramaCMcpServer {
     ///
     /// Outermost lock: taken before the client lock, never inside it.
     main_wp_lock: Arc<AsyncMutex<()>>,
+
+    /// Held across a whole EVA transaction on the main instance: the parameter
+    /// setters, compute, and the readback that tells the receipt what ran.
+    ///
+    /// EVA's parameters are process-global state and the client mutex covers
+    /// one request only, so two interleaved runs produce a receipt built from
+    /// one run's settings and the other's verdict. Same hazard main_wp_lock
+    /// covers for WP, and the same cost: a compute measured in minutes holds
+    /// this the whole time.
+    ///
+    /// Ordered after main_wp_lock. reload_project is the only site that holds
+    /// both, and it takes wp then eva, so that is the whole ordering rule.
+    /// Nothing reached under this guard acquires the WP lock: check_eva_step
+    /// holds it across run_eva_payload and eva_alarms_payload only, and neither
+    /// takes a lock beyond the client mutex.
+    ///
+    /// It used to be disjoint, and the comment here said so. reload_project
+    /// joined the transaction because a re-parse swaps the AST a concurrent
+    /// check reads its alarms against, and that made an order exist.
+    main_eva_lock: Arc<AsyncMutex<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -2425,6 +2445,7 @@ impl FramaCMcpServer {
                 tool: "run_wp",
                 source_files,
                 wp_config: response["effective_wp_config"].clone(),
+                eva_config: eva_config_absent("tool_does_not_run_eva"),
                 goals: wp_goals,
                 stable_scope: report_function,
                 goals_status_source: "wp_fetch_goals",
@@ -2575,6 +2596,7 @@ impl FramaCMcpServer {
             project_locked: Arc::new(RwLock::new(false)),
             wp_cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             main_wp_lock: Arc::new(AsyncMutex::new(())),
+            main_eva_lock: Arc::new(AsyncMutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
@@ -2746,11 +2768,11 @@ impl FramaCMcpServer {
         let _wp_op_guard = wp_lock.lock().await;
 
         // The client comes from the same registry read that revalidates the
-        // lock. A delete_sandbox that landed while this call waited has
-        // already removed the entry and killed the process, and a sandbox
-        // recreated under the same id owns a fresh lock and a fresh client;
-        // either way a client resolved before the wait belongs to a process
-        // this transaction must not talk to.
+        // lock. A delete_sandbox that landed while this call waited has already
+        // removed the entry and killed the process, and a sandbox recreated
+        // under the same id owns a fresh lock and a fresh client; either way a
+        // client resolved before the wait belongs to a process this transaction
+        // must not talk to.
         let client = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes
@@ -2758,17 +2780,16 @@ impl FramaCMcpServer {
                 .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
         };
 
-        // A delete can still land after this point: cleanup_sandbox never
-        // takes wp_lock, on purpose. A WP run can hold this lock for tens
-        // of minutes, and delete_sandbox is the force-kill escape for a
-        // wedged sandbox, so queuing deletion behind the lock would remove
-        // the only way to kill one. A delete that lands mid-run kills the
-        // process group, and the next request on this client fails with a
-        // broken pipe rather than silently corrupting the run. The cloned
-        // client is bound to the killed process's pipes, so it can never
-        // reach a sandbox recreated under the same id, and sandbox clients
-        // never respawn (that path is main-instance-only), so nothing
-        // outlives the kill.
+        // A delete can still land after this point: cleanup_sandbox never takes
+        // wp_lock, on purpose. A WP run can hold this lock for tens of minutes,
+        // and delete_sandbox is the force-kill escape for a wedged sandbox, so
+        // queuing deletion behind the lock would remove the only way to kill
+        // one. A delete that lands mid-run kills the process group, and the
+        // next request on this client fails with a broken pipe rather than
+        // silently corrupting the run. The cloned client is bound to the killed
+        // process's pipes, so it can never reach a sandbox recreated under the
+        // same id, and sandbox clients never respawn (that path is
+        // main-instance-only), so nothing outlives the kill.
         self.apply_wp_config(&client, params, requested_provers.as_ref())
             .await?;
 
@@ -3823,7 +3844,7 @@ pub mod propose;
 
 #[path = "receipt.rs"]
 pub mod receipt;
-use receipt::{incomplete_digest, proof_receipt_goals, ProofReceiptRequest};
+use receipt::{eva_config_absent, incomplete_digest, proof_receipt_goals, ProofReceiptRequest};
 
 #[path = "eacsl.rs"]
 pub mod eacsl;

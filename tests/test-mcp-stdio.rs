@@ -73,6 +73,7 @@ fn verified_conclusion_payload(function: &str) -> Value {
         contracts: json!({}),
         environment: json!({"frama_c_version": "test"}),
         wp_config: json!({}),
+        eva_config: json!({}),
         goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
         goals_status_source: "wp_fetch_goals",
         reported: json!({}),
@@ -4334,6 +4335,102 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
             investigation
         );
     }
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn check_receipt_reports_eva_settings_left_by_an_earlier_call() {
+    let c_file = tutorial_c("eva-rotate.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let deep = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "profile": "deep",
+        "function": "eva_main",
+    }))
+    .await
+    .unwrap();
+    let default = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "profile": "default",
+        "function": "eva_main",
+    }))
+    .await
+    .unwrap();
+
+    let deep_config = deep["proof_receipt"]["eva"].clone();
+    assert!(deep_config.is_object(), "deep EVA config missing: {deep:?}");
+    assert_eq!(default["eva"]["requested_options"]["profile"], "default");
+
+    // Every key answered. The readback is best effort per key so that one
+    // unanswerable request cannot throw away an analysis that already ran, and
+    // the cost of that is a wrong request name degrading silently into
+    // {"unavailable": ...} instead of failing. This is what makes it loud
+    // again, and it is the only thing pinning the sixteen request names against
+    // a real Frama-C.
+    for config in [&deep_config, &default["proof_receipt"]["eva"]] {
+        let entries = config.as_object().expect("EVA config object");
+        assert!(entries.len() >= 16, "too few EVA settings read back: {entries:?}");
+        for (key, value) in entries {
+            assert!(
+                value.get("unavailable").is_none(),
+                "EVA setting {key} was not readable: {value:?}"
+            );
+        }
+    }
+
+    // And what it ran with is the deep configuration, because nothing resets
+    // EVA between calls: the default profile leaves precision, slevel and
+    // ilevel unset, so it issues no setter and the earlier call's values are
+    // still in force on the shared process.
+    //
+    // This assertion deliberately encodes present behavior. Resetting the
+    // settings between calls is a separate change, and when it lands this line
+    // goes red. That is the fix arriving, not a regression: update it to assert
+    // the two configurations differ. Do not delete it, or nothing pins that the
+    // receipt follows the process rather than the request.
+    assert_eq!(default["proof_receipt"]["eva"], deep_config);
+
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn check_receipts_distinguish_eva_entry_points() {
+    let c_file = workspace_path("tests/fixtures/test_abs.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let main = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "function": "main",
+    }))
+    .await
+    .unwrap();
+    let abs_val = call_tool_json(&client, "check", json!({
+        "want": ["eva"],
+        "function": "abs_val",
+    }))
+    .await
+    .unwrap();
+
+    assert_eq!(main["proof_receipt"]["eva"]["main_function"], "main");
+    assert_eq!(abs_val["proof_receipt"]["eva"]["main_function"], "abs_val");
+
+    // The entry point is the only thing that moved, so it must be the only key
+    // that differs. A sha256 comparison would say nothing here: analysing
+    // abs_val with an unknown int argument raises an overflow alarm that main
+    // does not, so the two receipts differ in "reported" whether or not the EVA
+    // configuration is in them at all.
+    let mut main_config = main["proof_receipt"]["eva"].clone();
+    let mut abs_config = abs_val["proof_receipt"]["eva"].clone();
+    for config in [&mut main_config, &mut abs_config] {
+        config
+            .as_object_mut()
+            .expect("EVA config object")
+            .remove("main_function")
+            .expect("main_function key");
+    }
+    assert_eq!(main_config, abs_config);
 
     let _ = client.cancel().await;
 }

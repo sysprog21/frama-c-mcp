@@ -7,9 +7,8 @@ use frama_c_mcp::mcp::server::wpclass::*;
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::{
-    incomplete_digest, proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of,
-    ProofReceiptBody,
-    RECEIPT_SCHEMA,
+    eva_config_absent, incomplete_digest, proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of,
+    ProofReceiptBody, RECEIPT_SCHEMA,
 };
 
 #[test]
@@ -581,6 +580,7 @@ fn the_receipt_digests_incomplete_rather_than_copying_it() {
     // An empty run and a missing key agree, because both mean no gaps.
     assert_eq!(incomplete_digest(&json!([]))["count"], 0);
     assert_eq!(incomplete_digest(&json!(null))["count"], 0);
+
     // Session-scoped markers do not reach the hash, at any depth. A property
     // marker names a property within one Frama-C session and a live server
     // renumbers them, so hashing one made the receipt depend on when in a
@@ -618,7 +618,6 @@ fn the_receipt_digests_incomplete_rather_than_copying_it() {
     let one = json!([entry("PROPERTY_DEAD", "a"), entry("GOAL_NOT_VALID", "b")]);
     let other = json!([entry("GOAL_NOT_VALID", "b"), entry("PROPERTY_DEAD", "a")]);
     assert_eq!(incomplete_digest(&one)["sha256"], incomplete_digest(&other)["sha256"]);
-
 }
 
 #[test]
@@ -632,6 +631,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
             contracts: json!({}),
             environment: json!({"frama_c_version": "33.0"}),
             wp_config: json!({"model": "Typed+nocast"}),
+            eva_config: json!({"precision": 2}),
             goals: vec![json!({"stable_goal_id": "sg_1", "status": "valid"})],
             goals_status_source: "check_wp_goals",
             reported: json!({}),
@@ -681,6 +681,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
         contracts: json!({}),
         environment: json!({"frama_c_version": "33.0"}),
         wp_config: json!({"model": "Typed+nocast"}),
+        eva_config: json!({"precision": 2}),
         goals: vec![],
         goals_status_source: "check_wp_goals",
         reported: json!({"verdict": "proved"}),
@@ -713,9 +714,42 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
     // When the receipt's field set changes on purpose, update this and say why
     // in the commit.
     assert_eq!(
-        shape, "76dcd993f0a8",
+        shape, "c96baff31d2f",
         "the receipt's field set moved; stored conclusions will stop loading"
     );
+}
+
+#[test]
+fn an_absent_eva_config_says_which_absence_it_is() {
+    let body = |eva_config| {
+        proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
+            tool: "check",
+            source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+            ast_digest: json!("ast"),
+            ast_digest_unavailable_reason: json!(null),
+            contracts: json!({}),
+            environment: json!({"frama_c_version": "33.0"}),
+            wp_config: json!({"model": "Typed+nocast"}),
+            eva_config,
+            goals: vec![json!({"stable_goal_id": "sg_1", "status": "valid"})],
+            goals_status_source: "check_wp_goals",
+            reported: json!({}),
+        }))
+    };
+
+    // The four ways a receipt can carry no EVA configuration are four different
+    // claims about the run. Null said all of them at once, and the incomplete[]
+    // entry that tells them apart lives in the check payload, which does not
+    // travel with a stored receipt.
+    let not_requested = body(eva_config_absent("not_requested"));
+    let reload_failed = body(eva_config_absent("reload_failed"));
+    assert_eq!(not_requested["eva"], json!({"ran": false, "reason": "not_requested"}));
+    assert_ne!(not_requested["sha256"], reload_failed["sha256"]);
+
+    // And a run that did configure EVA is not confusable with any of them.
+    let ran = body(json!({"precision": 2, "slevel": 64}));
+    assert_eq!(ran["eva"]["precision"], 2);
+    assert_ne!(ran["sha256"], not_requested["sha256"]);
 }
 
 #[test]
@@ -746,6 +780,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
         contracts: json!({}),
         environment: environment.clone(),
         wp_config: wp.clone(),
+        eva_config: serde_json::Value::Null,
         goals: goals_a,
         goals_status_source: "wp_fetch_goals",
         reported: json!({"failure_kind": "proof_obligation"}),
@@ -758,6 +793,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
         contracts: json!({}),
         environment: environment.clone(),
         wp_config: wp.clone(),
+        eva_config: serde_json::Value::Null,
         goals: goals_b,
         goals_status_source: "wp_fetch_goals",
         reported: json!({"failure_kind": "proof_obligation"}),
@@ -772,6 +808,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
         contracts: json!({}),
         environment,
         wp_config: wp,
+        eva_config: serde_json::Value::Null,
         goals: proof_receipt_goals(
             &[json!({"stable_goal_id": "sg_a", "normalized_status": "valid"})],
             None,
@@ -1738,6 +1775,7 @@ fn ast_digest_separates_runs_that_goal_counts_cannot() {
             contracts: json!({}),
             environment: environment.clone(),
             wp_config: json!({"model": "Typed+cast"}),
+            eva_config: serde_json::Value::Null,
             goals: vec![json!({"stable_goal_id": "sg_1", "status": "valid"})],
             goals_status_source: "wp_fetch_goals",
             reported: json!({}),

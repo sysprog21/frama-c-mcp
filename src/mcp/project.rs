@@ -140,6 +140,12 @@ impl FramaCMcpServer {
         // rechecked under the lock because verify_program_step can set it while
         // this call waits for a run ahead of it.
         let _wp_op_guard = self.main_wp_lock.lock().await;
+
+        // And the EVA transaction, because a re-parse swaps the AST that a
+        // concurrent check's alarms are read against. Taken after the WP lock
+        // and never before it: this is the only site that holds both, so the
+        // order here is the whole ordering rule.
+        let _eva_op_guard = self.main_eva_lock.lock().await;
         if *self.project_locked.read().await {
             return Err(project_locked_error(
                 "reload_project",

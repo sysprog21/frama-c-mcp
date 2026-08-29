@@ -439,7 +439,7 @@ proof above it.
 
 `check`, `run_wp`, and stored conclusions carry a `proof_receipt`
 (`frama-c-mcp.proof-receipt.v4`): the source-file hash, an `ast_digest`, the
-Frama-C and prover environment, the effective WP configuration, per-goal
+Frama-C and prover environment, the effective EVA and WP configurations, per-goal
 statuses, and a sha256 over all of it. Two runs are comparable exactly when
 their receipts match.
 
@@ -449,6 +449,19 @@ embedding it a second time measured 509 KB of a 1.4 MB response on a 1,144-line
 file, almost all of it repeated `guidance` and `source_location` text. The hash
 is over the array as it stands, so any change to any entry still moves the
 receipt and the comparison guarantee is unchanged.
+
+The EVA half of that is read back off the Frama-C process, not copied from the
+request, and the two can disagree on purpose. EVA's settings outlive one call: a
+profile that leaves `precision`, `slevel` or `ilevel` unset issues no setter, so
+whatever an earlier call wrote is still in force, and `-eva-precision` is a
+meta-option that moves a dozen further parameters when it is set. So `check
+{profile: "deep"}` followed by `check {profile: "default"}` reports an empty
+`eva.frama_c_options`, because this run set nothing, beside a
+`proof_receipt.eva` still holding the deep values, because that is what the
+analysis ran with. Read `frama_c_options` as what this call asked for and
+`proof_receipt.eva` as what it got; where they differ, the receipt is the one
+describing the run. `self_check` writes to the same parameters, so a self-check
+shows up in every later receipt the same way.
 
 `ast_digest` is a hash of the normalised AST, and it answers a question the
 source-file hash cannot: what was actually analysed. Different `defines`,

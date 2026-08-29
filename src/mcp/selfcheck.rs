@@ -112,6 +112,13 @@ const CORE_REQUESTS: &[RequestSpec] = &[
 
 /// Kernel setters and recompute entry points, probed last because they would
 /// otherwise perturb the requests above.
+///
+/// The EVA readback getters are not here. They are probed too, but the list of
+/// them is EVA_READBACK_REQUESTS, and parameter_requests chains that rather
+/// than restating it. Two hand-written copies of one request list is the shape
+/// the ast-utils probe table is already faulted for: the sets agreed 16 for 16
+/// the day this was written, which is a coincidence a reader mistakes for a
+/// check, and nothing would have caught the next name added to one side alone.
 const PARAMETER_REQUESTS: &[RequestSpec] = &[
     ("kernel", "kernel.parameters.setMain", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaPrecision", ProbeKind::Set),
@@ -149,8 +156,17 @@ fn required_requests() -> Vec<RequiredRequest> {
         .collect()
 }
 
+/// The readback getters first, then the setters that would disturb them.
+///
+/// Derived from the same constant run_eva_payload reads through, so a request
+/// added to the receipt is probed by construction and cannot be probed by
+/// somebody remembering to add it here too.
 fn parameter_requests() -> Vec<RequiredRequest> {
-    PARAMETER_REQUESTS.iter().map(spec).collect()
+    analysis::EVA_READBACK_REQUESTS
+        .iter()
+        .map(|&(_, request)| RequiredRequest { domain: "kernel", request, kind: ProbeKind::Get })
+        .chain(PARAMETER_REQUESTS.iter().map(spec))
+        .collect()
 }
 
 fn probe_payload(request: &str) -> serde_json::Value {

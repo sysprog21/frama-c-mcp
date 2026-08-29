@@ -46,6 +46,7 @@ fn proof_receipt() -> serde_json::Value {
         contracts: serde_json::json!({}),
         environment: serde_json::json!({"frama_c_version": "31.0"}),
         wp_config: serde_json::json!({}),
+        eva_config: serde_json::json!({}),
         goals: vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
         goals_status_source: "wp_fetch_goals",
         reported: serde_json::json!({}),
