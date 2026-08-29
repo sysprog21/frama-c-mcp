@@ -941,7 +941,6 @@ impl SessionState {
         // server never wrote must not be storable as evidence", and checking
         // the name alone did not do it: a hand-assembled four-key object
         // wearing the right name stored fine.
-        //
         if let Some(reason) = proof_receipt_evidence_error(receipt, summary.total) {
             return Err(format!(
                 "cannot store verified conclusion for '{}': {reason}",

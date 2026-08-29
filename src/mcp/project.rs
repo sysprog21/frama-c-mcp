@@ -181,10 +181,10 @@ impl FramaCMcpServer {
                 match client_opt {
                     Some(c) if c.is_poisoned() => {
                         // The dead transport cannot answer getFiles, so the
-                        // file list comes from the session's cache of the
-                        // last load instead. ensure_main_spawned reads the
-                        // same flag and respawns, which is what makes the
-                        // fallback a recovery rather than a stale answer.
+                        // file list comes from the session's cache of the last
+                        // load instead. ensure_main_spawned reads the same flag
+                        // and respawns, which is what makes the fallback a
+                        // recovery rather than a stale answer.
                         let files = self
                             .main_frama_c_state
                             .lock()

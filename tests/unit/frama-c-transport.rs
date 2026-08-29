@@ -26,14 +26,13 @@ async fn a_failed_write_poisons_every_later_frame() {
         .expect("connect to the listener");
     let (peer, _) = listener.accept().await.expect("accept");
 
-    // close(2) is synchronous: once the peer drops, this stream has no
-    // other end and the kernel refuses the next write rather than
-    // buffering it.
+    // close(2) is synchronous: once the peer drops, this stream has no other
+    // end and the kernel refuses the next write rather than buffering it.
     drop(peer);
 
-    // The failing write reports the kernel's error, not the poison
-    // message: poison() returns the error the caller should see, and the
-    // fixed text below is for the calls after it.
+    // The failing write reports the kernel's error, not the poison message:
+    // poison() returns the error the caller should see, and the fixed text
+    // below is for the calls after it.
     let error = transport
         .send_frame("{}")
         .await
@@ -94,8 +93,8 @@ async fn a_peer_death_mid_read_poisons_every_later_frame() {
         .expect("connect to the listener");
     let (peer, _) = listener.accept().await.expect("accept");
 
-    // Die while the transport is blocked in read: close(2) makes the
-    // pending read answer EOF at once, deterministically.
+    // Die while the transport is blocked in read: close(2) makes the pending
+    // read answer EOF at once, deterministically.
     drop(peer);
 
     let error = transport
@@ -153,8 +152,8 @@ async fn a_read_timeout_does_not_poison() {
         .expect("connect to the listener");
     let (_peer, _) = listener.accept().await.expect("accept");
 
-    // The peer stays open but silent: the read spends its budget and
-    // reports no frame, which is not an error and not a death.
+    // The peer stays open but silent: the read spends its budget and reports no
+    // frame, which is not an error and not a death.
     let frame = transport
         .recv_frame(Duration::from_millis(50))
         .await

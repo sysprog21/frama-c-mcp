@@ -558,6 +558,7 @@ fn round_trip_reachable_conclusion_fields() {
     assert_eq!(stored.wp_summary.as_ref().unwrap().valid, 1);
     assert_eq!(stored.notes, "ok");
     assert_eq!(stored.callees, vec!["g".to_string(), "h".to_string()]);
+
     // Its own hash, not a chosen string: store_conclusion recomputes it, so a
     // fixture carries the real one and the assertion has to ask the receipt.
     assert_eq!(
@@ -594,6 +595,7 @@ fn verified_requires_auditable_proof_evidence() {
         function: "F".into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary(1)),
+
         // Built with the bad goal rather than spoiled afterwards. Editing a
         // finished receipt invalidates its hash, so the hash check would fire
         // first and this case would pass for the wrong reason.

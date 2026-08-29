@@ -3048,9 +3048,9 @@ impl FramaCMcpServer {
         let needs_respawn = match main_lock.as_ref() {
             None => true,
             Some(s) => {
-                // The last disjunct is the transport's own flag: a write
-                // that died part-way poisons the stream without touching
-                // any of the session fields above.
+                // The last disjunct is the transport's own flag: a write that
+                // died part-way poisons the stream without touching any of the
+                // session fields above.
                 s.poisoned
                     || s.with_rte != new_rte
                     || s.project_options != new_project_options
@@ -4100,8 +4100,8 @@ impl ServerHandler for FramaCMcpServer {
         if !structured_is_known {
             if let rmcp::model::CallToolResponse::Complete(result) = &mut response {
                 // The text block carries the same document, so nothing is lost:
-                // docs/architecture.md is written against it and it
-                // is what these revisions have always read.
+                // docs/architecture.md is written against it and it is what
+                // these revisions have always read.
                 result.structured_content = None;
             }
         }

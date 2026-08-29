@@ -6852,8 +6852,8 @@ async fn self_check_probes_rather_than_reporting_every_request_unprobed() {
             .as_array()
             .unwrap_or_else(|| panic!("{field} is not an array: {report}"));
 
-        // An empty array would satisfy the loop below without checking anything,
-        // which is the shape of a guard that passes by not running.
+        // An empty array would satisfy the loop below without checking
+        // anything, which is the shape of a guard that passes by not running.
         assert!(!requests.is_empty(), "{field} is empty: {report}");
 
         let undone: Vec<&Value> = requests

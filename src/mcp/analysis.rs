@@ -2833,8 +2833,8 @@ impl FramaCMcpServer {
             "incomplete": incomplete,
 
             // Same key order as the reload-failure payload above and as the
-            // table in docs/architecture.md, so the two build sites
-            // of one field set can be read side by side.
+            // table in docs/architecture.md, so the two build sites of one
+            // field set can be read side by side.
             "detail": if summarize { "summary" } else { "full" },
             "reload": reload,
             "eva": eva,
