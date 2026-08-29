@@ -731,18 +731,35 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
          without a leading dash (write \"builtins.h\", not \"-include builtins.h\")",
     )?;
 
-    if options.machdep.as_deref().is_some_and(str::is_empty) {
-        return Err(McpError::invalid_params("machdep must not be empty", None));
+    // These two land in the same argv as the three lists above, as their own
+    // tokens, so the leading-dash rule applies to them for the same reason it
+    // applies there. It used to stop at the three, and the gap read as
+    // deliberate because the error text above teaches the rule.
+    //
+    // compilation_database gets only the dash rule, because it is a path the
+    // caller chose and a real one can hold a character the preprocessor
+    // allowlist was never written for. Refusing those would be this validator
+    // inventing a restriction rather than closing one.
+    //
+    // Frama-C decides whether a non-name machdep argument is YAML from its
+    // contents, so do not infer that from a filename suffix.
+    if let Some(machdep) = options.machdep.as_deref() {
+        if machdep.is_empty() || machdep.starts_with('-') {
+            return Err(McpError::invalid_params(
+                "machdep must be a non-empty predefined name or YAML machdep file path without a \
+                 leading dash (write \"gcc_x86_64\" or \"machdeps/custom\", not \"-machdep gcc_x86_64\")",
+                None,
+            ));
+        }
     }
-    if options
-        .compilation_database
-        .as_deref()
-        .is_some_and(str::is_empty)
-    {
-        return Err(McpError::invalid_params(
-            "compilation_database must not be empty",
-            None,
-        ));
+    if let Some(compilation_database) = options.compilation_database.as_deref() {
+        if compilation_database.is_empty() || compilation_database.starts_with('-') {
+            return Err(McpError::invalid_params(
+                "compilation_database must be a non-empty path without a leading dash \
+                 (write \"build/compile_commands.json\", not \"-json-compilation-database build\")",
+                None,
+            ));
+        }
     }
     Ok(())
 }
