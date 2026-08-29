@@ -92,6 +92,7 @@ want integration && run integration cargo test --test test-integration -- --test
 want lifecycle && run lifecycle cargo test --test test-process-lifecycle -- --test-threads=1
 want reload && run reload cargo test --test test-reload-project-regression -- --test-threads=1
 want store && run store cargo test --test test-store-conclusion -- --test-threads=1
+want poison && run poison cargo test --test test-transport-poison-recovery -- --test-threads=1
 want abs-int && run abs-int scripts/check-abs-int-fixtures.sh
 want wp-model && run wp-model scripts/check-wp-model-fixtures.sh
 want artifacts && run artifacts scripts/check-artifacts.sh

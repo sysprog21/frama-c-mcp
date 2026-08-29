@@ -38,3 +38,5 @@ mod types;
 mod frama_c_client;
 #[path = "unit/frama-c-codec.rs"]
 mod frama_c_codec;
+#[path = "unit/frama-c-transport.rs"]
+mod frama_c_transport;

@@ -1,4 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -16,24 +18,27 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Transport {
     stream: UnixStream,
     read_buf: BytesMut,
-    /// Set when a frame write failed or timed out part-way through.
+    /// Set when a frame write failed or timed out part-way through, or the
+    /// read side saw the peer die (EOF or a read error).
     ///
     /// write_all is not cancellation-safe: the socket may already hold a
     /// prefix of that frame, so the next write would append a fresh frame
     /// onto it and corrupt the length-prefixed protocol for every later
     /// command. Poisoning turns that silent corruption into a fast error
     /// on every later use; recovery is a new Transport, which the session
-    /// gets through the respawn path in ensure_main_spawned.
+    /// gets through the respawn path in ensure_main_spawned. Read-side
+    /// death poisons too: after EOF the peer is gone for good, and a read
+    /// error leaves the stream state unknowable. A read that merely times
+    /// out does NOT poison; the poll loop times out routinely on healthy
+    /// servers.
     ///
-    /// The respawn is not automatic yet. ensure_main_spawned decides
-    /// in-place vs respawn from MainFramaCState alone and never looks at
-    /// this flag, so the first reload with explicit files still fails in
-    /// place (which marks the session poisoned) and only the second one
-    /// respawns; a reload without files never gets that far, because it
-    /// asks this dead transport for the current file list first. Sandbox
-    /// clients have no respawn path at all. Surfacing this flag to the
-    /// respawn decision is a planned follow-up.
-    poisoned: bool,
+    /// Shared with the FramaCClient that owns this transport, so
+    /// ensure_main_spawned can read it without taking the request lock.
+    /// It is the last disjunct of the respawn decision there, so the first
+    /// reload with files respawns instead of failing in place and marking
+    /// the session poisoned for the next caller to find. Sandbox clients
+    /// still have no respawn path at all.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl Transport {
@@ -42,12 +47,12 @@ impl Transport {
         Ok(Transport {
             stream,
             read_buf: BytesMut::with_capacity(8192),
-            poisoned: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub async fn send_frame(&mut self, payload: &str) -> Result<(), FramaCError> {
-        if self.poisoned {
+        if self.poisoned.load(Ordering::Relaxed) {
             return Err(poisoned_transport());
         }
         let frame = codec::encode_frame(payload);
@@ -62,7 +67,7 @@ impl Transport {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<String>, FramaCError> {
-        if self.poisoned {
+        if self.poisoned.load(Ordering::Relaxed) {
             return Err(poisoned_transport());
         }
         loop {
@@ -73,15 +78,17 @@ impl Transport {
             let mut tmp = [0u8; 4096];
             match tokio::time::timeout(timeout, self.stream.read(&mut tmp)).await {
                 Ok(Ok(0)) => {
-                    return Err(FramaCError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed",
-                    )));
+                    return Err(self
+                        .poison(FramaCError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed",
+                        )))
+                        .await);
                 }
                 Ok(Ok(n)) => {
                     self.read_buf.put_slice(&tmp[..n]);
                 }
-                Ok(Err(e)) => return Err(FramaCError::Io(e)),
+                Ok(Err(e)) => return Err(self.poison(FramaCError::Io(e)).await),
                 Err(_) => return Ok(None),
             }
         }
@@ -95,11 +102,19 @@ impl Transport {
     /// Mark the stream unusable and close our end of it, returning the
     /// error the caller should see. Any write that did not run to
     /// completion can have left a partial frame in the socket, and no
-    /// later frame may follow it on this stream.
+    /// later frame may follow it on this stream; a read that ended in EOF
+    /// or an error means the peer is gone, which is just as final.
     async fn poison(&mut self, error: FramaCError) -> FramaCError {
-        self.poisoned = true;
+        self.poisoned.store(true, Ordering::Relaxed);
         let _ = self.stream.shutdown().await;
         error
+    }
+
+    /// A shared handle on the poison flag. The FramaCClient takes one at
+    /// connect so it can answer is_poisoned without taking the request
+    /// lock that guards this transport.
+    pub fn poison_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.poisoned)
     }
 }
 

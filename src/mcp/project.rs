@@ -174,6 +174,35 @@ impl FramaCMcpServer {
             (None, None) => {
                 let client_opt = self.client.lock().await.clone();
                 match client_opt {
+                    Some(c) if c.is_poisoned() => {
+                        // The dead transport cannot answer getFiles, so the
+                        // file list comes from the session's cache of the
+                        // last load instead. ensure_main_spawned reads the
+                        // same flag and respawns, which is what makes the
+                        // fallback a recovery rather than a stale answer.
+                        let files = self
+                            .main_frama_c_state
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|s| s.files.clone())
+                            .unwrap_or_default();
+                        if files.is_empty() {
+                            return Err(McpError::internal_error(
+                                "the Frama-C transport is poisoned and no file list is cached; \
+                                 pass files explicitly to reload_project to recover",
+                                Some(json!({
+                                    "kind": "TransportPoisoned",
+                                    "retryable": true,
+                                    "suggestion": {
+                                        "tool": "reload_project",
+                                        "args_example": { "files": ["/path/to/source.c"] }
+                                    }
+                                })),
+                            ));
+                        }
+                        files
+                    }
                     Some(c) => {
                         let v = c
                             .get("kernel.ast.getFiles", json!(null))

@@ -278,6 +278,7 @@ jobs:
           cargo test --test test-process-lifecycle -- --test-threads=1
           cargo test --test test-reload-project-regression -- --test-threads=1
           cargo test --test test-store-conclusion -- --test-threads=1
+          cargo test --test test-transport-poison-recovery -- --test-threads=1
 
       - name: MCP stdio E2E tests
         id: stdio

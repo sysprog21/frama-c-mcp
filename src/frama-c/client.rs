@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
@@ -353,6 +354,10 @@ pub struct FramaCClient {
     /// but a reload and the fetch behind it are two requests, and the table
     /// cursor they share is process-global.
     fetch_lock: Mutex<()>,
+    /// The transport's poison flag, shared with the Transport inside
+    /// `inner` so ensure_main_spawned can read it without taking the
+    /// request lock.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl FramaCClient {
@@ -361,6 +366,7 @@ impl FramaCClient {
         state: Arc<RwLock<SessionState>>,
     ) -> Result<Self, FramaCError> {
         let transport = Transport::connect(path).await?;
+        let poisoned = transport.poison_flag();
         let mut inner = ClientInner {
             transport,
             counter: 0,
@@ -418,6 +424,7 @@ impl FramaCClient {
         let client = FramaCClient {
             inner: Mutex::new(inner),
             fetch_lock: Mutex::new(()),
+            poisoned,
         };
 
         // Auto-fetch function info to populate marker cache
@@ -429,6 +436,14 @@ impl FramaCClient {
         }
 
         Ok(client)
+    }
+
+    /// Whether the transport under this client can no longer carry a
+    /// frame. Read straight off the shared flag rather than through
+    /// `inner`: ensure_main_spawned asks while holding the client slot,
+    /// and the answer does not depend on the request in flight.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
     }
 
     pub async fn get(

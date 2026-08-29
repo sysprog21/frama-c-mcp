@@ -1774,6 +1774,10 @@ pub struct MainFramaCState {
     /// respawning immediately: the call that fails should report the user's
     /// actual error, and a syntax error the caller is about to fix does not
     /// deserve a spawn nobody waits for.
+    ///
+    /// The transport's own poison flag feeds the same decision: a frame
+    /// write that died part-way means this client can no longer carry a
+    /// request either, whatever this field says.
     pub poisoned: bool,
 }
 
@@ -3023,7 +3027,13 @@ impl FramaCMcpServer {
         let needs_respawn = match main_lock.as_ref() {
             None => true,
             Some(s) => {
-                s.poisoned || s.with_rte != new_rte || s.project_options != new_project_options
+                // The last disjunct is the transport's own flag: a write
+                // that died part-way poisons the stream without touching
+                // any of the session fields above.
+                s.poisoned
+                    || s.with_rte != new_rte
+                    || s.project_options != new_project_options
+                    || client_lock.as_ref().is_some_and(|c| c.is_poisoned())
             }
         };
 
