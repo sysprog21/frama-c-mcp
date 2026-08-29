@@ -3823,7 +3823,7 @@ pub mod propose;
 
 #[path = "receipt.rs"]
 pub mod receipt;
-use receipt::{proof_receipt_goals, ProofReceiptRequest};
+use receipt::{incomplete_digest, proof_receipt_goals, ProofReceiptRequest};
 
 #[path = "eacsl.rs"]
 pub mod eacsl;

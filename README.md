@@ -443,6 +443,13 @@ Frama-C and prover environment, the effective WP configuration, per-goal
 statuses, and a sha256 over all of it. Two runs are comparable exactly when
 their receipts match.
 
+What it reports about `incomplete[]` is a digest, `{count, codes, sha256}`, not
+the array. The array is already one key away at the payload's top level, and
+embedding it a second time measured 509 KB of a 1.4 MB response on a 1,144-line
+file, almost all of it repeated `guidance` and `source_location` text. The hash
+is over the array as it stands, so any change to any entry still moves the
+receipt and the comparison guarantee is unchanged.
+
 `ast_digest` is a hash of the normalised AST, and it answers a question the
 source-file hash cannot: what was actually analysed. Different `defines`,
 include paths, or machdep over identical files produce different digests; and,

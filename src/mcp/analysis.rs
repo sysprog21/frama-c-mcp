@@ -2449,7 +2449,7 @@ impl FramaCMcpServer {
                 goals_status_source: "not_run_reload_failed",
                 reported: json!({
                     "verdict": payload["verdict"].clone(),
-                    "incomplete": payload["incomplete"].clone(),
+                    "incomplete": incomplete_digest(&payload["incomplete"]),
                 }),
                 // No goals, so nothing to discriminate.
                 properties: &HashMap::new(),
@@ -2739,7 +2739,7 @@ impl FramaCMcpServer {
                 goals_status_source: "check_wp_goals",
                 reported: json!({
                     "verdict": payload["verdict"].clone(),
-                    "incomplete": payload["incomplete"].clone(),
+                    "incomplete": incomplete_digest(&payload["incomplete"]),
                     "wp_failure_kind": wp.get("failure_kind").cloned().unwrap_or_else(|| json!(null)),
                 }),
                 properties: &receipt_properties,

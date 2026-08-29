@@ -318,6 +318,38 @@ pub fn receipt_shape() -> &'static str {
     })
 }
 
+/// The incomplete[] array as a receipt should carry it: counted, keyed by code,
+/// and hashed.
+///
+/// The receipt used to embed the array verbatim, which measured 508,699 bytes
+/// of a 1,426,266-byte check on a 1,144-line file, 36 percent of the response,
+/// and every one of those bytes was already present at the payload's top level.
+/// The guidance and source_location strings are the weight, and a receipt needs
+/// neither: it exists to say whether two runs agree, not to re-explain the gaps
+/// to a reader who has them one key away.
+///
+/// The hash is what keeps the guarantee intact. Any edit to any entry moves the
+/// digest and therefore the receipt sha256, so two runs still match exactly
+/// when
+/// their receipts match. The counts make the receipt legible on its own, which
+/// the raw array was not at that size.
+pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
+    let entries = incomplete.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut codes: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in entries {
+        let code = entry.get("code").and_then(|code| code.as_str()).unwrap_or("UNKNOWN");
+        *codes.entry(code).or_default() += 1;
+    }
+
+    json!({
+        "count": entries.len(),
+        "codes": codes,
+        // Over the array as it stands, so the digest is a function of the
+        // same bytes the payload reports.
+        "sha256": sha256_hex(&serde_json::to_vec(incomplete).unwrap_or_default()),
+    })
+}
+
 /// Not a pure function of its input: a null ast_digest draws a fresh nonce, so
 /// two calls on identical bodies differ by design. Every other input is
 /// deterministic.

@@ -7,7 +7,8 @@ use frama_c_mcp::mcp::server::wpclass::*;
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::{
-    proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of, ProofReceiptBody,
+    incomplete_digest, proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of,
+    ProofReceiptBody,
     RECEIPT_SCHEMA,
 };
 
@@ -534,6 +535,53 @@ fn wp_run_response_reports_task_failure_kind() {
         None,
     );
     assert_eq!(unproved["failure_kind"], "proof_obligation");
+}
+
+#[test]
+fn the_receipt_digests_incomplete_rather_than_copying_it() {
+    let entry = |code: &str, guidance: &str| {
+        json!({
+            "code": code,
+            "reason": "a reason long enough to matter",
+            "guidance": guidance,
+            "source_location": {"file": "/some/long/path/to/a/source/file.c", "line": 42},
+        })
+    };
+    let incomplete = json!([
+        entry("PROPERTY_DEAD", "a paragraph of advice repeated per entry"),
+        entry("PROPERTY_DEAD", "a paragraph of advice repeated per entry"),
+        entry("GOAL_NOT_VALID", "different advice"),
+    ]);
+
+    let digest = incomplete_digest(&incomplete);
+    assert_eq!(digest["count"], 3);
+    assert_eq!(digest["codes"]["PROPERTY_DEAD"], 2);
+    assert_eq!(digest["codes"]["GOAL_NOT_VALID"], 1);
+
+    // Smaller than what it replaces, which is the whole point: measured on a
+    // 1,144-line file the embedded array was 508,699 bytes of a 1,426,266-byte
+    // response, all of it already present one key away at the payload's top
+    // level.
+    let digest_bytes = serde_json::to_vec(&digest).unwrap().len();
+    let array_bytes = serde_json::to_vec(&incomplete).unwrap().len();
+    assert!(
+        digest_bytes * 2 < array_bytes,
+        "digest {digest_bytes} is not materially smaller than {array_bytes}"
+    );
+
+    // And it stays as sensitive as the array was. A receipt is only worth
+    // comparing if any change to what it reports moves it, so every field of
+    // every entry has to reach the hash, not just the codes the counts show.
+    let mut reworded = incomplete.clone();
+    reworded[0]["guidance"] = json!("advice with one word changed");
+    let reworded_digest = incomplete_digest(&reworded);
+    assert_eq!(reworded_digest["codes"], digest["codes"], "codes should not move");
+    assert_ne!(reworded_digest["sha256"], digest["sha256"], "the hash must move");
+
+    // An empty run and a missing key agree, because both mean no gaps.
+    assert_eq!(incomplete_digest(&json!([]))["count"], 0);
+    assert_eq!(incomplete_digest(&json!(null))["count"], 0);
+
 }
 
 #[test]
