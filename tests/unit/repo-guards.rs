@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 
 use frama_c_mcp::mcp::server::*;
@@ -853,22 +853,33 @@ fn ci_named_tests_still_exist() {
     );
 }
 
-/// Every pub fn in src/ is called from somewhere in src/ or tests/.
+/// Every pub item in src/ is named somewhere else in src/ or tests/.
 ///
 /// This exists because dead_code cannot see these any more. Publishing the
 /// internals so the unit tests could move out of the crate made every one of
 /// them a pub item in a pub mod, and the lint does not fire on those: it
-/// assumes an external consumer. So the 439 published items lost the check
-/// that a helper whose last caller went away gets reported, while the 331 that
+/// assumes an external consumer. So the published items lost the check that a
+/// helper whose last caller went away gets reported, while the ones that
 /// stayed private kept it, and nothing anywhere said which half you were in.
+///
+/// It read pub fn only until 2026-08-30, which was 313 of the 482 published
+/// items. The eight keywords below take it to 453, closing a gap of 140 pub
+/// structs, consts, enums and types that were in neither half, covered by no
+/// lint and by no guard. A count is the wrong instrument for that gap, because
+/// it moves with every commit and a gate pinning it becomes a number people
+/// bump. Naming the orphan is the instrument, and it costs one keyword list.
+///
+/// The remaining 29 are pub mod, deliberately out. A module is named by every
+/// path that reaches through it and by the #[path] attribute above it, so it
+/// can never be orphaned by this scan and would only pad the list.
 ///
 /// Name-based and therefore approximate in one direction only: a name that
 /// appears in a comment or a string counts as a use, so this under-reports
 /// rather than crying wolf. That is the right way round for a guard nobody
-/// asked for, and it still catches the case that matters, which is a function
-/// no longer written down anywhere but its own definition.
+/// asked for, and it still catches the case that matters, which is an item no
+/// longer written down anywhere but its own definition.
 #[test]
-fn every_published_function_has_a_caller() {
+fn every_published_item_has_a_user() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let mut sources = Vec::new();
@@ -882,35 +893,52 @@ fn every_published_function_has_a_caller() {
         .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
         .collect();
 
+    const PUBLISHED: &[&str] =
+        &["fn", "struct", "enum", "type", "const", "static", "trait", "union"];
+
     // Definition sites, and every other mention of the name anywhere.
-    let mut defined: Vec<(String, String)> = Vec::new();
+    let mut defined: Vec<(&str, String, String)> = Vec::new();
     for (path, text) in &texts {
         if !path.starts_with(root.join("src")) {
             continue;
         }
         for line in text.lines() {
-            let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix("pub fn ").or_else(|| {
-                trimmed
-                    .strip_prefix("pub async fn ")
-                    .or_else(|| trimmed.strip_prefix("pub unsafe fn "))
-            }) else {
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            // "pub async fn" and "pub unsafe fn" carry the keyword a token further in.
+            let rest = rest
+                .strip_prefix("async ")
+                .or_else(|| rest.strip_prefix("unsafe "))
+                .unwrap_or(rest);
+            let Some((keyword, rest)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Some(keyword) = PUBLISHED.iter().copied().find(|known| *known == keyword) else {
                 continue;
             };
             let name: String = rest
                 .chars()
                 .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
                 .collect();
+            // "pub const fn" would read as a const named fn. No such form is in
+            // the tree, and this says so precisely if one arrives, rather than
+            // reporting an orphan called "fn" and sending the reader hunting.
+            assert!(
+                !PUBLISHED.contains(&name.as_str()),
+                "{}: \"pub {keyword} {name}\" is a modifier form this scan does not read",
+                path.display()
+            );
             if !name.is_empty() {
-                defined.push((name, format!("{}", path.display())));
+                defined.push((keyword, name, format!("{}", path.display())));
             }
         }
     }
-    assert!(defined.len() > 100, "parsed {} pub fns, the scan broke", defined.len());
+    assert!(defined.len() > 400, "parsed {} pub items, the scan broke", defined.len());
 
     let mut orphans = Vec::new();
-    for (name, where_defined) in &defined {
-        let definition = format!("fn {name}");
+    for (keyword, name, where_defined) in &defined {
+        let definition = format!("{keyword} {name}");
         let uses = texts
             .iter()
             .flat_map(|(_, text)| text.lines())
@@ -918,7 +946,7 @@ fn every_published_function_has_a_caller() {
             .filter(|line| !line.trim_start().contains(definition.as_str()))
             .count();
         if uses == 0 {
-            orphans.push(format!("{name} ({where_defined})"));
+            orphans.push(format!("pub {keyword} {name} ({where_defined})"));
         }
     }
     orphans.sort();
@@ -926,7 +954,7 @@ fn every_published_function_has_a_caller() {
 
     assert!(
         orphans.is_empty(),
-        "these pub fns are named nowhere but their own definition, and dead_code \
+        "these pub items are named nowhere but their own definition, and dead_code \
          can no longer report them: {orphans:?}"
     );
 }
