@@ -1,6 +1,8 @@
 use frama_c_mcp::mcp::server::*;
 
 use frama_c_mcp::mcp::server::project::*;
+use serde_json::json;
+use std::path::Path;
 
 fn with_defines(defines: &[&str]) -> ProjectLoadOptions {
     ProjectLoadOptions {
@@ -32,6 +34,323 @@ fn plain_and_valued_defines_are_accepted() {
 fn ordinary_paths_and_headers_are_accepted() {
     assert!(validate_project_options(&with_include_paths(&["include", "../vendor/inc"])).is_ok());
     assert!(validate_project_options(&with_force_includes(&["builtins.h", "sys/types.h"])).is_ok());
+}
+
+/// The log shape is verbatim Frama-C 33: tag and location on one line, text
+/// indented on the next. The feedback line and the untagged "[kernel] Parsing"
+/// line are both in the sample because both are in every real log.
+fn sample_log() -> String {
+    let mut log = String::from("[kernel] Parsing a.c (with preprocessing)\n");
+    log.push_str("[kernel:pp:compilation-db] using compilation database:\n  a.json\n");
+    for line in 1..=21 {
+        log.push_str(&format!(
+            "[kernel:asm:clobber] src/a.c:{line}: Warning: \n  Clobber list contains \"memory\" argument.\n"
+        ));
+    }
+    for (line, name) in [(30, "one"), (31, "one"), (32, "two")] {
+        log.push_str(&format!(
+            "[kernel:attrs:unknown] src/a.c:{line}: Warning: \n  Ignoring unknown attribute: {name}\n"
+        ));
+    }
+    log.push_str("[kernel:typing:implicit-function-declaration] /abs/b.c:40: Warning: \n  Calling undeclared function f. Old style K&R code?\n");
+    log
+}
+
+#[test]
+fn ast_parse_diagnostics_counts_only_warning_tags_and_bounds_samples() {
+    let log = sample_log();
+    let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+    let categories = &health["categories"];
+
+    assert_eq!(categories["kernel:asm:clobber"]["count"], 21);
+    assert_eq!(categories["kernel:asm:clobber"]["count_unit"], "sites");
+    assert_eq!(
+        categories["kernel:asm:clobber"]["locations"].as_array().unwrap().len(),
+        20
+    );
+    assert_eq!(categories["kernel:asm:clobber"]["locations_omitted"], 1);
+
+    // Three warnings, two names. The unit says which of those it reports.
+    assert_eq!(categories[ATTRS_UNKNOWN]["count"], 2);
+    assert_eq!(
+        categories[ATTRS_UNKNOWN]["count_unit"],
+        "distinct_attribute_names"
+    );
+
+    assert_eq!(
+        categories["kernel:typing:implicit-function-declaration"]["count"],
+        1
+    );
+
+    // A tag without the Warning token is feedback, and an untagged line is
+    // neither.
+    assert!(categories.get("kernel:pp:compilation-db").is_none());
+    assert!(categories.get("kernel").is_none());
+}
+
+/// A relative location resolves against the child's working directory and an
+/// absolute one is left alone, because Frama-C prints both and neither form
+/// matches the argument the caller passed.
+#[test]
+fn ast_parse_diagnostics_resolves_locations_against_the_child_directory() {
+    let log = sample_log();
+    let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+    let clobber = &health["categories"]["kernel:asm:clobber"]["locations"][0];
+    assert_eq!(clobber["file"], "/work/src/a.c");
+    assert_eq!(clobber["line"], 1);
+    let implicit =
+        &health["categories"]["kernel:typing:implicit-function-declaration"]["locations"][0];
+    assert_eq!(implicit["file"], "/abs/b.c");
+    assert_eq!(implicit["line"], 40);
+}
+
+/// Both soundness categories are keys even when nothing fired, so a caller
+/// reads a zero rather than a missing key.
+#[test]
+fn ast_parse_diagnostics_reports_zero_for_a_clean_parse() {
+    let log = "[kernel] Parsing clean.c (with preprocessing)\n";
+    let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+    assert_eq!(health["categories"]["kernel:asm:clobber"]["count"], 0);
+    assert_eq!(health["categories"][ATTRS_UNKNOWN]["count"], 0);
+}
+
+/// The offsets select the boot parse out of a log that has since grown. Only
+/// the named window is counted; bytes on either side are another AST's.
+#[test]
+fn ast_parse_diagnostics_counts_only_the_named_window() {
+    let boot = "[kernel:asm:clobber] a.c:1: Warning: \n  Clobber list contains \"memory\" argument.\n";
+    let later = "[kernel:asm:clobber] b.c:9: Warning: \n  Clobber list contains \"memory\" argument.\n";
+    let log = format!("{boot}{later}");
+    let health = ast_parse_diagnostics(log.as_bytes(), boot.len() as u64, Path::new("/work"));
+    assert_eq!(health["categories"]["kernel:asm:clobber"]["count"], 1);
+
+    // Out-of-range offsets clamp rather than panic.
+    let all = ast_parse_diagnostics(log.as_bytes(), u64::MAX, Path::new("/work"));
+    assert_eq!(all["categories"]["kernel:asm:clobber"]["count"], 2);
+    let empty = ast_parse_diagnostics(log.as_bytes(), 0, Path::new("/work"));
+    assert_eq!(empty["categories"]["kernel:asm:clobber"]["count"], 0);
+}
+
+/// A bracket in a directory name is not a category, on either side of the tag.
+///
+/// Both orderings are here because each broke the other anchor: taking the
+/// first bracket on the line read "[v1]" as the category when the path came
+/// first, and taking the last read it as the category when the path came after
+/// the tag, which dropped the warning entirely rather than misfiling it.
+#[test]
+fn ast_parse_diagnostics_ignores_brackets_outside_the_tag() {
+    let clobber = "  Clobber list contains \"memory\" argument.";
+    for (label, line) in [
+        ("path before the tag", "src/[v1]/a.c:3: [kernel:asm:clobber] Warning: "),
+        ("path after the tag", "[kernel:asm:clobber] src/[v1]/a.c:3: Warning: "),
+    ] {
+        let log = format!("{line}\n{clobber}\nsrc/[v1]/b.c:4: Warning: something untagged\n");
+        let health =
+            ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+        assert_eq!(
+            health["categories"]["kernel:asm:clobber"]["count"], 1,
+            "{label}: {health}"
+        );
+        assert_eq!(
+            health["categories"]["kernel:asm:clobber"]["locations"][0]["file"],
+            "/work/src/[v1]/a.c",
+            "{label}"
+        );
+        assert!(health["categories"].get("v1").is_none(), "{label}");
+    }
+}
+
+#[test]
+fn ast_parse_diagnostics_ignores_colon_containing_bracketed_paths() {
+    let log = "src/[team:api]/a.c:3: [kernel:asm:clobber] Warning: \n  Clobber list contains \"memory\" argument.\n";
+    let health =
+        ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+
+    assert_eq!(health["categories"]["kernel:asm:clobber"]["count"], 1);
+    assert_eq!(
+        health["categories"]["kernel:asm:clobber"]["locations"][0]["file"],
+        "/work/src/[team:api]/a.c"
+    );
+    assert!(health["categories"].get("team:api").is_none(), "{health}");
+}
+
+/// A path that carries the "Warning:" token itself. The marker search has to
+/// keep going until it finds one with a tag before it, because stopping at the
+/// first left a head with no tag in it and dropped the warning: the count is
+/// the soundness claim, so losing it is worse than resolving its location to
+/// the directory the path was cut at.
+#[test]
+fn ast_parse_diagnostics_reads_a_line_whose_path_carries_the_marker() {
+    for (label, line) in [
+        ("path before the tag", "src/Warning:x/a.c:3: [kernel:asm:clobber] Warning: "),
+        ("path after the tag", "[kernel:asm:clobber] src/Warning:x/a.c:3: Warning: "),
+    ] {
+        let log = format!("{line}\n  Clobber list contains \"memory\" argument.\n");
+        let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+        assert_eq!(health["categories"][ASM_CLOBBER]["count"], 1, "{label}: {health}");
+    }
+}
+
+/// An unmatched "[" in the path pairs with the tag's own closing bracket, so
+/// the scan has to resume after the bracket it rejected rather than after the
+/// one it borrowed. Resuming past the "]" stepped over the tag and dropped the
+/// warning, which is the failure that hides a soundness finding rather than
+/// misfiling it.
+#[test]
+fn ast_parse_diagnostics_reads_a_tag_after_an_unmatched_bracket() {
+    let log = "src/[dir/a.c:3: [kernel:asm:clobber] Warning: \n  Clobber list contains \"memory\" argument.\n";
+    let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+
+    assert_eq!(health["categories"][ASM_CLOBBER]["count"], 1, "{health}");
+    assert_eq!(
+        health["categories"][ASM_CLOBBER]["locations"][0]["file"],
+        "/work/src/[dir/a.c"
+    );
+}
+
+/// The same segment at the head of a relative path, where the left side is a
+/// field boundary too and only the character after the bracket separates a
+/// path from a tag.
+#[test]
+fn ast_parse_diagnostics_ignores_a_bracketed_path_that_opens_the_line() {
+    let log = "[team:api]/a.c:3: [kernel:asm:clobber] Warning: \n  Clobber list contains \"memory\" argument.\n";
+    let health = ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+
+    assert_eq!(health["categories"]["kernel:asm:clobber"]["count"], 1, "{health}");
+    assert_eq!(
+        health["categories"]["kernel:asm:clobber"]["locations"][0]["file"],
+        "/work/[team:api]/a.c"
+    );
+    assert!(health["categories"].get("team:api").is_none(), "{health}");
+}
+
+/// Frama-C puts the attribute name on the tag line when it fits and wraps it
+/// onto the next when it does not, and which happens is a function of the path
+/// length against the margin.
+///
+/// Measured on Frama-C 33: "a.c:1" keeps "__q__" on the tag line, while the
+/// same attribute reported under a path like this repository's fixtures wraps.
+/// Reading only the wrapped form counted zero attributes for every project
+/// with short paths, and every fixture here has a long one, so nothing caught
+/// it.
+#[test]
+fn ast_parse_diagnostics_reads_an_attribute_name_on_either_line() {
+    let wrapped = "[kernel:attrs:unknown] tests/fixtures/long-enough-to-wrap.c:3: Warning: \n  Ignoring unknown attribute: __wrapped__\n";
+    let inline = "[kernel:attrs:unknown] a.c:1: Warning: Ignoring unknown attribute: __q__\n";
+
+    for (label, log, name, line) in [
+        ("wrapped", wrapped, "__wrapped__", 3),
+        ("same line", inline, "__q__", 1),
+    ] {
+        let health =
+            ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+        let entry = &health["categories"][ATTRS_UNKNOWN]["locations"][0];
+        assert_eq!(health["categories"][ATTRS_UNKNOWN]["count"], 1, "{label}");
+        assert_eq!(entry["attribute"], name, "{label}");
+        assert_eq!(entry["location"]["line"], line, "{label}");
+    }
+
+    // Both spellings in one log are still two names and two counts.
+    let log = format!("{wrapped}{inline}");
+    let health =
+        ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+    assert_eq!(health["categories"][ATTRS_UNKNOWN]["count"], 2, "{health}");
+}
+
+/// A warning between an attribute's tag line and its name ends the wrap.
+///
+/// The name is still counted, because the count is the soundness claim and an
+/// unpinned location is a worse answer than none rather than a reason to drop
+/// the finding. What must not happen is the name inheriting the earlier
+/// warning's location and pointing at the wrong file.
+#[test]
+fn an_interrupted_attribute_keeps_its_count_and_loses_only_its_location() {
+    let log = "[kernel:attrs:unknown] src/a.c:3: Warning: \n               [kernel:asm:clobber] src/b.c:9: Warning: \n               \x20 Clobber list contains \"memory\" argument.\n               \x20 Ignoring unknown attribute: __orphan__\n";
+    let health =
+        ast_parse_diagnostics(log.as_bytes(), log.len() as u64, Path::new("/work"));
+
+    assert_eq!(health["categories"][ATTRS_UNKNOWN]["count"], 1, "{health}");
+    let entry = &health["categories"][ATTRS_UNKNOWN]["locations"][0];
+    assert_eq!(entry["attribute"], "__orphan__", "{health}");
+    assert_eq!(
+        entry["location"], json!({"unresolved": true}),
+        "src/a.c:3 belongs to the clobber's neighbour, not to this name: {health}"
+    );
+    assert_eq!(health["categories"]["kernel:asm:clobber"]["count"], 1, "{health}");
+}
+
+/// A window this server could not read reports no category at all. A zero
+/// would be a claim that the front end dropped nothing, which is the one thing
+/// an unreadable log cannot establish.
+#[test]
+fn an_unreadable_parse_log_is_not_a_clean_parse() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("never-written.stdout.log");
+    let record = unreadable_parse_log(&missing, &std::io::Error::from(std::io::ErrorKind::NotFound));
+
+    assert_eq!(record["categories"], json!({}));
+    assert!(
+        record["unavailable"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("never-written.stdout.log")),
+        "{record}"
+    );
+
+    // And check reads it as a finding rather than as silence. Silence would let
+    // a verdict of "proved" stand on the one shape where nothing established
+    // that the analyzed program is the compiled one.
+    let reload = json!({"ast_reload_health": {"parse_diagnostics": record}});
+    let mut items = Vec::new();
+    analysis::ast_diagnostic_gaps(&mut items, &reload, &[]);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(
+        items[0]["code"],
+        analysis::incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE
+    );
+    assert!(
+        items[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("never-written.stdout.log")),
+        "{items:?}"
+    );
+
+    // And it is the whole answer: a record with no categories has nothing to
+    // say about any of them, so no zero row follows it.
+    let clean = json!({"ast_reload_health": {"parse_diagnostics": {"categories": {
+        "kernel:asm:clobber": {"count": 0, "count_unit": "sites"},
+    }}}});
+    let mut items = Vec::new();
+    analysis::ast_diagnostic_gaps(&mut items, &clean, &[]);
+    assert!(items.is_empty(), "{items:?}");
+}
+
+#[test]
+fn header_bearing_sources_do_not_reuse_parse_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.c");
+    let included = dir.path().join("included.c");
+    std::fs::write(&plain, "int f(void) { return 0; }\n").unwrap();
+    std::fs::write(&included, "# include \"header.h\"\nint f(void) { return 0; }\n").unwrap();
+
+    // A comment can precede the directive on its own line, so a scan anchored
+    // to the first character of the line reads this as header-free.
+    let commented = dir.path().join("commented.c");
+    std::fs::write(&commented, "/**/#include \"header.h\"\nint f(void) { return 0; }\n").unwrap();
+
+    // The same directive written with the digraph and with the trigraph. Both
+    // are the preprocessor pulling in bytes the digest does not cover, and
+    // neither carries a "#".
+    let digraph = dir.path().join("digraph.c");
+    std::fs::write(&digraph, "%:include \"header.h\"\nint f(void) { return 0; }\n").unwrap();
+    let trigraph = dir.path().join("trigraph.c");
+    std::fs::write(&trigraph, "??=include \"header.h\"\nint f(void) { return 0; }\n").unwrap();
+
+    assert!(!files_may_include(&[plain.display().to_string()]));
+    assert!(files_may_include(&[included.display().to_string()]));
+    assert!(files_may_include(&[commented.display().to_string()]));
+    assert!(files_may_include(&[digraph.display().to_string()]));
+    assert!(files_may_include(&[trigraph.display().to_string()]));
+    assert!(files_may_include(&[dir.path().join("missing.c").display().to_string()]));
 }
 
 // -cpp-extra-args is shell-evaluated by Frama-C, so these fields are shell
@@ -146,4 +465,118 @@ fn custom_machdep_paths_are_accepted() {
 #[test]
 fn an_empty_define_is_rejected() {
     assert!(validate_project_options(&with_defines(&[""])).is_err());
+}
+
+/// What makes a file set ineligible for the cached parse record: anything
+/// whose bytes reach beyond the files the caller named.
+///
+/// The scan is deliberately crude and errs toward declining. An include
+/// spelled inside a comment or a dead conditional costs a recount; an include
+/// missed would let this server claim a count it cannot stand behind.
+#[test]
+fn a_file_set_that_reaches_past_its_own_bytes_declines_the_cached_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let write = |name: &str, body: &str| {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).expect("write fixture");
+        path.to_str().expect("utf-8 path").to_string()
+    };
+
+    let plain = write("plain.c", "int f(void) { return 0; }\n");
+    assert!(!files_may_include(std::slice::from_ref(&plain)));
+
+    for (name, body) in [
+        ("direct.c", "#include <stdio.h>\nint f(void) { return 0; }\n"),
+        ("local.c", "#include \"own.h\"\nint f(void) { return 0; }\n"),
+        ("indented.c", "  #  include <stdio.h>\nint f(void) { return 0; }\n"),
+    ] {
+        let file = write(name, body);
+        assert!(files_may_include(&[file]), "{name} reaches past its bytes");
+    }
+
+    // One include anywhere in the set is the whole set.
+    let with_include = write("mixed.c", "#include <stdio.h>\n");
+    assert!(files_may_include(&[plain.clone(), with_include]));
+
+    // A file that cannot be read is not a file whose bytes are known.
+    let missing = tmp.path().join("gone.c").to_str().unwrap().to_string();
+    assert!(files_may_include(&[missing]));
+
+    // Any directive, not only an include. "#/**/include" is a legal spelling
+    // and telling it from a define needs the line stripped of comments first,
+    // so the scan does not try: a define costs a recount it did not need, which
+    // is cheaper than a missed include costing a stale claim.
+    for name in ["#define N 1\n", "#/**/include <stdio.h>\n", "#if 0\n#endif\n"] {
+        let file = write("directive.c", name);
+        assert!(files_may_include(&[file]), "{name:?}");
+    }
+}
+
+/// The digest follows the bytes, so it separates an edit from a re-read and
+/// separates two paths that happen to hold the same text.
+#[test]
+fn the_source_digest_moves_with_the_bytes_and_with_the_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("a.c");
+    let name = |p: &std::path::Path| p.to_str().expect("utf-8 path").to_string();
+
+    std::fs::write(&path, "int f(void) { return 0; }\n").expect("write");
+    let first = loaded_source_digest(&[name(&path)], None);
+    assert_eq!(first, loaded_source_digest(&[name(&path)], None), "re-read");
+
+    std::fs::write(&path, "int f(void) { return 1; }\n").expect("rewrite");
+    assert_ne!(first, loaded_source_digest(&[name(&path)], None), "edit in place");
+
+    // Same bytes written again is a different state, because an edit and a
+    // restore between two reads hash the same and the identity has to see the
+    // round trip. Conditional on the write actually moving the modification
+    // time, which is the same limit the identity has: a filesystem that stamps
+    // both writes identically cannot distinguish them and neither can this.
+    let written = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let before = written(&path);
+    let restored = loaded_source_digest(&[name(&path)], None);
+    std::fs::write(&path, "int f(void) { return 1; }\n").expect("rewrite the same bytes");
+    if written(&path) != before {
+        assert_ne!(restored, loaded_source_digest(&[name(&path)], None), "rewritten");
+    }
+
+    // Same bytes under another name is another file set: Frama-C is handed the
+    // path, and the path is what it parses.
+    let twin = tmp.path().join("b.c");
+    std::fs::copy(&path, &twin).expect("copy");
+    assert_ne!(
+        loaded_source_digest(&[name(&path)], None),
+        loaded_source_digest(&[name(&twin)], None)
+    );
+}
+
+/// A machdep is in the identity, because Frama-C reads a YAML file there as
+/// readily as a builtin name, and those bytes are outside the file set.
+///
+/// A builtin name is not a path, so it hashes as the failure to open it, which
+/// is stable and costs a project that names one nothing. A file that is edited,
+/// or that is deleted after the process loaded it, moves the digest, which is
+/// what sends the next reload to a new process instead of reusing a record
+/// taken under a machine model that is no longer on disk.
+#[test]
+fn the_machdep_is_part_of_the_parse_identity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("a.c");
+    std::fs::write(&source, "int f(void) { return 0; }\n").expect("write");
+    let files = [source.to_str().expect("utf-8 path").to_string()];
+
+    let builtin = loaded_source_digest(&files, Some("gcc_x86_64"));
+    assert_eq!(builtin, loaded_source_digest(&files, Some("gcc_x86_64")), "re-read");
+    assert_ne!(builtin, loaded_source_digest(&files, None), "no machdep at all");
+
+    let custom = tmp.path().join("custom.yaml");
+    std::fs::write(&custom, "machdep:\n  sizeof_int: 4\n").expect("write machdep");
+    let custom = custom.to_str().expect("utf-8 path").to_string();
+    let loaded = loaded_source_digest(&files, Some(&custom));
+
+    std::fs::write(&custom, "machdep:\n  sizeof_int: 8\n").expect("edit machdep");
+    assert_ne!(loaded, loaded_source_digest(&files, Some(&custom)), "edited");
+
+    std::fs::remove_file(&custom).expect("remove machdep");
+    assert_ne!(loaded, loaded_source_digest(&files, Some(&custom)), "deleted");
 }

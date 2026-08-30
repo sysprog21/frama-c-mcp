@@ -105,13 +105,57 @@ pub fn proof_receipt_evidence_error(
 /// One home, because there were three: this, a hand-rolled write! loop, and an
 /// eight-way {:02x} format string in wpclass for the first eight bytes.
 pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+/// The same spelling for a digest taken a chunk at a time, so a caller that
+/// must not hold a whole file in memory gets bytes identical to sha256_hex.
+///
+/// Also whether the bytes could open a preprocessing directive, answered here
+/// because the alternative is a second pass over a file this one is already
+/// streaming. All three spellings of the "#" that starts one: the character,
+/// the digraph "%:", and the trigraph "??=". A source is free to use any of
+/// them, and the answer is used to decide whether a file reaches past its own
+/// bytes, so missing a spelling is the expensive direction; a false yes only
+/// costs a reparse.
+///
+/// Scanned byte by byte with a two-byte lookbehind rather than by searching
+/// each chunk, because a digraph or trigraph can straddle a chunk boundary and
+/// a per-chunk search cannot see one that does.
+pub fn sha256_hex_of_reader(mut reader: impl std::io::Read) -> std::io::Result<(String, bool)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut may_be_a_directive = false;
+    let mut previous = [0u8; 2];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if !may_be_a_directive {
+            for &byte in &buffer[..read] {
+                may_be_a_directive |= byte == b'#'
+                    || (byte == b':' && previous[1] == b'%')
+                    || (byte == b'=' && previous[1] == b'?' && previous[0] == b'?');
+                if may_be_a_directive {
+                    break;
+                }
+                previous = [previous[1], byte];
+            }
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hex_digest(hasher.finalize()), may_be_a_directive))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
     use std::fmt::Write;
 
     // One buffer, sized up front. The map-and-collect spelling allocates a
     // String per byte, 33 allocations against this one, and wpclass hashes once
     // per WP goal.
     let mut out = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
+    for byte in digest.as_ref() {
         // Writing to a String cannot fail; the Result exists for the trait.
         let _ = write!(out, "{byte:02x}");
     }
