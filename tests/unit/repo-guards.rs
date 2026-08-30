@@ -273,24 +273,19 @@ fn only_a_known_e_acsl_wrapper_can_be_named() {
 /// not a sweep.
 #[test]
 fn no_em_dash_in_a_rust_comment() {
-    let mut offenders = Vec::new();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
     for dir in ["src", "tests"] {
-        let mut stack = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"))).join(dir)];
-        while let Some(path) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&path) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                    for (number, line) in text.lines().enumerate() {
-                        let trimmed = line.trim_start();
-                        if trimmed.starts_with("//") && line.contains('\u{2014}') {
-                            offenders.push(format!("{}:{}", path.display(), number + 1));
-                        }
-                    }
-                }
+        source_files(&root.join(dir), "rs", &mut sources);
+    }
+
+    let mut offenders = Vec::new();
+    for path in &sources {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for (number, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") && line.contains('\u{2014}') {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
             }
         }
     }
@@ -340,8 +335,9 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
     const CEILING: usize = 300;
 
     let mut files = Vec::new();
-    rust_files(
+    source_files(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        "rs",
         &mut files,
     );
 
@@ -417,13 +413,34 @@ fn closes_at(line: &str, close: &str) -> bool {
     rest.is_empty() || rest.starts_with("//")
 }
 
-/// Walk every .rs file under a directory.
-fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for path in entries.flatten().map(|entry| entry.path()) {
+/// Walk every file whose extension is the one asked for, under a directory.
+///
+/// Recursive, and every caller wants it that way: a scan that reads one
+/// directory level answers about the tree it was pointed at rather than the
+/// tree, and goes quiet instead of failing when a file moves down one.
+///
+/// It panics on a directory it cannot read, where it used to return what it
+/// had. Every caller is a guard, and a guard that reports on the part of the
+/// tree it happened to reach is the failure mode these tests exist against;
+/// the non-empty assertions at the call sites do not catch it, because one
+/// readable directory at the top satisfies them.
+///
+/// Each directory is walked in sorted order, so the appended run is ordered
+/// too. read_dir order is arbitrary, and every caller is a guard whose report
+/// a human reads, so the order is part of the contract rather than something
+/// each call site remembers to restore afterwards.
+fn source_files(dir: &std::path::Path, extension: &str, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|err| panic!("read an entry of {}: {err}", dir.display())).path()
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
         if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            source_files(&path, extension, out);
+        } else if path.extension().is_some_and(|ext| ext == extension) {
             out.push(path);
         }
     }
@@ -521,7 +538,7 @@ fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf>
 fn every_frama_c_request_is_named_in_a_probe_table() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    rust_files(&root.join("src"), &mut sources);
+    source_files(&root.join("src"), "rs", &mut sources);
     assert!(!sources.is_empty(), "found no sources to scan");
 
     let known: std::collections::HashSet<&str> =
@@ -883,14 +900,21 @@ fn every_published_item_has_a_user() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let mut sources = Vec::new();
-    rust_files(&root.join("src"), &mut sources);
+    source_files(&root.join("src"), "rs", &mut sources);
     let src_count = sources.len();
-    rust_files(&root.join("tests"), &mut sources);
+    source_files(&root.join("tests"), "rs", &mut sources);
     assert!(src_count > 0 && sources.len() > src_count, "found no sources to scan");
 
+    // A file that cannot be read is a failure and not a file to skip: dropping
+    // one under src/ loses its definitions, and dropping one under tests/ turns
+    // the uses written there into orphan reports on items that are fine.
     let texts: Vec<(std::path::PathBuf, String)> = sources
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            (path, text)
+        })
         .collect();
 
     const PUBLISHED: &[&str] =
@@ -921,11 +945,15 @@ fn every_published_item_has_a_user() {
                 .chars()
                 .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
                 .collect();
-            // "pub const fn" would read as a const named fn. No such form is in
-            // the tree, and this says so precisely if one arrives, rather than
-            // reporting an orphan called "fn" and sending the reader hunting.
+
+            // "pub const fn" would read as a const named fn, and "pub static
+            // mut" as a static named mut. Neither form is in the tree, and this
+            // says so precisely if one arrives, rather than recording an item
+            // called "fn" and sending the reader hunting. A leading modifier
+            // that is not itself a keyword below, "pub extern \"C\" fn", is
+            // dropped by the filter that follows instead.
             assert!(
-                !PUBLISHED.contains(&name.as_str()),
+                !PUBLISHED.contains(&name.as_str()) && name != "mut",
                 "{}: \"pub {keyword} {name}\" is a modifier form this scan does not read",
                 path.display()
             );
@@ -936,16 +964,18 @@ fn every_published_item_has_a_user() {
     }
     assert!(defined.len() > 400, "parsed {} pub items, the scan broke", defined.len());
 
+    // Split once and stop at the first hit. Counting every use of every name
+    // re-split the whole corpus per item, which was most of this suite's
+    // runtime, and the answer only ever asks whether one exists.
+    let corpus: Vec<&str> = texts.iter().flat_map(|(_, text)| text.lines()).collect();
+
     let mut orphans = Vec::new();
     for (keyword, name, where_defined) in &defined {
         let definition = format!("{keyword} {name}");
-        let uses = texts
+        let used = corpus
             .iter()
-            .flat_map(|(_, text)| text.lines())
-            .filter(|line| line.contains(name.as_str()))
-            .filter(|line| !line.trim_start().contains(definition.as_str()))
-            .count();
-        if uses == 0 {
+            .any(|line| line.contains(name.as_str()) && !line.contains(definition.as_str()));
+        if !used {
             orphans.push(format!("pub {keyword} {name} ({where_defined})"));
         }
     }
@@ -1636,7 +1666,8 @@ fn documented_gate_list_covers_ci() {
     );
 }
 
-/// The ast-utils requests self_check expects are the requests its plug-in registers.
+/// The ast-utils requests self_check expects are the requests its plug-in
+/// registers.
 ///
 /// AST_UTILS_REQUESTS is hand-written because it also states each request's
 /// probe behaviour. The plug-in is the authority for the name and the command
@@ -1670,18 +1701,22 @@ fn ast_utils_requests_match_plugin_registrations() {
 
     // Every module, not just the one that registers everything today: a
     // registration moved into a sibling would otherwise leave both sides quiet.
-    let plugin_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ast-utils/src");
-    let mut sources = std::fs::read_dir(&plugin_src)
-        .expect("read ast-utils/src")
-        .map(|entry| entry.expect("read ast-utils/src entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "ml"))
-        .collect::<Vec<_>>();
-    sources.sort();
+    // Recursive for the same reason, even though dune's "modules :standard"
+    // reads one directory: a subdirectory needs its own dune file to build at
+    // all, and a scan that trusts that has to be re-read every time the build
+    // description changes.
+    let mut sources = Vec::new();
+    source_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ast-utils/src"),
+        "ml",
+        &mut sources,
+    );
     assert!(!sources.is_empty(), "no plug-in sources to scan");
 
-    let mut actual = BTreeMap::new();
+    let mut actual: BTreeMap<String, (String, String)> = BTreeMap::new();
     for path in &sources {
-        let source = std::fs::read_to_string(path).expect("read plug-in source");
+        let source = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         let text = strip_ocaml_comments(&source);
         let lines = text.lines().collect::<Vec<_>>();
         let registrations = lines
@@ -1689,9 +1724,13 @@ fn ast_utils_requests_match_plugin_registrations() {
             .enumerate()
             .filter(|(_, line)| line.contains("Server.Request.register"));
         for (at, _) in registrations {
-            // The name and the kind sit three lines below the call today. Six
-            // is slack, and overshooting panics rather than reading the next
-            // registration's name, because the window stops before it.
+            // The kind and the name sit two and three lines below the call
+            // today, and six is slack. A registration that puts either further
+            // out panics rather than going quiet, which is the whole value of
+            // the window being fixed. It is fixed rather than cut at the next
+            // registration because the registrations stand tens of lines apart;
+            // a pair closer than six would let the first read the second's
+            // fields and then blame the table for a name registered twice.
             let window = &lines[at..lines.len().min(at + 7)];
             let field = |label: &str| {
                 window.iter().find_map(|line| line.split_once(label)).map(|(_, rest)| rest)
@@ -1701,16 +1740,22 @@ fn ast_utils_requests_match_plugin_registrations() {
                 .and_then(|rest| rest.split_once('"'))
                 .unwrap_or_else(|| panic!("{site}: registration has no ~name within six lines"))
                 .0;
+
             // One token, not the rest of the line: a registration that put the
             // kind and the name on one line would otherwise read as a kind of
             // "`GET ~name:..." and blame the table for the mismatch.
             let kind = field("~kind:")
                 .and_then(|rest| rest.split_whitespace().next())
                 .unwrap_or_else(|| panic!("{site}: registration has no ~kind within six lines"));
-            assert!(
-                actual.insert(name.to_string(), kind.to_string()).is_none(),
-                "{site}: the plug-in registers {name} twice"
-            );
+
+            // Both sites, because which one loses the insert is decided by path
+            // order rather than by which one is new, and blaming the older file
+            // sends the reader somewhere that has been correct for months.
+            if let Some((_, first)) =
+                actual.insert(name.to_string(), (kind.to_string(), site.clone()))
+            {
+                panic!("{site}: {name} is also registered at {first}");
+            }
         }
     }
     assert!(!actual.is_empty(), "no plug-in registrations parsed");
@@ -1723,14 +1768,14 @@ fn ast_utils_requests_match_plugin_registrations() {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|name| match (expected.get(name), actual.get(name)) {
-            (Some(table), Some(plugin)) if table != plugin => {
-                Some(format!("{name} is in the table as {table} and registered as {plugin}"))
-            }
+            (Some(table), Some((plugin, site))) if table != plugin => Some(format!(
+                "{name} is in the table as {table} and registered as {plugin} at {site}"
+            )),
             (Some(table), None) => {
                 Some(format!("{name} is in the table as {table} and registered nowhere"))
             }
-            (None, Some(plugin)) => {
-                Some(format!("{name} is registered as {plugin} and in no table"))
+            (None, Some((plugin, site))) => {
+                Some(format!("{name} is registered as {plugin} at {site} and in no table"))
             }
             _ => None,
         })
