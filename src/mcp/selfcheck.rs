@@ -20,7 +20,7 @@ type RequestSpec = (&'static str, &'static str, ProbeKind);
 
 /// An ast-utils probe target: request name, command verb, and whether
 /// `required_requests` probes it live. The domain is always "ast-utils".
-type AstUtilsSpec = (&'static str, ProbeKind, bool);
+pub type AstUtilsSpec = (&'static str, ProbeKind, bool);
 
 /// Requests the ast-utils plugin registers, and whether self_check probes each
 /// one live. Removal and sandbox-lifecycle requests stay unprobed because a
@@ -31,7 +31,7 @@ type AstUtilsSpec = (&'static str, ProbeKind, bool);
 /// getRteObligations back `context {want: ["logic_deps"]}` and
 /// `{want: ["rte_obligations"]}`, and were the exception: a plug-in too old to
 /// register them passed self_check and then failed at `context`.
-const AST_UTILS_REQUESTS: &[AstUtilsSpec] = &[
+pub const AST_UTILS_REQUESTS: &[AstUtilsSpec] = &[
     ("plugins.ast-utils.getFunctionAst", ProbeKind::Get, true),
     ("plugins.ast-utils.getCilContext", ProbeKind::Get, true),
     ("plugins.ast-utils.getContractContext", ProbeKind::Get, true),

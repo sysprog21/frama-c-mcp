@@ -786,26 +786,6 @@ pub struct InsertGhostStmtParams {
     pub expr: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RemoveAnnotationParams {
-    /// Function name (removes all added annotations for this function)
-    pub function: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct HoareAnalyzeParams {
-    /// Function name to analyze
-    pub function: String,
-    /// Callee context: pre-computed specs for called functions
-    pub callee_context: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetHoareTraceParams {
-    /// Function name
-    pub function: String,
-}
-
 // Conclusion tools
 
 #[derive(Debug, Deserialize, JsonSchema)]

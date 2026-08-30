@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 
 use frama_c_mcp::mcp::server::*;
@@ -273,24 +273,19 @@ fn only_a_known_e_acsl_wrapper_can_be_named() {
 /// not a sweep.
 #[test]
 fn no_em_dash_in_a_rust_comment() {
-    let mut offenders = Vec::new();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
     for dir in ["src", "tests"] {
-        let mut stack = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"))).join(dir)];
-        while let Some(path) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&path) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                    for (number, line) in text.lines().enumerate() {
-                        let trimmed = line.trim_start();
-                        if trimmed.starts_with("//") && line.contains('\u{2014}') {
-                            offenders.push(format!("{}:{}", path.display(), number + 1));
-                        }
-                    }
-                }
+        source_files(&root.join(dir), "rs", &mut sources);
+    }
+
+    let mut offenders = Vec::new();
+    for path in &sources {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for (number, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") && line.contains('\u{2014}') {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
             }
         }
     }
@@ -340,8 +335,9 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
     const CEILING: usize = 300;
 
     let mut files = Vec::new();
-    rust_files(
+    source_files(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        "rs",
         &mut files,
     );
 
@@ -417,13 +413,34 @@ fn closes_at(line: &str, close: &str) -> bool {
     rest.is_empty() || rest.starts_with("//")
 }
 
-/// Walk every .rs file under a directory.
-fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for path in entries.flatten().map(|entry| entry.path()) {
+/// Walk every file whose extension is the one asked for, under a directory.
+///
+/// Recursive, and every caller wants it that way: a scan that reads one
+/// directory level answers about the tree it was pointed at rather than the
+/// tree, and goes quiet instead of failing when a file moves down one.
+///
+/// It panics on a directory it cannot read, where it used to return what it
+/// had. Every caller is a guard, and a guard that reports on the part of the
+/// tree it happened to reach is the failure mode these tests exist against;
+/// the non-empty assertions at the call sites do not catch it, because one
+/// readable directory at the top satisfies them.
+///
+/// Each directory is walked in sorted order, so the appended run is ordered
+/// too. read_dir order is arbitrary, and every caller is a guard whose report
+/// a human reads, so the order is part of the contract rather than something
+/// each call site remembers to restore afterwards.
+fn source_files(dir: &std::path::Path, extension: &str, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|err| panic!("read an entry of {}: {err}", dir.display())).path()
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
         if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            source_files(&path, extension, out);
+        } else if path.extension().is_some_and(|ext| ext == extension) {
             out.push(path);
         }
     }
@@ -521,7 +538,7 @@ fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf>
 fn every_frama_c_request_is_named_in_a_probe_table() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    rust_files(&root.join("src"), &mut sources);
+    source_files(&root.join("src"), "rs", &mut sources);
     assert!(!sources.is_empty(), "found no sources to scan");
 
     let known: std::collections::HashSet<&str> =
@@ -853,72 +870,113 @@ fn ci_named_tests_still_exist() {
     );
 }
 
-/// Every pub fn in src/ is called from somewhere in src/ or tests/.
+/// Every pub item in src/ is named somewhere else in src/ or tests/.
 ///
 /// This exists because dead_code cannot see these any more. Publishing the
 /// internals so the unit tests could move out of the crate made every one of
 /// them a pub item in a pub mod, and the lint does not fire on those: it
-/// assumes an external consumer. So the 439 published items lost the check
-/// that a helper whose last caller went away gets reported, while the 331 that
+/// assumes an external consumer. So the published items lost the check that a
+/// helper whose last caller went away gets reported, while the ones that
 /// stayed private kept it, and nothing anywhere said which half you were in.
+///
+/// It read pub fn only until 2026-08-30, which was 313 of the 482 published
+/// items. The eight keywords below take it to 453, closing a gap of 140 pub
+/// structs, consts, enums and types that were in neither half, covered by no
+/// lint and by no guard. A count is the wrong instrument for that gap, because
+/// it moves with every commit and a gate pinning it becomes a number people
+/// bump. Naming the orphan is the instrument, and it costs one keyword list.
+///
+/// The remaining 29 are pub mod, deliberately out. A module is named by every
+/// path that reaches through it and by the #[path] attribute above it, so it
+/// can never be orphaned by this scan and would only pad the list.
 ///
 /// Name-based and therefore approximate in one direction only: a name that
 /// appears in a comment or a string counts as a use, so this under-reports
 /// rather than crying wolf. That is the right way round for a guard nobody
-/// asked for, and it still catches the case that matters, which is a function
-/// no longer written down anywhere but its own definition.
+/// asked for, and it still catches the case that matters, which is an item no
+/// longer written down anywhere but its own definition.
 #[test]
-fn every_published_function_has_a_caller() {
+fn every_published_item_has_a_user() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let mut sources = Vec::new();
-    rust_files(&root.join("src"), &mut sources);
+    source_files(&root.join("src"), "rs", &mut sources);
     let src_count = sources.len();
-    rust_files(&root.join("tests"), &mut sources);
+    source_files(&root.join("tests"), "rs", &mut sources);
     assert!(src_count > 0 && sources.len() > src_count, "found no sources to scan");
 
+    // A file that cannot be read is a failure and not a file to skip: dropping
+    // one under src/ loses its definitions, and dropping one under tests/ turns
+    // the uses written there into orphan reports on items that are fine.
     let texts: Vec<(std::path::PathBuf, String)> = sources
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            (path, text)
+        })
         .collect();
 
+    const PUBLISHED: &[&str] =
+        &["fn", "struct", "enum", "type", "const", "static", "trait", "union"];
+
     // Definition sites, and every other mention of the name anywhere.
-    let mut defined: Vec<(String, String)> = Vec::new();
+    let mut defined: Vec<(&str, String, String)> = Vec::new();
     for (path, text) in &texts {
         if !path.starts_with(root.join("src")) {
             continue;
         }
         for line in text.lines() {
-            let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix("pub fn ").or_else(|| {
-                trimmed
-                    .strip_prefix("pub async fn ")
-                    .or_else(|| trimmed.strip_prefix("pub unsafe fn "))
-            }) else {
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            // "pub async fn" and "pub unsafe fn" carry the keyword a token further in.
+            let rest = rest
+                .strip_prefix("async ")
+                .or_else(|| rest.strip_prefix("unsafe "))
+                .unwrap_or(rest);
+            let Some((keyword, rest)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Some(keyword) = PUBLISHED.iter().copied().find(|known| *known == keyword) else {
                 continue;
             };
             let name: String = rest
                 .chars()
                 .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
                 .collect();
+
+            // "pub const fn" would read as a const named fn, and "pub static
+            // mut" as a static named mut. Neither form is in the tree, and this
+            // says so precisely if one arrives, rather than recording an item
+            // called "fn" and sending the reader hunting. A leading modifier
+            // that is not itself a keyword below, "pub extern \"C\" fn", is
+            // dropped by the filter that follows instead.
+            assert!(
+                !PUBLISHED.contains(&name.as_str()) && name != "mut",
+                "{}: \"pub {keyword} {name}\" is a modifier form this scan does not read",
+                path.display()
+            );
             if !name.is_empty() {
-                defined.push((name, format!("{}", path.display())));
+                defined.push((keyword, name, format!("{}", path.display())));
             }
         }
     }
-    assert!(defined.len() > 100, "parsed {} pub fns, the scan broke", defined.len());
+    assert!(defined.len() > 400, "parsed {} pub items, the scan broke", defined.len());
+
+    // Split once and stop at the first hit. Counting every use of every name
+    // re-split the whole corpus per item, which was most of this suite's
+    // runtime, and the answer only ever asks whether one exists.
+    let corpus: Vec<&str> = texts.iter().flat_map(|(_, text)| text.lines()).collect();
 
     let mut orphans = Vec::new();
-    for (name, where_defined) in &defined {
-        let definition = format!("fn {name}");
-        let uses = texts
+    for (keyword, name, where_defined) in &defined {
+        let definition = format!("{keyword} {name}");
+        let used = corpus
             .iter()
-            .flat_map(|(_, text)| text.lines())
-            .filter(|line| line.contains(name.as_str()))
-            .filter(|line| !line.trim_start().contains(definition.as_str()))
-            .count();
-        if uses == 0 {
-            orphans.push(format!("{name} ({where_defined})"));
+            .any(|line| line.contains(name.as_str()) && !line.contains(definition.as_str()));
+        if !used {
+            orphans.push(format!("pub {keyword} {name} ({where_defined})"));
         }
     }
     orphans.sort();
@@ -926,7 +984,7 @@ fn every_published_function_has_a_caller() {
 
     assert!(
         orphans.is_empty(),
-        "these pub fns are named nowhere but their own definition, and dead_code \
+        "these pub items are named nowhere but their own definition, and dead_code \
          can no longer report them: {orphans:?}"
     );
 }
@@ -1606,6 +1664,153 @@ fn documented_gate_list_covers_ci() {
         "CI runs these and the gate list in that document does not mention them, so \
          nobody runs them by hand: {missing:?}"
     );
+}
+
+/// The ast-utils requests self_check expects are the requests its plug-in
+/// registers.
+///
+/// AST_UTILS_REQUESTS is hand-written because it also states each request's
+/// probe behaviour. The plug-in is the authority for the name and the command
+/// verb, so those two columns are compared here; the probed flag is this
+/// server's own policy and stays unguarded. The Rust side is read from the
+/// crate rather than parsed back out of selfcheck.rs, which is what leaves the
+/// text scanning to the OCaml half and keeps this test free of Frama-C.
+#[test]
+fn ast_utils_requests_match_plugin_registrations() {
+    const PREFIX: &str = "plugins.ast-utils.";
+
+    let expected = selfcheck::AST_UTILS_REQUESTS
+        .iter()
+        .map(|&(request, kind, _)| {
+            let name = request.strip_prefix(PREFIX).unwrap_or_else(|| {
+                panic!("AST_UTILS_REQUESTS holds a request from another domain: {request}")
+            });
+            let kind = match kind {
+                selfcheck::ProbeKind::Get => "`GET",
+                selfcheck::ProbeKind::Set => "`SET",
+                selfcheck::ProbeKind::Exec => "`EXEC",
+            };
+            (name.to_string(), kind.to_string())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        expected.len(),
+        selfcheck::AST_UTILS_REQUESTS.len(),
+        "AST_UTILS_REQUESTS names a request twice, so self_check probes it twice"
+    );
+
+    // Every module, not just the one that registers everything today: a
+    // registration moved into a sibling would otherwise leave both sides quiet.
+    // Recursive for the same reason, even though dune's "modules :standard"
+    // reads one directory: a subdirectory needs its own dune file to build at
+    // all, and a scan that trusts that has to be re-read every time the build
+    // description changes.
+    let mut sources = Vec::new();
+    source_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ast-utils/src"),
+        "ml",
+        &mut sources,
+    );
+    assert!(!sources.is_empty(), "no plug-in sources to scan");
+
+    let mut actual: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for path in &sources {
+        let source = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let text = strip_ocaml_comments(&source);
+        let lines = text.lines().collect::<Vec<_>>();
+        let registrations = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("Server.Request.register"));
+        for (at, _) in registrations {
+            // The kind and the name sit two and three lines below the call
+            // today, and six is slack. A registration that puts either further
+            // out panics rather than going quiet, which is the whole value of
+            // the window being fixed. It is fixed rather than cut at the next
+            // registration because the registrations stand tens of lines apart;
+            // a pair closer than six would let the first read the second's
+            // fields and then blame the table for a name registered twice.
+            let window = &lines[at..lines.len().min(at + 7)];
+            let field = |label: &str| {
+                window.iter().find_map(|line| line.split_once(label)).map(|(_, rest)| rest)
+            };
+            let site = format!("{}:{}", path.display(), at + 1);
+            let name = field("~name:\"")
+                .and_then(|rest| rest.split_once('"'))
+                .unwrap_or_else(|| panic!("{site}: registration has no ~name within six lines"))
+                .0;
+
+            // One token, not the rest of the line: a registration that put the
+            // kind and the name on one line would otherwise read as a kind of
+            // "`GET ~name:..." and blame the table for the mismatch.
+            let kind = field("~kind:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("{site}: registration has no ~kind within six lines"));
+
+            // Both sites, because which one loses the insert is decided by path
+            // order rather than by which one is new, and blaming the older file
+            // sends the reader somewhere that has been correct for months.
+            if let Some((_, first)) =
+                actual.insert(name.to_string(), (kind.to_string(), site.clone()))
+            {
+                panic!("{site}: {name} is also registered at {first}");
+            }
+        }
+    }
+    assert!(!actual.is_empty(), "no plug-in registrations parsed");
+
+    // Both directions and the disagreement in one match, so the cases are
+    // visibly exhaustive rather than three filters that have to add up.
+    let drift = expected
+        .keys()
+        .chain(actual.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|name| match (expected.get(name), actual.get(name)) {
+            (Some(table), Some((plugin, site))) if table != plugin => Some(format!(
+                "{name} is in the table as {table} and registered as {plugin} at {site}"
+            )),
+            (Some(table), None) => {
+                Some(format!("{name} is in the table as {table} and registered nowhere"))
+            }
+            (None, Some((plugin, site))) => {
+                Some(format!("{name} is registered as {plugin} at {site} and in no table"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        drift.is_empty(),
+        "AST_UTILS_REQUESTS has drifted from the plug-in: {drift:#?}"
+    );
+}
+
+/// Blank out OCaml comment bodies, keeping the line structure.
+///
+/// Comments nest, and a registration commented out rather than deleted still
+/// reads as a registration to a substring scan, which is the drift this file
+/// exists to catch arriving as a clean run. A "(*" inside a string literal
+/// would open a comment that is not there; nothing in the plug-in writes one,
+/// and telling the two apart needs a lexer.
+fn strip_ocaml_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("(*") {
+            depth += 1;
+        } else if depth > 0 && rest.starts_with("*)") {
+            depth -= 1;
+        } else {
+            out.push(if depth > 0 && c != '\n' { ' ' } else { c });
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        out.push_str("  ");
+        rest = &rest[2..];
+    }
+    out
 }
 
 /// The tool surface is exactly what README documents.
