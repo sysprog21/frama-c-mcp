@@ -50,8 +50,261 @@ struct AstReloadHealth {
     payload: serde_json::Value,
 }
 
+const AST_DIAGNOSTIC_SAMPLE: usize = 20;
+
+/// The two categories a dropped soundness assumption arrives under. Public
+/// because analysis.rs classifies them into check codes and has to name the
+/// same strings this module reads off the log.
+pub const ASM_CLOBBER: &str = "kernel:asm:clobber";
+pub const ATTRS_UNKNOWN: &str = "kernel:attrs:unknown";
+const ATTRIBUTE_PREFIX: &str = "Ignoring unknown attribute:";
+const AST_SOUNDNESS_CATEGORIES: [&str; 2] = [ASM_CLOBBER, ATTRS_UNKNOWN];
+
+fn log_location(source: &str, cwd: &Path) -> serde_json::Value {
+    let source = source.trim().trim_end_matches(':').trim();
+    if source.is_empty() {
+        return json!({"unresolved": true});
+    }
+    // Frama-C prints "path", "path:line" or "path:line:column", so the numbers
+    // come off the end one at a time and what is left is the path. A trailing
+    // field that is not a number means the whole string is the path: a path can
+    // carry a colon.
+    let (source, line, column) = match trailing_number(source) {
+        None => (source, None, None),
+        Some((head, last)) => match trailing_number(head) {
+            Some((head, line)) => (head, Some(line), Some(last)),
+            None => (head, Some(last), None),
+        },
+    };
+    let path = Path::new(source);
+    let path = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+    json!({"file": path, "line": line, "column": column})
+}
+
+/// Summarize Warning records from the log slice that built the current AST.
+/// The server protocol loses boot-time messages, while this file is
+/// append-only.
+///
+/// The window is the process's boot parse, from byte zero to the length
+/// stdout had when the socket appeared, and it is complete for two reasons
+/// that no later window has. Frama-C suppresses a warn-once category for the
+/// life of the process, so a reparse cannot re-emit one. And the log is
+/// process-wide, so a call running alongside a reparse would put its own
+/// warnings in the same range; nothing can be in flight before the socket
+/// exists. ensure_main_spawned is what keeps this true, by respawning rather
+/// than reparsing whenever the record would stop answering for the file set.
+///
+/// Measured on Frama-C 33. A warning is one line or two, and which it is
+/// depends on the path length against the margin rather than on anything this
+/// server chose: "[kernel:attrs:unknown] a.c:1: Warning: Ignoring unknown
+/// attribute: __q__" fits, while the same warning under a longer path breaks
+/// after "Warning:" and indents the text onto the next line. Reading only the
+/// second shape counted zero unknown attributes for every project with short
+/// paths.
+///
+/// The tag is found by tag_bounds rather than by either end of the line,
+/// because a directory name can carry brackets on either side of it.
+pub fn ast_parse_diagnostics(log: &[u8], end: u64, cwd: &Path) -> serde_json::Value {
+    let end = usize::try_from(end).unwrap_or(usize::MAX).min(log.len());
+
+    // Counted in full, sampled up to the cap. A program with ten thousand
+    // clobber sites is ten thousand increments rather than ten thousand JSON
+    // objects and paths that the cap below would throw away: the count is the
+    // soundness claim, and the sample is the evidence a reader can follow.
+    let mut categories: BTreeMap<String, (usize, Vec<serde_json::Value>)> = BTreeMap::new();
+    let mut record = |category: &str, source: &str| {
+        let entry = categories.entry(category.to_string()).or_default();
+        entry.0 += 1;
+        if entry.1.len() < AST_DIAGNOSTIC_SAMPLE {
+            entry.1.push(log_location(source, cwd));
+        }
+    };
+
+    // The attributes are keyed by name because the count is distinct names, so
+    // this map is bounded by the program's attribute vocabulary rather than by
+    // its size. The location stays unparsed until the name is known to be new.
+    let mut attributes: BTreeMap<String, &str> = BTreeMap::new();
+    let mut pending_attribute: Option<&str> = None;
+    let text = String::from_utf8_lossy(&log[..end]);
+    for line in text.lines() {
+        match warning_line_fields(line) {
+            // The name sits on this line when it fits and wraps onto the next
+            // when it does not, and which of the two happens is a function of
+            // the path length and the margin rather than of anything this
+            // server controls. Measured on Frama-C 33: "a.c:1" keeps "__q__" on
+            // the tag line, while the same attribute under "tests/fixtures/..."
+            // wraps.
+            Some((category, source)) if category == ATTRS_UNKNOWN => {
+                match line.split_once(ATTRIBUTE_PREFIX) {
+                    Some((_, name)) => {
+                        attributes.entry(name.trim().to_string()).or_insert(source);
+                        pending_attribute = None;
+                    }
+                    None => pending_attribute = Some(source),
+                }
+            }
+
+            // Any other warning ends the wrap: what follows it belongs to that
+            // warning, so an attribute name arriving later is not this one's.
+            Some((category, source)) => {
+                record(category, source);
+                pending_attribute = None;
+            }
+
+            // Untagged, so a continuation line if it names an attribute. It is
+            // counted even with no pending location, because the count is the
+            // soundness claim and a location this server could not pin is a
+            // worse answer than an unpinned one, not a reason to drop it. An
+            // empty source is what log_location reads as unresolved.
+            None => {
+                if let Some((_, name)) = line.split_once(ATTRIBUTE_PREFIX) {
+                    let source = pending_attribute.take().unwrap_or("");
+                    attributes.entry(name.trim().to_string()).or_insert(source);
+                }
+            }
+        }
+    }
+    for (name, source) in attributes {
+        let entry = categories.entry(ATTRS_UNKNOWN.to_string()).or_default();
+        entry.0 += 1;
+        if entry.1.len() < AST_DIAGNOSTIC_SAMPLE {
+            entry.1.push(json!({"attribute": name, "location": log_location(source, cwd)}));
+        }
+    }
+
+    // Present with a zero count rather than absent, so a caller reads "Frama-C
+    // dropped nothing here" instead of having to guess why a key is missing.
+    for category in AST_SOUNDNESS_CATEGORIES {
+        categories.entry(category.to_string()).or_default();
+    }
+    let categories = categories
+        .into_iter()
+        .map(|(category, (count, locations))| {
+            let count_unit = if category == ATTRS_UNKNOWN {
+                "distinct_attribute_names"
+            } else {
+                "sites"
+            };
+            (
+                category,
+                json!({
+                    "count": count,
+                    "count_unit": count_unit,
+                    "locations_omitted": count - locations.len(),
+                    "locations": locations,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"categories": categories})
+}
+
+/// The string without its trailing ":<number>" field, and that number.
+fn trailing_number(source: &str) -> Option<(&str, u64)> {
+    let (head, last) = source.rsplit_once(':')?;
+    Some((head, last.parse().ok()?))
+}
+
+/// The category and the unparsed source location of one warning line, or None
+/// when the line is not one: feedback carries a tag too, as in
+/// "[kernel:pp:compilation-db] using compilation database:", and only a
+/// warning carries the "Warning:" token.
+///
+/// The tag is the first bracketed group at a field boundary before the token,
+/// scanning left to right. Neither end of the line is a safe anchor: a
+/// directory name can carry brackets on either side of the tag.
+///
+/// The location is handed back as the text Frama-C printed rather than as a
+/// parsed one, so a caller that is only going to count this warning never pays
+/// for the path it will not keep.
+fn warning_line_fields(line: &str) -> Option<(&str, &str)> {
+    // The first "Warning:" with a tag before it, not the first one on the line.
+    // A path may carry the token, as in "src/Warning:x/a.c:3:", and stopping
+    // there leaves a head with no tag in it, which dropped the warning
+    // entirely. Earliest rather than latest, because the message that follows
+    // the real marker may quote the token too, and a head that reaches into the
+    // message reads its text as a location.
+    let mut from = 0;
+    let (head, open, close) = loop {
+        let at = from + line[from..].find("Warning:")?;
+        let head = &line[..at];
+        match tag_bounds(head) {
+            Some((open, close)) => break (head, open, close),
+            None => from = at + 1,
+        }
+    };
+
+    // Whichever side of the tag the location was printed on. Both sides are
+    // taken because Frama-C puts it after the tag and nothing promises that.
+    let before = head[..open].trim().trim_end_matches(':').trim();
+    let after = head[close + 1..].trim().trim_end_matches(':').trim();
+    let source = if before.is_empty() { after } else { before };
+    Some((&head[open + 1..close], source))
+}
+
+/// Byte offsets of the "[" and "]" around the first plugin:category tag.
+///
+/// A tag holds a colon and no whitespace, and is a whitespace-separated field
+/// of its own. Both sides of that have to be checked: a path segment carrying
+/// a colon, as in "[team:api]/a.c:3:", is a field boundary on its left when the
+/// path is relative and starts with it, so only the character after the bracket
+/// tells the two apart.
+fn tag_bounds(head: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(open) = head[from..].find('[') {
+        let open = from + open;
+        let close = open + head[open..].find(']')?;
+        let candidate = &head[open + 1..close];
+        let tail = &head[close + 1..];
+        if (open == 0 || head[..open].ends_with(char::is_whitespace))
+            && (tail.is_empty() || tail.starts_with(char::is_whitespace))
+            && candidate.contains(':')
+            && !candidate.contains(char::is_whitespace)
+        {
+            return Some((open, close));
+        }
+
+        // Past the rejected "[", not past the "]" it was paired with. That
+        // bracket may be the real tag's, as in "src/[dir/a.c:3:
+        // [kernel:asm:clobber]", where the first "[" is unmatched inside the
+        // path and pairs with the tag's own closing bracket. Skipping to it
+        // stepped over the tag and dropped the warning.
+        from = open + 1;
+    }
+    None
+}
+
+/// The boot parse's own bytes, rather than the whole log. Frama-C keeps
+/// writing to this file for the life of the process, so a read of all of it
+/// grows with the proof while the window that gets parsed does not. The read
+/// is still bounded by end inside ast_parse_diagnostics, which answers for a
+/// slice a caller passes rather than for whatever this handed it.
+fn read_parse_window(path: &Path, end: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut window = Vec::new();
+    std::fs::File::open(path)?.take(end).read_to_end(&mut window)?;
+    Ok(window)
+}
+
+/// The parse record when there is none. No categories, because an absent key
+/// is the only honest answer: a zero would say the front end dropped nothing,
+/// which is exactly what has not been established. One constructor, so that
+/// invariant is stated once rather than honored by convention.
+pub fn parse_log_unavailable(reason: String) -> serde_json::Value {
+    json!({"unavailable": reason, "categories": {}})
+}
+
+/// The record for a spawn log this server could not read.
+pub fn unreadable_parse_log(path: &Path, error: &std::io::Error) -> serde_json::Value {
+    parse_log_unavailable(format!(
+        "cannot read the Frama-C stdout log at {}: {error}",
+        path.display()
+    ))
+}
+
 async fn ast_reload_health(
     client: &FramaCClient,
+    parse_diagnostics: serde_json::Value,
 ) -> Result<AstReloadHealth, McpError> {
     let files = reload_health_get(client, "kernel.ast.getFiles", json!(null)).await?;
     let functions = reload_health_fetch_all(
@@ -88,6 +341,7 @@ async fn ast_reload_health(
         "functions_count": functions.len(),
         "globals_count": globals.len(),
         "properties_count": properties.len(),
+        "parse_diagnostics": parse_diagnostics,
     });
     Ok(AstReloadHealth { functions, payload })
 }
@@ -235,7 +489,46 @@ impl FramaCMcpServer {
         // back empty and the sandbox path has no function cache to resolve
         // against.
         let client = self.require_client().await?;
-        let health = ast_reload_health(&client).await?;
+
+        // Read and memoize under one lock. Splitting the two across the
+        // ast_reload_health await let a concurrent reload reset the offsets in
+        // between, after which storing this call's value put the previous file
+        // set's counts back as the answer for the new one. An empty payload if
+        // the process is gone, rather than a panic: the state lock was released
+        // when ensure_main_spawned returned, so the client and the state are no
+        // longer known to agree.
+        let parse_diagnostics = {
+            let mut state = self.main_frama_c_state.lock().await;
+            match state.as_mut() {
+                Some(state) => match state.ast_reload_diagnostics.clone() {
+                    // Including a cached absence. A process that never got a
+                    // boot record cannot grow one, since the boundary it would
+                    // need was a property of an instant that has passed, so
+                    // ensure_main_spawned poisons it instead and the next
+                    // reload answers from a new process.
+                    Some(cached) => cached,
+
+                    // A log this server cannot read is not a parse that dropped
+                    // nothing, and the difference matters: the record below
+                    // carries both soundness categories at zero, which a caller
+                    // is entitled to read as "Frama-C kept everything". So the
+                    // failure answers with no categories at all, and it is not
+                    // cached, since the next call may well read the file.
+                    None => match read_parse_window(&state.stdout_log_path, state.ast_parse_log_end)
+                    {
+                        Ok(log) => {
+                            let fresh =
+                                ast_parse_diagnostics(&log, state.ast_parse_log_end, &state.working_dir);
+                            state.ast_reload_diagnostics = Some(fresh.clone());
+                            fresh
+                        }
+                        Err(error) => unreadable_parse_log(&state.stdout_log_path, &error),
+                    },
+                },
+                None => parse_log_unavailable("the Frama-C process is gone".to_string()),
+            }
+        };
+        let health = ast_reload_health(&client, parse_diagnostics).await?;
         let entries = health.functions;
         {
             let mut state = self.state.write().await;

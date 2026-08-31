@@ -945,6 +945,10 @@ pub mod incomplete_code {
     pub const EVA_NOT_REQUESTED: &str = "EVA_NOT_REQUESTED";
     pub const WP_NOT_REQUESTED: &str = "WP_NOT_REQUESTED";
     pub const WP_BACKEND_ANOMALY: &str = "WP_BACKEND_ANOMALY";
+    pub const AST_ASM_CLOBBER: &str = "AST_ASM_CLOBBER";
+    pub const AST_UNKNOWN_ATTRIBUTE: &str = "AST_UNKNOWN_ATTRIBUTE";
+    pub const AST_UNCLASSIFIED_WARNING: &str = "AST_UNCLASSIFIED_WARNING";
+    pub const AST_PARSE_DIAGNOSTICS_UNAVAILABLE: &str = "AST_PARSE_DIAGNOSTICS_UNAVAILABLE";
 
     // Only the doc comparison reads the list as a list; the emit sites name
     // codes one at a time. It used to be cfg(test) gated, which stopped meaning
@@ -971,6 +975,10 @@ pub mod incomplete_code {
         EVA_NOT_REQUESTED,
         WP_NOT_REQUESTED,
         WP_BACKEND_ANOMALY,
+        AST_ASM_CLOBBER,
+        AST_UNKNOWN_ATTRIBUTE,
+        AST_UNCLASSIFIED_WARNING,
+        AST_PARSE_DIAGNOSTICS_UNAVAILABLE,
     ];
 }
 
@@ -1542,6 +1550,7 @@ pub fn check_incomplete_items(
     wanted: WantedAnalyses,
 ) -> Vec<serde_json::Value> {
     let mut incomplete = Vec::new();
+    ast_diagnostic_gaps(&mut incomplete, reload, AST_WARNING_ALLOWLIST);
     unrequested_analysis_gaps(&mut incomplete, rte, wanted);
     step_failure_gaps(&mut incomplete, reload, eva, eva_alarms, wp, wp_goals, wanted);
     property_row_gaps(&mut incomplete, eva_alarms, wp_goals);
@@ -1550,6 +1559,110 @@ pub fn check_incomplete_items(
     incomplete
 }
 
+/// Warning categories this server has read and declared benign, with the
+/// reason it is willing to say so. Empty on purpose: silence about a category
+/// nobody has looked at would be this server deciding a warning is harmless
+/// without saying so. A row leaves the aggregate below and goes nowhere else.
+pub const AST_WARNING_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// The code and reason a category becomes, for the two the front end drops
+/// soundness with. The spellings come from the module that reads them off the
+/// log, so the classifier and the zero rows cannot disagree about what a
+/// category is called.
+fn ast_soundness_reason(category: &str) -> Option<(&'static str, &'static str)> {
+    match category {
+        project::ASM_CLOBBER => Some((
+            incomplete_code::AST_ASM_CLOBBER,
+            "Frama-C assumed inline assembly has no effects beyond its operands, so the analyzed statement is weaker than the compiled one.",
+        )),
+        project::ATTRS_UNKNOWN => Some((
+            incomplete_code::AST_UNKNOWN_ATTRIBUTE,
+            "Frama-C ignored an unknown attribute, so the analyzed declaration differs from the source.",
+        )),
+        _ => None,
+    }
+}
+
+/// What the parse of the loaded files cost, read off the reload payload.
+///
+/// The two soundness classes get a code each; everything else that nobody has
+/// classified or allowlisted shares one aggregate entry, because a payload
+/// carrying one entry per category is unbounded in the size of the program.
+///
+/// The allowlist is a parameter rather than a read of the const below, so a
+/// test can prove that a row removes its category from the aggregate and
+/// changes nothing else. A guard over an empty const proves neither.
+pub fn ast_diagnostic_gaps(
+    incomplete: &mut Vec<serde_json::Value>,
+    reload: &serde_json::Value,
+    allowlist: &[(&str, &str)],
+) {
+    let diagnostics = &reload["ast_reload_health"]["parse_diagnostics"];
+
+    // No completeness flag on any of this, and that is a property of how the
+    // record is produced rather than an omission. It is always a process's boot
+    // parse, because ensure_main_spawned respawns rather than hand back a
+    // reparse, and a boot parse can neither miss a warn-once category nor pick
+    // up a concurrent call's output. So a zero here is evidence of absence,
+    // which is what lets the zero-count branch below skip a category instead of
+    // having to hedge it, and it is what keeps two checks of one session
+    // reporting the same codes: an entry that appeared only on the second would
+    // move proof_receipt.sha256, since the receipt digests incomplete.
+    // A record that says why it is empty is a finding rather than silence.
+    // Reading it as a clean parse would let check answer "proved" on the one
+    // shape where nothing established that the analyzed program is the
+    // compiled one, which is the claim these codes exist to make.
+    if let Some(reason) = diagnostics["unavailable"].as_str() {
+        incomplete.push(json!({
+            "code": incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE,
+            "reason": "This server has no record of what Frama-C's front end dropped while parsing, so nothing here says the analyzed program is the compiled one.",
+            "detail": reason,
+        }));
+        return;
+    }
+
+    let Some(categories) = diagnostics["categories"].as_object() else {
+        return;
+    };
+
+    let mut unclassified = serde_json::Map::new();
+    for (category, record) in categories {
+        if record["count"].as_u64().unwrap_or(0) == 0 {
+            continue;
+        }
+        if let Some((code, reason)) = ast_soundness_reason(category) {
+            incomplete.push(json!({
+                "code": code,
+                "reason": reason,
+                "category": category,
+                "count": record["count"],
+                "count_unit": record["count_unit"],
+                "locations": record["locations"],
+                "locations_omitted": record["locations_omitted"],
+            }));
+            continue;
+        }
+        // A classified category left the loop above, so the only thing that
+        // keeps one out of the aggregate here is a row saying why its silence
+        // is deliberate.
+        if !allowlist.iter().any(|(allowed, _)| allowed == category) {
+            // The whole record, not the bare count. One entry is what keeps the
+            // payload bounded in the number of categories; dropping the unit
+            // and the capped sample inside it would leave a caller a number it
+            // cannot interpret and a warning it cannot find, and buys nothing,
+            // since each sample is already capped.
+            unclassified.insert(category.clone(), record.clone());
+        }
+    }
+
+    if !unclassified.is_empty() {
+        incomplete.push(json!({
+            "code": incomplete_code::AST_UNCLASSIFIED_WARNING,
+            "reason": "Frama-C emitted parse warnings in categories this server has not classified, so their effect on the analyzed program is unknown.",
+            "categories": unclassified,
+        }));
+    }
+}
 
 /// How Frama-C prints the goal name for each PKEnsures clause. All five are
 /// assumed at a call site, so all five belong to the same finding;

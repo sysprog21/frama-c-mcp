@@ -95,6 +95,139 @@ fn undischarged_rte_alarm_makes_check_incomplete() {
     assert_eq!(flagged, vec![&json!("#p4"), &json!("#p5")]);
 }
 
+fn reload_with_categories(categories: serde_json::Value) -> serde_json::Value {
+    json!({"ast_reload_health": {"parse_diagnostics": {"categories": categories}}})
+}
+
+fn ast_gaps(reload: &serde_json::Value) -> Vec<serde_json::Value> {
+    check_incomplete_items(
+        Some(true),
+        reload,
+        &json!({"ok": true}),
+        &json!([]),
+        &json!({"ok": true}),
+        &json!([]),
+        WantedAnalyses::BOTH,
+    )
+    .into_iter()
+    .filter(|item| {
+        item["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("AST_"))
+    })
+    .collect()
+}
+
+fn record(count: u64, unit: &str) -> serde_json::Value {
+    json!({"count": count, "count_unit": unit, "locations": [], "locations_omitted": 0})
+}
+
+/// Each soundness class is its own code, and everything nobody classified
+/// shares one entry: a payload with an entry per category grows with the
+/// program rather than with the finding.
+#[test]
+fn ast_parse_losses_make_check_incomplete() {
+    let reload = reload_with_categories(
+        json!({
+            "kernel:asm:clobber": record(2, "sites"),
+            "kernel:attrs:unknown": record(1, "distinct_attribute_names"),
+            "kernel:typing:implicit-function-declaration": record(1, "sites"),
+            "kernel:annot:unknown": record(3, "sites"),
+        }),
+    );
+    let items = ast_gaps(&reload);
+    let codes: Vec<_> = items.iter().filter_map(|item| item["code"].as_str()).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "AST_ASM_CLOBBER",
+            "AST_UNKNOWN_ATTRIBUTE",
+            "AST_UNCLASSIFIED_WARNING"
+        ],
+        "{items:?}"
+    );
+
+    let aggregate = items.last().unwrap();
+
+    // Each category keeps its whole record, so the one entry is still enough to
+    // read the number and reach the site.
+    assert_eq!(
+        aggregate["categories"],
+        json!({
+            "kernel:annot:unknown": record(3, "sites"),
+            "kernel:typing:implicit-function-declaration": record(1, "sites"),
+        })
+    );
+    assert_eq!(items[0]["count"], 2);
+    assert_eq!(items[1]["count_unit"], "distinct_attribute_names");
+}
+
+/// A category with a zero count is not a finding, so a clean parse carries no
+/// AST code at all.
+#[test]
+fn a_clean_parse_carries_no_ast_code() {
+    let reload = reload_with_categories(
+        json!({
+            "kernel:asm:clobber": record(0, "sites"),
+            "kernel:attrs:unknown": record(0, "distinct_attribute_names"),
+        }),
+    );
+    assert!(ast_gaps(&reload).is_empty());
+}
+
+/// No entry carries a completeness flag, because there is nothing for one to
+/// say: the record is always a boot parse, ensure_main_spawned having
+/// respawned rather than hand back a reparse.
+///
+/// The property that buys is that two checks of one session report the same
+/// codes. An entry that appeared only on the second would move
+/// proof_receipt.sha256, since the receipt digests incomplete, and two runs of
+/// the same thing would stop matching.
+#[test]
+fn ast_codes_do_not_depend_on_when_the_caller_asked() {
+    let categories = json!({
+        "kernel:asm:clobber": record(2, "sites"),
+        "kernel:typing:implicit-function-declaration": record(1, "sites"),
+    });
+    let items = ast_gaps(&reload_with_categories(categories));
+    assert_eq!(items.len(), 2, "{items:?}");
+    for item in &items {
+        assert!(item["counts_are_complete"].is_null(), "{item:?}");
+    }
+
+    // A zero is evidence of absence rather than a category that may have been
+    // suppressed, which is what lets it be silent.
+    let quiet = ast_gaps(&reload_with_categories(json!({
+        "kernel:attrs:unknown": record(0, "distinct_attribute_names"),
+    })));
+    assert!(quiet.is_empty(), "{quiet:?}");
+}
+
+/// The categories 22.1.2 named are not candidates for the aggregate; every
+/// other warning category, including compilation-database ambiguity, is.
+#[test]
+fn compilation_database_warnings_reach_the_unclassified_aggregate() {
+    let reload = reload_with_categories(
+        json!({
+            "kernel:asm:clobber": record(2, "sites"),
+            "kernel:attrs:unknown": record(2, "distinct_attribute_names"),
+            "kernel:pp:compilation-db": record(1, "sites"),
+        }),
+    );
+    let items = ast_gaps(&reload);
+    assert_eq!(
+        items.last().unwrap()["categories"],
+        json!({"kernel:pp:compilation-db": record(1, "sites")})
+    );
+}
+
+/// A missing or malformed parse record is silence, not a finding. An older
+/// reload payload has no parse_diagnostics key at all.
+#[test]
+fn a_reload_without_parse_diagnostics_carries_no_ast_code() {
+    assert!(ast_gaps(&json!({"ast_reload_health": {"checked": true}})).is_empty());
+}
+
 /// An abort is a gap only when it cost a goal its verdict.
 ///
 /// The anomaly text below is verbatim from Frama-C 33 on

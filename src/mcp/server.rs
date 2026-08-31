@@ -29,7 +29,8 @@ pub use crate::mcp::store::*;
 pub use crate::mcp::wpout::*;
 use crate::mcp::types::*;
 use crate::state::{
-    FunctionVerificationState, MarkerLocation, SandboxMetadata, SessionState, StaleMarker,
+    sha256_hex, sha256_hex_of_reader, FunctionVerificationState, MarkerLocation, SandboxMetadata,
+    SessionState, StaleMarker,
 };
 
 pub fn proofread_report_from_wp_goals(
@@ -1724,6 +1725,235 @@ pub fn parse_wp_model_support(help: &str) -> WpModelSupport {
     }
 }
 
+/// Identity of a loaded file set: its paths in order, and the bytes behind
+/// them.
+///
+/// The parse record kept on the state below answers for one AST, so it has to
+/// be dropped exactly when that AST changes and kept otherwise. A path list
+/// alone cannot say that, since editing a file in place changes nothing about
+/// the list. Header-bearing sources are deliberately not eligible to reuse
+/// this digest: the header bytes are outside it.
+pub fn loaded_source_digest(files: &[String], machdep: Option<&str>) -> String {
+    loaded_source_state(files, machdep).0
+}
+
+/// One entry of that identity: the name, when it was last written, and a digest
+/// of the bytes behind it.
+///
+/// The timestamp is there because the digest is taken at an instant and the
+/// question is about an interval. A file edited and put back between two reads
+/// hashes the same both times, and the identity would then say "unchanged"
+/// about bytes Frama-C may have parsed in their edited state. Writing it back
+/// moves the modification time, so the round trip shows up as a change even
+/// though the content does not. It is not a proof: a caller that restores the
+/// timestamp too, or that completes the round trip inside one tick of the
+/// filesystem's resolution, is indistinguishable from one that did nothing, and
+/// no content-based identity can see that.
+///
+/// An unreadable name is its own state and has to differ from every digest and
+/// from itself read: what matters is only that it never matches a name that was
+/// read. Returns the bytes when there were any, so a caller can ask something
+/// else of them without opening the file twice.
+fn hash_named_file(input: &mut Vec<u8>, name: &str) -> bool {
+    input.extend_from_slice(name.as_bytes());
+    let read = std::fs::File::open(name).and_then(|file| {
+        let written = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since_epoch| since_epoch.as_nanos());
+
+        // Streamed rather than read whole. Nothing here wants the bytes, only a
+        // digest and one question about them, and a generated translation unit
+        // is as large as its generator felt like making it.
+        let (digest, has_hash) = sha256_hex_of_reader(file)?;
+        Ok((written, digest, has_hash))
+    });
+    match &read {
+        Ok((written, digest, _)) => {
+            input.extend_from_slice(format!("{written:?}").as_bytes());
+            input.extend_from_slice(digest.as_bytes());
+        }
+        Err(error) => input.extend_from_slice(error.to_string().as_bytes()),
+    }
+    input.push(0);
+    read.map(|(_, _, has_hash)| has_hash).unwrap_or(true)
+}
+
+/// That digest and whether any of the sources reaches outside itself, from one
+/// read each.
+///
+/// The two answers are taken together because they are answers about the same
+/// bytes: read twice, the include scan and the digest can describe two
+/// different versions of a file that was edited in between, and the pair would
+/// then say "no headers, and these are the bytes" about a file that had both.
+fn loaded_source_state(files: &[String], machdep: Option<&str>) -> (String, bool) {
+    let mut input = Vec::new();
+    let mut may_include = false;
+    for file in files {
+        may_include |= hash_named_file(&mut input, file);
+    }
+
+    // The machdep is in the identity rather than in a test of its own, because
+    // Frama-C reads a YAML file there as readily as a builtin name and decides
+    // which it is from the contents. A name hashes as the error from failing to
+    // open it, so a builtin costs nothing and stays stable, while a file that
+    // is edited, or that disappears after being loaded, moves the digest and
+    // sends the next reload down the respawn path. It stays out of the include
+    // scan: "#" opens a comment in YAML, and a comment is not a reason to
+    // respawn.
+    if let Some(machdep) = machdep {
+        let _ = hash_named_file(&mut input, machdep);
+    }
+    (sha256_hex(&input), may_include)
+}
+
+/// True when this file set may depend on bytes that loaded_source_digest does
+/// not include.
+///
+/// Any "#" anywhere in the file, in any of its three spellings, not a directive
+/// this server recognized. Every narrower read was wrong in the same direction.
+/// Matching the word "include" needs the line free of comments first, since
+/// "/**/#include" and "#/**/include" are both legal; requiring "#" to open the
+/// line misses the first of those, because a comment may precede the directive
+/// and may have opened on an earlier line; and reading only the character
+/// misses "%:include" and "??=include", which are the same directive written
+/// with a digraph or a trigraph. A lexer for all that buys nothing here: a
+/// directive is the preprocessor deciding something this server has no way to
+/// compare. So a file whose only "#" is in a format string pays a recount it
+/// did not need, which is the cheaper mistake.
+///
+/// The scan is over bytes rather than text, because the question is about ASCII
+/// punctuation and a source Frama-C compiles is not required to be UTF-8.
+/// Decoding it first made a latin-1 comment an unreadable file, which is the
+/// answer for a file that is not there.
+pub fn files_may_include(files: &[String]) -> bool {
+    loaded_source_state(files, None).1
+}
+
+/// Start Frama-C on its own two logs, or leave neither behind.
+///
+/// The logs are removed on every path that leaves without a MainFramaCState to
+/// own them, since nothing else knows their names: both carry the spawn counter
+/// that made them unique. Drop unlinks the pair for a spawn that succeeded.
+fn spawn_frama_c(
+    command_line: &[String],
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+) -> Result<tokio::process::Child, McpError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let create = |path: &Path, which: &str| {
+        std::fs::File::create(path)
+            .map_err(|e| McpError::internal_error(format!("create {which} log: {e}"), None))
+    };
+    let stdout_log = create(stdout_log_path, "stdout")?;
+    let stderr_log = match create(stderr_log_path, "stderr") {
+        Ok(log) => log,
+        Err(error) => {
+            let _ = std::fs::remove_file(stdout_log_path);
+            return Err(error);
+        }
+    };
+
+    let mut cmd = Command::new(&command_line[0]);
+    for arg in &command_line[1..] {
+        cmd.arg(arg);
+    }
+    cmd.stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        // Its own process group, for the same reason the sandbox spawn takes
+        // one: Frama-C starts why3server and the provers as its own children,
+        // and kill_on_drop SIGKILLs only Frama-C itself. Without a group there
+        // is nothing to signal them through, and a server that goes away
+        // without running Drop leaves the whole tree behind. Measured: seven
+        // frama-c processes reparented to launchd, the oldest at eight and a
+        // half hours, each still holding its socket.
+        //
+        // The child is the leader, so the pgid is its pid and nothing extra
+        // needs persisting.
+        .process_group(0)
+        .kill_on_drop(true);
+
+    cmd.spawn().map_err(|error| {
+        let _ = std::fs::remove_file(stdout_log_path);
+        let _ = std::fs::remove_file(stderr_log_path);
+        McpError::internal_error(format!("spawn frama-c: {error}"), None)
+    })
+}
+
+/// Where this process's boot parse ends in its log, and the record to answer
+/// with instead when there is no boot parse to read.
+///
+/// Some means no record: a boundary this server could not read is not a boot
+/// parse of length zero, and neither is a log with nothing in it yet. Parsing
+/// an empty window answers every category at zero, which a caller reads as "the
+/// front end dropped nothing". Frama-C narrates the parse it just did, so an
+/// empty file here is its output not having landed rather than a quiet run, and
+/// this server does not spawn it with -quiet.
+///
+/// The identity is the third way to have no record. Booted_on was read before
+/// the spawn, so a write that landed while Frama-C was starting built an AST
+/// those bytes do not name; parsed is the same identity read again afterwards,
+/// and the two differing is what says that happened.
+fn boot_parse_window(
+    stdout_log_path: &Path,
+    parsed: &str,
+    booted_on: &str,
+) -> (u64, Option<serde_json::Value>) {
+    let end = std::fs::metadata(stdout_log_path).map(|metadata| metadata.len());
+    let missing = match &end {
+        // Worded apart from the runtime failure in reload_project deliberately.
+        // Both are an unreadable log, and how long the code lasts depends on
+        // which one it was: this one cannot be retried and takes the process
+        // with it, that one is retried on the next call. The detail is what a
+        // reader has to tell them apart by, so the two cannot share a sentence.
+        Err(error) => Some(format!(
+            "cannot measure the boot parse in the Frama-C stdout log at {}: {error}",
+            stdout_log_path.display()
+        )),
+        Ok(0) => Some(
+            "Frama-C had written nothing to its log when the socket appeared, so this server \
+             never saw the boot parse"
+                .to_string(),
+        ),
+        Ok(_) => (parsed != booted_on).then(|| {
+            "the sources changed while Frama-C was starting, so no boot parse describes them"
+                .to_string()
+        }),
+    };
+    (end.unwrap_or(0), missing.map(project::parse_log_unavailable))
+}
+
+/// Whether the parse record on this state still answers for the file set the
+/// caller is asking to load.
+///
+/// It does when the bytes behind the named paths are the ones the boot parse
+/// read, and nothing outside those bytes reached the preprocessor. A file set
+/// that fails either test does not get a reparse and a hedged record; it gets
+/// a new process, whose own boot parse is complete.
+fn parse_record_survives(state: &MainFramaCState, identity: &(String, bool)) -> bool {
+    let (digest, may_include) = identity;
+    !state.project_options.names_bytes_outside_the_file_set()
+        && !may_include
+        && *digest == state.ast_parse_source_digest
+}
+
+/// loaded_source_state on a blocking thread.
+///
+/// Every reload asks this, and it opens and hashes each source, so on the
+/// executor it is a stall proportional to the project rather than to the call.
+/// A join failure answers as a file set that reaches outside itself, under an
+/// empty digest that matches nothing: both send the caller to a new process,
+/// which is the answer that needs no record to be true.
+async fn source_identity(files: Vec<String>, machdep: Option<String>) -> (String, bool) {
+    tokio::task::spawn_blocking(move || loaded_source_state(&files, machdep.as_deref()))
+        .await
+        .unwrap_or_else(|_| (String::new(), true))
+}
+
 /// Main Frama-C process state. None at server startup; the first
 /// reload_project spawns Frama-C, connects the client, and fills this field.
 ///
@@ -1745,6 +1975,18 @@ pub struct MainFramaCState {
     pub command_line: Vec<String>,
     pub stdout_log_path: PathBuf,
     pub stderr_log_path: PathBuf,
+    /// Length of stdout at the moment this process finished booting, which is
+    /// where its parse diagnostics end. The range always starts at zero: the
+    /// boot parse is the only one this server reads, because it is the only
+    /// complete one, and ensure_main_spawned respawns rather than reparse.
+    pub ast_parse_log_end: u64,
+    /// What loaded_source_digest returned for the file set the boot parse
+    /// read. A later reload matching it can stay in this process.
+    pub ast_parse_source_digest: String,
+    /// Parsed once and kept for the life of the process, since the bytes it
+    /// was read from never change and nothing else appends to that range.
+    pub ast_reload_diagnostics: Option<serde_json::Value>,
+    pub working_dir: PathBuf,
     pub startup_stderr_tail: String,
     /// The WP memory model this process last ran proofs under, if any.
     ///
@@ -1782,18 +2024,27 @@ pub struct MainFramaCState {
 }
 
 impl Drop for MainFramaCState {
-    /// Unlink the socket this spawn's Frama-C was listening on.
+    /// Unlink what this spawn owned: the socket its Frama-C listened on, and
+    /// the two logs it wrote.
     ///
-    /// `kill_on_drop` takes the process down but leaves the path behind, and
-    /// nothing else removed it, so a machine running this suite accumulated
-    /// 1,249 stale `.sock` files in `/tmp`.
+    /// `kill_on_drop` takes the process down but leaves the paths behind, and
+    /// nothing else removed them, so a machine running this suite accumulated
+    /// 1,249 stale `.sock` files in `/tmp`. The logs are named per spawn for
+    /// the same reason the socket is, and a session that reloads a changing
+    /// file set now respawns every time, so they accumulate at the same rate.
+    /// Nothing outside this state reads them: the startup tail is copied into
+    /// the state at spawn, and the parse record is read while the process is
+    /// still live.
     ///
     /// This body runs before the fields drop, so the unlink lands while
     /// Frama-C is still alive and `kill_on_drop` SIGKILLs it a moment later.
-    /// That is harmless: unlink removes the name, not the listening socket, and
-    /// paths are unique per spawn, so nothing will ask for that name again.
+    /// That is harmless: unlink removes the name and not the open file or the
+    /// listening socket, and every path here is unique per spawn, so nothing
+    /// will ask for one of these names again.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.stdout_log_path);
+        let _ = std::fs::remove_file(&self.stderr_log_path);
     }
 }
 
@@ -1804,6 +2055,25 @@ pub struct ProjectLoadOptions {
     pub force_includes: Vec<String>,
     pub machdep: Option<String>,
     pub compilation_database: Option<String>,
+}
+
+impl ProjectLoadOptions {
+    /// Whether these options pull in bytes that loaded_source_state never
+    /// reads, which is what makes a parse record unusable for a later call.
+    ///
+    /// Beside the struct rather than beside the one predicate that asks,
+    /// because the answer is a property of the fields: a sixth option naming a
+    /// path is a decision to take here, and taking it anywhere else means the
+    /// author of that field never sees the question.
+    ///
+    /// include_paths and defines are not in it. They reach the preprocessor,
+    /// but only a source with a directive can act on them, and such a source is
+    /// already refused. Nor is machdep: it names bytes, but loaded_source_state
+    /// hashes them, so the identity answers for it rather than this predicate
+    /// refusing every project that sets one.
+    fn names_bytes_outside_the_file_set(&self) -> bool {
+        !self.force_includes.is_empty() || self.compilation_database.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -3034,13 +3304,18 @@ impl FramaCMcpServer {
         new_rte: bool,
         new_project_options: ProjectLoadOptions,
     ) -> Result<(), McpError> {
-        use std::process::Stdio;
-        use tokio::process::Command;
-
         // Held to the end, so the respawn decision and the assignment that acts
         // on it cannot be split by another caller. The two state locks below
         // are dropped across the spawn and cannot do this themselves.
         let _spawning = self.main_spawn_lock.lock().await;
+
+        // Before the locks, because it reads files: the answer depends on the
+        // caller's arguments and on the disk, never on the state, and taking it
+        // here keeps blocking work out of the section that holds three locks.
+        // One read serves both callers below, the reuse decision and the digest
+        // stamped on a new process.
+        let identity =
+            source_identity(new_files.clone(), new_project_options.machdep.clone()).await;
 
         let main_lock = self.main_frama_c_state.lock().await;
         let client_lock = self.client.lock().await;
@@ -3048,13 +3323,24 @@ impl FramaCMcpServer {
         let needs_respawn = match main_lock.as_ref() {
             None => true,
             Some(s) => {
-                // The last disjunct is the transport's own flag: a write that
+                // The third disjunct is the transport's own flag: a write that
                 // died part-way poisons the stream without touching any of the
                 // session fields above.
+                //
+                // The last one is the parse record. Only a process's boot parse
+                // is a complete account of what the front end dropped: a
+                // reparse cannot re-emit a warn-once category, and the log it
+                // writes into is process-wide, so a concurrent call can put its
+                // own warnings in the same window. Rather than report a record
+                // hedged on both counts, a file set this server cannot prove
+                // unchanged gets a new process. Reload rebuilds the AST from
+                // source either way, so this costs process lifetime rather than
+                // anything the caller had.
                 s.poisoned
                     || s.with_rte != new_rte
                     || s.project_options != new_project_options
                     || client_lock.as_ref().is_some_and(|c| c.is_poisoned())
+                    || !parse_record_survives(s, &identity)
             }
         };
 
@@ -3064,8 +3350,32 @@ impl FramaCMcpServer {
             drop(main_lock);
             match reload_files_in_place(&client, &new_files).await {
                 Ok(()) => {
+                    // parse_record_survives read those bytes before the
+                    // reparse, so a write that landed in between built an AST
+                    // the boot-parse record does not describe. Reading them
+                    // again is what closes that window: unchanged and the record
+                    // still answers for what Frama-C is holding, changed and it
+                    // answers for nothing, so it is replaced by the absence
+                    // rather than left to be read as a parse that dropped what
+                    // the previous bytes dropped. The process is poisoned with
+                    // it, since the next call cannot recover a record for an AST
+                    // whose boot parse never happened; only a new process can.
+                    //
+                    // Before the lock, like the read that started this call.
+                    let reparsed =
+                        source_identity(new_files.clone(), new_project_options.machdep.clone())
+                            .await;
+
                     let mut main_lock = self.main_frama_c_state.lock().await;
                     if let Some(s) = main_lock.as_mut() {
+                        if reparsed.0 != s.ast_parse_source_digest {
+                            s.ast_reload_diagnostics = Some(project::parse_log_unavailable(
+                                "the sources changed while Frama-C was rebuilding the AST, so no \
+                                 parse record describes it"
+                                    .to_string(),
+                            ));
+                            s.poisoned = true;
+                        }
                         s.files = new_files;
                     }
                     self.state.write().await.project_loaded = true;
@@ -3099,12 +3409,13 @@ impl FramaCMcpServer {
         // whenever rte or the project options change, and reusing the name let
         // the new Frama-C bind a path the dying one had not released yet. The
         // counter also gives `MainFramaCState::drop` a path no live process
-        // wants.
+        // wants, and keeps the handover's two stdout writers separate.
         static SPAWN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let spawn_id = SPAWN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let socket_path = PathBuf::from(format!(
             "/tmp/frama-c-mcp-{}-{}.sock",
             std::process::id(),
-            SPAWN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            spawn_id
         ));
 
         // Unique per spawn, so this only matters when a pid is reused and the
@@ -3122,13 +3433,18 @@ impl FramaCMcpServer {
             .map(|root| root.join("logs"))
             .and_then(|dir| std::fs::create_dir_all(&dir).map(|()| dir))
             .map_err(|e| McpError::internal_error(format!("create log directory: {e}"), None))?;
-        let log_basename = format!("main-{}", std::process::id());
+        let log_basename = format!("main-{}-{}", std::process::id(), spawn_id);
         let stdout_log_path = log_dir.join(format!("{}.stdout.log", log_basename));
-        let stdout_log = std::fs::File::create(&stdout_log_path)
-            .map_err(|e| McpError::internal_error(format!("create stdout log: {}", e), None))?;
         let stderr_log_path = log_dir.join(format!("{}.stderr.log", log_basename));
-        let stderr_log = std::fs::File::create(&stderr_log_path)
-            .map_err(|e| McpError::internal_error(format!("create stderr log: {}", e), None))?;
+
+        // The identity taken above, which was read before this spawn. Either
+        // way an edit landing between the read and the parse makes the digest
+        // and the AST disagree, but only this order errs safely: the record is
+        // stamped with the bytes as they were no later than the parse read
+        // them, so a reload of the edited file computes a different digest and
+        // respawns. Reading it afterwards stamps the new bytes onto the old
+        // parse, and that reload reuses a record for an AST nobody built.
+        let ast_parse_source_digest = identity.0.clone();
 
         let command_line = self.main_frama_c_command_line(
             &new_files,
@@ -3136,28 +3452,7 @@ impl FramaCMcpServer {
             &new_project_options,
             &socket_path,
         );
-        let mut cmd = Command::new(&command_line[0]);
-        for arg in &command_line[1..] {
-            cmd.arg(arg);
-        }
-        cmd.stdout(Stdio::from(stdout_log))
-            .stderr(Stdio::from(stderr_log))
-
-            // Its own process group, for the same reason the sandbox spawn
-            // takes one: Frama-C starts why3server and the provers as its own
-            // children, and kill_on_drop SIGKILLs only Frama-C itself. Without
-            // a group there is nothing to signal them through, and a server
-            // that goes away without running Drop leaves the whole tree behind.
-            // Measured: seven frama-c processes reparented to launchd, the
-            // oldest at eight and a half hours, each still holding its socket.
-            //
-            // The child is the leader, so the pgid is its pid and nothing extra
-            // needs persisting.
-            .process_group(0)
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn()
-            .map_err(|e| McpError::internal_error(format!("spawn frama-c: {}", e), None))?;
+        let mut child = spawn_frama_c(&command_line, &stdout_log_path, &stderr_log_path)?;
         let pid = child.id().unwrap_or_default();
 
         // Waiting for the socket and connecting are one step: the file exists
@@ -3174,7 +3469,11 @@ impl FramaCMcpServer {
             Err(reason) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                // After the tail is read, which is the last thing that wants
+                // them.
                 let tail = startup_failure_tail(&stdout_log_path, &stderr_log_path, 20);
+                let _ = std::fs::remove_file(&stdout_log_path);
+                let _ = std::fs::remove_file(&stderr_log_path);
                 let message = format!("connect to new frama-c: {reason}\noutput:\n{tail}");
 
                 // A spawn that died in the preprocessor names the header it
@@ -3198,9 +3497,28 @@ impl FramaCMcpServer {
         // found the why3server gone. What kill_on_drop cannot promise is the
         // rest of the tree when a prover is mid-proof, since it signals one pid
         // and never the group, so the respawn goes through the path that does.
+        // The whole file at this point is the boot parse: Frama-C parses the
+        // files named on its command line before it creates the socket, and
+        // connect_when_listening returned only once that socket existed.
+        //
+        // Read again now that the parse is over, and before the locks like the
+        // read that started this call: this is the only reader that wants the
+        // state of the sources after Frama-C looked at them rather than before.
+        let parsed =
+            source_identity(new_files.clone(), new_project_options.machdep.clone()).await;
+        let (ast_parse_log_end, ast_reload_diagnostics) =
+            boot_parse_window(&stdout_log_path, &parsed.0, &ast_parse_source_digest);
+
         let mut main_lock = self.main_frama_c_state.lock().await;
         let mut client_lock = self.client.lock().await;
         let replaced = main_lock.take();
+
+        // A spawn with no record cannot grow one: the boundary it would need
+        // was a property of an instant that has passed, and reading the log
+        // later would take in whatever ran after the parse. So the absence is
+        // cached rather than retried, and the process is marked for
+        // replacement, which is the one thing that does produce a boot record.
+        let poisoned = ast_reload_diagnostics.is_some();
         *main_lock = Some(MainFramaCState {
             child,
             socket_path,
@@ -3216,8 +3534,17 @@ impl FramaCMcpServer {
             startup_stderr_tail: startup_failure_tail(&stdout_log_path, &stderr_log_path, 20),
             stdout_log_path,
             stderr_log_path,
+            ast_parse_log_end,
+            ast_parse_source_digest,
+            ast_reload_diagnostics,
+
+            // The child inherits this process's directory, and a location
+            // Frama-C writes relative is relative to that. Captured per spawn
+            // rather than read back later, so a later chdir cannot make an
+            // already-recorded location resolve somewhere else.
+            working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             wp_model_used: None,
-            poisoned: false,
+            poisoned,
         });
         *client_lock = Some(Arc::new(new_client));
         drop(client_lock);

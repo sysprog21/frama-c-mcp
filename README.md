@@ -427,10 +427,67 @@ payload contract and the change rule. The full set:
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
 | `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
+| `AST_ASM_CLOBBER` | Frama-C assumed inline assembly has no effects beyond its operands, so the analyzed statement is weaker than the compiled one |
+| `AST_UNKNOWN_ATTRIBUTE` | Frama-C ignored an unknown attribute, so the analyzed declaration differs from the source |
+| `AST_UNCLASSIFIED_WARNING` | Frama-C emitted parse warnings in categories this server has not classified, so their effect on the analyzed program is unknown |
+| `AST_PARSE_DIAGNOSTICS_UNAVAILABLE` | This server has no record of what the front end dropped, so nothing says the analyzed program is the compiled one |
 
 Treat the set as additive: codes are added as gaps are found, and three were
 added in one day. Branch on the ones you handle and surface the rest rather
 than assuming an unknown code is benign.
+
+The four `AST_*` codes are about the parse and not the verdict: they say the
+program that was analyzed is not the program that would be compiled, or that
+nothing checked. The two soundness codes carry `count`, `count_unit` (clobber
+sites, or distinct attribute names, since Frama-C announces an unknown
+attribute once per name for the life of the process), and a capped `locations`
+sample with `locations_omitted`. `AST_UNCLASSIFIED_WARNING` is a single entry
+for every category nobody has classified, carrying a `categories` object that
+maps each category to that same record; it has no `count` of its own. The same
+numbers are on `reload_project` under `ast_reload_health.parse_diagnostics`.
+
+`AST_PARSE_DIAGNOSTICS_UNAVAILABLE` is the fourth and carries no counts at all,
+only a `detail` naming what went missing. It replaces the other three rather
+than joining them, because a record that could not be taken has nothing to say
+about any category.
+
+How long it lasts depends on which failure it names, and the `detail` is what
+says which. Four of them cost the process. Three are properties of its spawn:
+Frama-C had written nothing to its log when the socket appeared, the boot parse
+could not be measured in it (`cannot measure the boot parse in ...`), or the
+sources moved while Frama-C was starting. The fourth is the same race one
+reload later, when the sources move while Frama-C is rebuilding the AST in
+place. None can be recovered by looking again, since the boundary they would
+need was a property of an instant that has passed, so the server marks that
+Frama-C unusable: the next `reload_project` replaces it whether or not the file
+set changed, and the code goes with it.
+
+The one that does not is the spawn log being unreadable when a later call goes
+to read it (`cannot read the Frama-C stdout log at ...`). That one is neither
+cached nor fatal: the same process answers the code for as long as its log
+stays unreadable, and reports counts again as soon as it does not. The two
+unreadable cases are worded apart on purpose, because that wording is the only
+thing telling a caller which of the two it is holding.
+
+None of them carries a completeness caveat, because there is nothing for one to
+say. The record is always the boot parse of the Frama-C process that answered,
+and a boot parse is complete in both directions: Frama-C suppresses a warn-once
+category for the rest of the process, so no later parse could re-announce one,
+and the log is process-wide, so a call running alongside a later parse would
+write into its window. Nothing can be in flight before the socket exists.
+
+Keeping that true costs a respawn. `reload_project` reuses the running Frama-C
+only when the file set is byte-identical to the one that process booted on and
+carries no preprocessor directive; anything else, including a source with an
+`#include`, gets a new process. Reload rebuilds the AST from source either way,
+so what this costs is process lifetime rather than anything you were holding.
+The payoff is that a zero means the front end dropped nothing, that two checks
+in one session report the same codes, and that `proof_receipt.sha256` therefore
+does not move between them.
+
+When the spawn log cannot be read at all, `parse_diagnostics` carries an
+`unavailable` string and no categories, rather than the zeros that would read
+as "nothing was dropped".
 
 `check` also returns `messages[]`, Frama-C's own errors and warnings from the
 run, each with its plugin and source location. A generated `assigns` for an

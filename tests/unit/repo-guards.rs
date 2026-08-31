@@ -3,7 +3,9 @@ use serde_json::json;
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::strip_generated_label;
-use frama_c_mcp::mcp::server::analysis::{incomplete_code, CHECK_SCHEMA};
+use frama_c_mcp::mcp::server::analysis::{
+    ast_diagnostic_gaps, incomplete_code, AST_WARNING_ALLOWLIST, CHECK_SCHEMA,
+};
 use frama_c_mcp::mcp::server::selfcheck;
 
 /// The check payload's frozen vocabulary, in the three places it is written.
@@ -73,6 +75,55 @@ fn incomplete_codes_match_their_documentation() {
         architecture.contains(&format!("| `{CHECK_SCHEMA}` |")),
         "docs/architecture.md has no compatibility-history row for {CHECK_SCHEMA}"
     );
+}
+
+/// A category leaves the unclassified aggregate only through the allowlist,
+/// and a row that says nothing is a mute list rather than an allowlist: this
+/// server would be calling a warning benign without saying why.
+#[test]
+fn ast_warning_allowlist_entries_explain_their_silence() {
+    assert!(
+        AST_WARNING_ALLOWLIST
+            .iter()
+            .all(|(category, reason)| !category.trim().is_empty() && !reason.trim().is_empty()),
+        "{AST_WARNING_ALLOWLIST:?}"
+    );
+
+    // What a row does, proved against a stub rather than against the empty
+    // const above, which would pass either way.
+    let reload = json!({"ast_reload_health": {"parse_diagnostics": {
+        "categories": {
+            "kernel:asm:clobber": {"count": 1, "count_unit": "sites"},
+            "kernel:annot:unknown": {"count": 3, "count_unit": "sites"},
+            "kernel:typing:implicit-function-declaration": {"count": 1, "count_unit": "sites"},
+        },
+    }}});
+
+    let mut silent = Vec::new();
+    ast_diagnostic_gaps(&mut silent, &reload, &[("kernel:annot:unknown", "why")]);
+    let aggregate = silent
+        .iter()
+        .find(|item| item["code"] == incomplete_code::AST_UNCLASSIFIED_WARNING)
+        .expect("the unallowlisted category still reports");
+    assert_eq!(
+        aggregate["categories"],
+        json!({"kernel:typing:implicit-function-declaration":
+            {"count": 1, "count_unit": "sites"}})
+    );
+
+    // And nowhere else: the soundness code beside it is untouched. Found before
+    // it is compared, because two absent entries are also equal and would let a
+    // renamed category pass this as if it had rendered.
+    let mut loud = Vec::new();
+    ast_diagnostic_gaps(&mut loud, &reload, &[]);
+    let clobber = |items: &[serde_json::Value]| {
+        items
+            .iter()
+            .find(|item| item["code"] == incomplete_code::AST_ASM_CLOBBER)
+            .cloned()
+            .expect("kernel:asm:clobber must render as its own code")
+    };
+    assert_eq!(clobber(&silent), clobber(&loud));
 }
 
 /// A generated hash label is stripped from a clause before the receipt keeps
@@ -930,7 +981,9 @@ fn every_published_item_has_a_user() {
             let Some(rest) = line.trim_start().strip_prefix("pub ") else {
                 continue;
             };
-            // "pub async fn" and "pub unsafe fn" carry the keyword a token further in.
+
+            // "pub async fn" and "pub unsafe fn" carry the keyword a token
+            // further in.
             let rest = rest
                 .strip_prefix("async ")
                 .or_else(|| rest.strip_prefix("unsafe "))

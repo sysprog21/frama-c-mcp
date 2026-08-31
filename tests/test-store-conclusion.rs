@@ -144,7 +144,8 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     // prove the branch exists without proving the fixture reaches it, so a
     // fixture that started failing on its hash would still look right here.
     //
-    // wp_summary above says one goal, which is what makes the counts meaningful.
+    // wp_summary above says one goal, which is what makes the counts
+    // meaningful.
     assert_eq!(
         proof_receipt_evidence_error(&hollow, 1).as_deref(),
         Some("proof_receipt has no goals")

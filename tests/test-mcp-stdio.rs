@@ -8391,3 +8391,336 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
     );
     let _ = client.cancel().await;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// What the parse itself cost
+//
+// Frama-C's front end drops things, and until these tests it dropped them
+// silently: the diagnostics are written while Frama-C boots, before log
+// monitoring is enabled, so the first reload_project on a file carrying them
+// answered with an empty message array. The counts below are read off the spawn
+// log instead, which is why they survive that.
+//
+// The numbers are not arbitrary and are pinned against Frama-C 33: a memory
+// clobber repeats once per site, while an unknown attribute is announced once
+// per distinct name for the life of the process. A test asserting a count has
+// to say which of the two it is asserting.
+//
+// Both the counts and the category spellings below are Frama-C's, so a kernel
+// that emits a warning differently fails these rather than degrading. That is
+// the intended direction: this server reads soundness off those exact strings,
+// so a spelling that moved is a finding this server would stop reporting, and a
+// green suite would be the wrong answer. CI measures Frama-C 33.0; the 32.1
+// lane compiles the plug-in and runs nothing. FRAMA_C_MEASURED names the
+// version these expectations were taken under, and a failure below reports it.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The Frama-C the counts and category names in this block were measured
+/// under, quoted in each failure so a version drift reads as one instead of as
+/// a broken parse.
+const FRAMA_C_MEASURED: &str = "Frama-C 33.0";
+
+fn ast_fixture(name: &str) -> String {
+    workspace_path(&format!("tests/fixtures/ast-parse-{name}.c"))
+        .to_str()
+        .expect("fixture path is utf-8")
+        .to_string()
+}
+
+async fn reload_diagnostics(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    files: &[String],
+    rte: bool,
+) -> Value {
+    // Callers pass rte true unless they are after the respawn: check reloads
+    // with rte true, and a mismatch respawns Frama-C. Respawning no longer
+    // changes what the record says, but it does change which process said it,
+    // and a test comparing two of those is not measuring what it reads as.
+    let payload = call_tool_json(client, "reload_project", json!({"files": files, "rte": rte}))
+        .await
+        .unwrap_or_else(|e| panic!("reload_project({files:?}): {e}"));
+    payload["ast_reload_health"]["parse_diagnostics"].clone()
+}
+
+fn category_count(diagnostics: &Value, category: &str) -> u64 {
+    // A missing category is the failure a version drift shows up as, so it says
+    // which Frama-C the name was taken from and what this one reported instead.
+    // Without that the assertion reads as a broken parse.
+    diagnostics["categories"][category]["count"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            panic!(
+                "no count for {category}, which is a {FRAMA_C_MEASURED} category name. \
+                 This Frama-C reported: {diagnostics}"
+            )
+        })
+}
+
+fn ast_incomplete_codes(check: &Value) -> Vec<String> {
+    check["incomplete"]
+        .as_array()
+        .expect("check payload has an incomplete array")
+        .iter()
+        .filter_map(|item| item["code"].as_str())
+        .filter(|code| code.starts_with("AST_"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The first reload after a spawn counts what the boot parse dropped, and a
+/// second reload of the same files answers with the same numbers.
+///
+/// The second half is the point. A reparse inside a live process cannot
+/// re-emit what a warn-once category already spent, so recounting the log
+/// would report two clobbers and no attributes: two different answers about
+/// one AST, the second of them false.
+#[tokio::test]
+async fn a_reload_counts_what_the_parse_dropped_and_keeps_counting_it() {
+    let losses = ast_fixture("losses");
+    let client = spawn_mcp_client("").await;
+
+    let first = reload_diagnostics(&client, std::slice::from_ref(&losses), true).await;
+    assert_eq!(category_count(&first, "kernel:asm:clobber"), 2, "{first}");
+    assert_eq!(category_count(&first, "kernel:attrs:unknown"), 2, "{first}");
+
+    let second = reload_diagnostics(&client, std::slice::from_ref(&losses), true).await;
+    assert_eq!(second, first, "one AST, two answers");
+
+    // The clobber sample names where, and says how many it did not name.
+    let sample = first["categories"]["kernel:asm:clobber"]["locations"]
+        .as_array()
+        .expect("a location sample");
+    assert_eq!(sample.len(), 2, "{first}");
+    assert!(
+        sample[0]["file"]
+            .as_str()
+            .is_some_and(|file| file.ends_with("ast-parse-losses.c")),
+        "{first}"
+    );
+    assert_eq!(first["categories"]["kernel:asm:clobber"]["locations_omitted"], 0);
+    assert_eq!(
+        first["categories"]["kernel:attrs:unknown"]["count_unit"],
+        "distinct_attribute_names"
+    );
+    let _ = client.cancel().await;
+}
+
+/// One attribute name at two sites is one dropped declaration kind, and the
+/// count says so. Frama-C announces it once per name, and the unit reported
+/// beside the count is what makes the number readable.
+#[tokio::test]
+async fn a_repeated_attribute_name_counts_once() {
+    let client = spawn_mcp_client("").await;
+    let diagnostics = reload_diagnostics(&client, &[ast_fixture("repeat-attribute")], true).await;
+    assert_eq!(
+        category_count(&diagnostics, "kernel:attrs:unknown"),
+        1,
+        "{diagnostics}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A clean parse reports zero rather than omitting the category. An absent key
+/// is a caller guessing whether the question was asked.
+#[tokio::test]
+async fn a_clean_parse_reports_zero_rather_than_omitting_the_category() {
+    let client = spawn_mcp_client("").await;
+    let diagnostics = reload_diagnostics(&client, &[ast_fixture("clean")], true).await;
+    assert_eq!(category_count(&diagnostics, "kernel:asm:clobber"), 0);
+    assert_eq!(category_count(&diagnostics, "kernel:attrs:unknown"), 0);
+    let _ = client.cancel().await;
+}
+
+/// The two soundness classes reach the verdict, once each, on every check of
+/// the session rather than only the first.
+#[tokio::test]
+async fn check_names_each_ast_loss_on_every_call_not_only_the_first() {
+    let client = spawn_mcp_client(&ast_fixture("losses")).await;
+    let want = json!({"function": "clobber_one", "want": ["eva"]});
+
+    let first = call_tool_json(&client, "check", want.clone())
+        .await
+        .expect("check on the losses fixture");
+    let codes = ast_incomplete_codes(&first);
+    assert_eq!(
+        codes,
+        vec!["AST_ASM_CLOBBER", "AST_UNKNOWN_ATTRIBUTE"],
+        "{:?}",
+        first["incomplete"]
+    );
+
+    let second = call_tool_json(&client, "check", want)
+        .await
+        .expect("a second check in the same session");
+    assert_eq!(ast_incomplete_codes(&second), codes, "{:?}", second["incomplete"]);
+
+    // No hedge on the count. The record is a boot parse, so nothing was
+    // suppressed and nothing else was writing into its window.
+    let clobber = first["incomplete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "AST_ASM_CLOBBER")
+        .unwrap();
+    assert_eq!(clobber["count"], 2);
+    assert!(clobber["counts_are_complete"].is_null(), "{clobber}");
+    let _ = client.cancel().await;
+}
+
+/// A file with nothing dropped carries neither soundness code.
+#[tokio::test]
+async fn check_carries_no_ast_code_for_a_clean_parse() {
+    let client = spawn_mcp_client(&ast_fixture("clean")).await;
+    let payload = call_tool_json(&client, "check", json!({"function": "clean", "want": ["eva"]}))
+        .await
+        .expect("check on the clean fixture");
+    assert!(
+        ast_incomplete_codes(&payload).is_empty(),
+        "{:?}",
+        payload["incomplete"]
+    );
+    let _ = client.cancel().await;
+}
+
+/// A category nobody classified is still reported, in the aggregate, with its
+/// count. Silence here would be this server deciding a warning is benign
+/// without saying so.
+#[tokio::test]
+async fn an_unclassified_parse_warning_reaches_the_aggregate() {
+    let client = spawn_mcp_client(&ast_fixture("unclassified")).await;
+    let payload = call_tool_json(
+        &client,
+        "check",
+        json!({"function": "implicit_warning", "want": ["eva"]}),
+    )
+    .await
+    .expect("check on the unclassified fixture");
+
+    assert_eq!(
+        ast_incomplete_codes(&payload),
+        vec!["AST_UNCLASSIFIED_WARNING"],
+        "{:?}",
+        payload["incomplete"]
+    );
+    let aggregate = payload["incomplete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "AST_UNCLASSIFIED_WARNING")
+        .unwrap();
+
+    // The whole record, not a bare count: one entry keeps the payload bounded
+    // without costing the caller the unit or the site.
+    let record = &aggregate["categories"]["kernel:typing:implicit-function-declaration"];
+    assert_eq!(record["count"], 1, "{aggregate}");
+    assert_eq!(record["count_unit"], "sites", "{aggregate}");
+    assert!(
+        record["locations"][0]["file"]
+            .as_str()
+            .is_some_and(|file| file.ends_with("ast-parse-unclassified.c")),
+        "{aggregate}"
+    );
+    assert_eq!(record["locations_omitted"], 0, "{aggregate}");
+    let _ = client.cancel().await;
+}
+
+/// Editing a file in place is a new AST even though the path list is
+/// unchanged, and the record follows the bytes rather than the paths.
+///
+/// A path list cannot say that an edit happened, so the digest is over the
+/// bytes; a file set that fails it gets a new process rather than a reparse
+/// whose counts would have to be hedged.
+#[tokio::test]
+async fn an_edit_behind_an_unchanged_path_is_a_new_parse() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("edited.c");
+    std::fs::write(
+        &source,
+        "int one(int x) { __asm__ volatile(\"\" ::: \"memory\"); return x; }\n",
+    )
+    .expect("write fixture");
+    let files = vec![source.to_str().expect("utf-8 path").to_string()];
+
+    let client = spawn_mcp_client("").await;
+    let first = reload_diagnostics(&client, &files, true).await;
+    assert_eq!(category_count(&first, "kernel:asm:clobber"), 1, "{first}");
+
+    std::fs::write(
+        &source,
+        "int one(int x) { __asm__ volatile(\"\" ::: \"memory\"); return x; }\n\
+         int two(int x) { __asm__ volatile(\"\" ::: \"memory\"); return x; }\n",
+    )
+    .expect("rewrite fixture");
+
+    let second = reload_diagnostics(&client, &files, true).await;
+    assert_eq!(category_count(&second, "kernel:asm:clobber"), 2, "{second}");
+    let _ = client.cancel().await;
+}
+
+/// A source that pulls in headers gets a new Frama-C rather than a reparse, so
+/// its counts are the same on every call.
+///
+/// The reparse this replaces could not re-announce a warn-once category, so
+/// the attribute count fell to zero on the second call and the caller was
+/// handed a zero that was evidence of nothing. Reload rebuilds the AST from
+/// source either way, so a respawn costs process lifetime rather than anything
+/// the caller was holding.
+#[tokio::test]
+async fn a_source_with_includes_reports_the_same_counts_on_every_call() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("included.c");
+    std::fs::write(
+        &source,
+        "#include <stddef.h>\n\
+         int one(int x) { __asm__ volatile(\"\" ::: \"memory\"); return x; }\n\
+         int two(void) __attribute__((__unknown_frama_included__));\n",
+    )
+    .expect("write fixture");
+    let files = vec![source.to_str().expect("utf-8 path").to_string()];
+
+    let client = spawn_mcp_client("").await;
+    let first = reload_diagnostics(&client, &files, true).await;
+    assert_eq!(category_count(&first, "kernel:asm:clobber"), 1, "{first}");
+    assert_eq!(category_count(&first, "kernel:attrs:unknown"), 1, "{first}");
+
+    let second = reload_diagnostics(&client, &files, true).await;
+    assert_eq!(second, first, "one AST, two answers: {second}");
+
+    // And the finding reaches the verdict with no hedge on it.
+    let payload = call_tool_json(&client, "check", json!({"function": "one", "want": ["eva"]}))
+        .await
+        .expect("check after the reload");
+    let clobber = payload["incomplete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "AST_ASM_CLOBBER")
+        .expect("the clobber is a finding");
+    assert_eq!(clobber["count"], 1, "{clobber}");
+    assert!(clobber["counts_are_complete"].is_null(), "{clobber}");
+    let _ = client.cancel().await;
+}
+
+/// Changing the load options respawns, and the record follows the new process.
+///
+/// Worth pinning separately because a respawn takes the other branch of
+/// ensure_main_spawned, and that branch writes the record from its own boot
+/// rather than carrying anything forward.
+#[tokio::test]
+async fn a_respawn_reports_the_new_process_parse() {
+    let losses = ast_fixture("losses");
+    let client = spawn_mcp_client("").await;
+
+    let first = reload_diagnostics(&client, std::slice::from_ref(&losses), true).await;
+    assert_eq!(category_count(&first, "kernel:attrs:unknown"), 2, "{first}");
+
+    // Same files, rte off: a respawn rather than an in-place reload.
+    let respawned = reload_diagnostics(&client, std::slice::from_ref(&losses), false).await;
+    assert_eq!(
+        category_count(&respawned, "kernel:attrs:unknown"),
+        2,
+        "a new process has spent no warn-once category: {respawned}"
+    );
+    assert_eq!(category_count(&respawned, "kernel:asm:clobber"), 2, "{respawned}");
+    let _ = client.cancel().await;
+}

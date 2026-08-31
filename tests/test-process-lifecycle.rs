@@ -1862,6 +1862,16 @@ fn self_check_reports_capabilities_over_stdio() {
             .any(|item| item["request"] == request));
     }
 }
+/// Which reloads keep the process and which replace it.
+///
+/// The same file set, unchanged on disk, is reloaded in place: the AST is
+/// rebuilt inside the running Frama-C and the pid does not move. A different
+/// file set is not, and that is the parse record rather than the AST. The
+/// record of what the front end dropped is a boot parse, so it answers for the
+/// files that process was started on and for no others; a reparse could not
+/// re-announce a warn-once category, so reusing the process would leave the
+/// counts describing the previous file set. This test used to assert the
+/// opposite, and it is the only place either half is pinned.
 #[test]
 #[cfg(target_os = "linux")]
 fn in_place_reload_preserves_frama_c_pid() {
@@ -1882,8 +1892,10 @@ fn in_place_reload_preserves_frama_c_pid() {
     eprintln!("[test] first reload frama-c PID = {}", frama_pid_1);
     assert!(process_alive(frama_pid_1));
 
-    let args_b = format!(r#"{{"files":["{}"],"rte":false}}"#, test_c_b.display());
-    let r = mcp.call_tool("reload_project", &args_b);
+    // The same files again, untouched: neither fixture carries a preprocessor
+    // directive, so the bytes behind the paths are the whole input and they are
+    // the ones the boot parse read.
+    let r = mcp.call_tool("reload_project", &args_a);
     assert!(r.get("error").is_none(), "second reload failed: {:?}", r);
 
     // The claim is that the reload happened in place, so wait for the child to
@@ -1899,6 +1911,34 @@ fn in_place_reload_preserves_frama_c_pid() {
         frama_pid_1, frama_pid_2
     );
     assert!(process_alive(frama_pid_1), "frama-c should still be alive");
+
+    // A different file set: a new process, because the record on this one
+    // cannot answer for files it never parsed. Waiting for a pid that differs
+    // rather than for any pid at all, since the old process is killed after the
+    // new one connects and both are children for that moment.
+    let args_b = format!(r#"{{"files":["{}"],"rte":false}}"#, test_c_b.display());
+    let r = mcp.call_tool("reload_project", &args_b);
+    assert!(r.get("error").is_none(), "third reload failed: {:?}", r);
+
+    let frama_pid_3 = wait_until_some(
+        || first_child_pid(mcp_pid).filter(|pid| *pid != frama_pid_2),
+        Duration::from_secs(10),
+    )
+    .expect("a new file set should get its own frama-c");
+    eprintln!("[test] third reload frama-c PID = {}", frama_pid_3);
+    assert!(process_alive(frama_pid_3), "the new frama-c should be alive");
+
+    // Replaced, not joined. Waiting rather than asserting outright: the old
+    // process is killed after the new one connects, so for a moment both are
+    // alive, and a test that read the pid table once would be racing that.
+    assert!(
+        wait_until_some(
+            || (!process_alive(frama_pid_2)).then_some(()),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "the replaced frama-c should be gone, not leaked alongside the new one"
+    );
 }
 
 /// Dropping a client must not orphan the server's Frama-C.
