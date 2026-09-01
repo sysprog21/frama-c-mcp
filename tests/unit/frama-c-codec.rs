@@ -40,6 +40,36 @@ fn decode_frame_invalid_prefix() {
     assert!(result.is_err());
 }
 
+/// An oversized declared length is refused before anything is buffered.
+///
+/// A W frame carries 15 hex digits, so the wire format allows almost 2^60
+/// bytes, and recv_frame reads until the declared payload arrives. Without this
+/// the loop had no exit: a wedged or corrupt server grew the read buffer with
+/// no diagnostic, which a caller sees as a hang rather than a protocol error.
+/// The check has to be on the header, since by the time the payload is short
+/// the process has already allocated for it.
+#[test]
+fn decode_frame_refuses_a_length_it_will_never_honour() {
+    // One byte over the cap, declared in a well-formed W header, with no
+    // payload behind it at all: the refusal must come off the header.
+    let header = format!("W{:015x}", MAX_FRAME_PAYLOAD_BYTES + 1);
+    let error = decode_frame(header.as_bytes())
+        .expect_err("a length over the cap is a protocol error, not a short read");
+    let text = error.to_string();
+    assert!(
+        text.contains("over the") && text.contains(&MAX_FRAME_PAYLOAD_BYTES.to_string()),
+        "the error has to name the limit it enforced: {text}"
+    );
+
+    // And the cap is not so tight that a large legitimate frame trips it. A
+    // whole-AST printDeclaration runs to tens of megabytes.
+    let ok = format!("W{:015x}", 64 * 1024 * 1024);
+    assert!(
+        decode_frame(ok.as_bytes()).unwrap().is_none(),
+        "a 64 MB frame is a short read waiting for its payload, not an error"
+    );
+}
+
 // encode_command
 
 #[test]

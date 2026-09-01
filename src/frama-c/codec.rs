@@ -45,6 +45,22 @@ pub fn encode_frame(payload: &str) -> Vec<u8> {
     buf
 }
 
+/// The largest frame this client will accept from the server.
+///
+/// A W frame declares its length in 15 hex digits, so the wire format allows
+/// almost 2^60 bytes, and recv_frame keeps reading until the declared payload
+/// arrives. Nothing bounded that: a Frama-C that wedged mid-frame, or wrote a
+/// corrupt header, grew this process's read buffer without limit and with no
+/// diagnostic, which reads as a hang rather than as the protocol error it is.
+///
+/// 256 MB rather than something tighter, because a legitimate frame here can
+/// be large: fetchFunctions over a whole kernel tree and printDeclaration on a
+/// big AST both run to tens of megabytes, and a cap that clips a real payload
+/// would be a worse bug than the one it prevents. Every other output path in
+/// this tree is capped too, at 256 KB for the e-acsl and why3 readers, which
+/// are reading tool output rather than the AST.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+
 /// Try to decode one complete frame from a byte buffer.
 ///
 /// Returns `Ok(Some((payload, consumed)))` on success,
@@ -78,6 +94,16 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(String, usize)>, FramaCError> 
     let payload_len = usize::from_str_radix(hex_str, 16).map_err(|e| {
         FramaCError::InvalidFrame(format!("invalid hex in frame header '{hex_str}': {e}"))
     })?;
+
+    // Refused here rather than after buffering, which is the whole point: the
+    // caller reads until the declared length arrives, so a length it will never
+    // honour has to be an error before the first read and not after the last.
+    if payload_len > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(FramaCError::InvalidFrame(format!(
+            "frame declares {payload_len} bytes, over the {MAX_FRAME_PAYLOAD_BYTES} \
+             byte limit; the server is out of sync or the header is corrupt"
+        )));
+    }
 
     let total = header_len + payload_len;
     if buf.len() < total {
