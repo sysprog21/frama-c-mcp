@@ -9041,14 +9041,38 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
          per-goal figure before reading a ceiling failure as added text."
     );
 
+    // Two-sided on purpose, and the lower bound is the part that matters.
+    //
+    // A one-sided ceiling goes slack on its own. This one was set at 2600
+    // against a measured 2340, sized so the 641-bytes-per-goal round that
+    // caused all this would fail it. Then next_action and suggested_next_tool
+    // stopped being sent twice, the figure fell to 1654, and the ceiling did
+    // not follow: 1654 plus that same 641 is 2295, under 2600, so the gate
+    // quietly stopped catching the regression it exists for. Nothing was wrong
+    // with the payload; the gate had drifted away from it.
+    //
+    // So the baseline is recorded and the payload has to stay near it in both
+    // directions. TOLERANCE is under the regression size, which is what makes
+    // the upper bound bite. A legitimate shrink trips the lower bound, and the
+    // fix is to update BASELINE, which drags the ceiling down with it. That is
+    // the step that did not happen last time.
+    const BASELINE: usize = 1654;
+    const TOLERANCE: usize = 400;
     let per_goal = actual / classified.len();
     assert!(
-        per_goal < 2600,
-        "a classified goal costs {per_goal} bytes, over the 2600 this test \
-         records. Something added text to failure_classification: either hoist \
-         it into the advice block, which is sent once per category, or raise \
-         this ceiling deliberately and say in the commit message what a caller \
-         gets for the extra bytes."
+        per_goal < BASELINE + TOLERANCE,
+        "a classified goal costs {per_goal} bytes against a recorded {BASELINE}. \
+         Something added text to failure_classification: either hoist it into \
+         the advice block, which is sent once per category, or raise BASELINE \
+         deliberately and say in the commit message what a caller gets for the \
+         extra bytes."
+    );
+    assert!(
+        per_goal + TOLERANCE > BASELINE,
+        "a classified goal costs {per_goal} bytes against a recorded {BASELINE}, \
+         so the payload shrank and this gate is now looser than it reads. That \
+         is good news and an edit: set BASELINE to {per_goal} so the ceiling \
+         follows it down and keeps catching an addition of {TOLERANCE} bytes."
     );
 
     let _ = client.cancel().await;
