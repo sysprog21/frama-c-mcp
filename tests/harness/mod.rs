@@ -68,7 +68,13 @@ pub fn test_state_dir() -> PathBuf {
 /// character becomes an underscore.
 fn path_segment(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
