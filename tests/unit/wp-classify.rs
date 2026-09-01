@@ -267,14 +267,14 @@ fn splitting_a_classification_keeps_the_goal_half_small() {
         "the E-ACSL advice is identical everywhere and belongs in the shared half"
     );
     assert!(
-        per_goal["suggested_next_tool"]
+        per_goal["next_action"]
             .get("runtime_check_suggestion")
             .is_none(),
         "and its copy nested inside next_action goes with it"
     );
 
     // What the stdio suite reads per goal stays per goal.
-    assert!(per_goal["suggested_next_tool"]["tool"].as_str().is_some());
+    assert!(per_goal["next_action"]["tool"].as_str().is_some());
     assert!(
         per_goal["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
             .as_bool()
@@ -283,7 +283,7 @@ fn splitting_a_classification_keeps_the_goal_half_small() {
 
     // Measured rather than aspired to: 2015 bytes against 5706 on this goal, so
     // a little over a third. The rest is what the shared half now carries once.
-    // A tighter ratio is not available without moving suggested_next_tool or
+    // A tighter ratio is not available without moving next_action or
     // wp_timeout_triage, and the stdio suite reads both per goal.
     let goal_bytes = serde_json::to_string(&per_goal).unwrap().len();
     let whole_bytes = serde_json::to_string(&classification).unwrap().len();
@@ -1234,8 +1234,8 @@ fn classify_wp_failure_unknown_fallback() {
     assert_eq!(classification["category"], "prover_unknown");
     assert_eq!(classification["failure_kind"], "proof_obligation");
     assert!(!classification["evidence"].as_array().unwrap().is_empty());
-    assert_eq!(classification["suggested_next_tool"]["tool"], "get_wp_goals");
-    assert_eq!(classification["suggested_next_tool"]["args"]["want"], serde_json::json!(["vc"]));
+    assert_eq!(classification["next_action"]["tool"], "get_wp_goals");
+    assert_eq!(classification["next_action"]["args"]["want"], serde_json::json!(["vc"]));
     assert_eq!(classification["semantic_verdict"]["kind"], "specification_too_weak");
     assert!(classification["semantic_verdict"]["plain_language"]
         .as_str()

@@ -1806,7 +1806,7 @@ fn assert_wp_goal_shape(goal: &Value) {
     assert!(goal["vacuous"].as_bool().is_some(), "{:?}", goal);
     if goal["failure_classification"].is_object() {
         assert!(goal["failure_classification"]["category"].as_str().is_some(), "{:?}", goal);
-        assert!(goal["failure_classification"]["suggested_next_tool"]["tool"].as_str().is_some(),
+        assert!(goal["failure_classification"]["next_action"]["tool"].as_str().is_some(),
             "{:?}", goal);
         assert!(goal["failure_classification"]["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
             .as_bool().is_some(), "{:?}", goal);
@@ -3412,7 +3412,7 @@ async fn wp_goals_surface_vacuous_call_precondition_status() {
         later_precondition
     );
     assert!(
-        later_precondition["failure_classification"]["suggested_next_tool"]["tool"]
+        later_precondition["failure_classification"]["next_action"]["tool"]
             .as_str()
             .is_some(),
         "classification should suggest a next tool: {:?}",
@@ -4838,7 +4838,7 @@ async fn property_identity_is_preserved_across_analysis_tools() {
         })
         .unwrap_or_else(|| panic!("VC with failure classification missing: {:?}", details));
     assert!(
-        classified_vc["failure_classification"]["suggested_next_tool"]["tool"]
+        classified_vc["failure_classification"]["next_action"]["tool"]
             .as_str()
             .is_some(),
         "{:?}",
@@ -8831,7 +8831,6 @@ async fn a_respawn_reports_the_new_process_parse() {
     let _ = client.cancel().await;
 }
 
-#[tokio::test]
 /// The advice block rides one goal per category, over the wire.
 ///
 /// The split was unit-tested on split_goal_classification alone, which is the
@@ -8841,10 +8840,15 @@ async fn a_respawn_reports_the_new_process_parse() {
 /// payload a client actually receives.
 ///
 /// Writing it found two things a unit test could not. The split does hold end
-/// to end. And it saves less than it looks, because suggested_next_tool.reason
-/// and next_action.reason still carry the same advice text on every goal, and
-/// those stay per-goal on purpose. The second assertion below pins that number
-/// so the gap is a measurement rather than a belief.
+/// to end. And it saves less than it looks, because next_action.reason still
+/// carries the advice text on every goal, and it stays per-goal on purpose: a
+/// caller reading one goal needs the reason in hand. The second assertion below
+/// pins that number so the gap is a measurement rather than a belief.
+///
+/// The figures moved once since they were first recorded, and downward: the
+/// classification used to carry this same object twice, as next_action and as
+/// suggested_next_tool, so every number here counted it twice.
+#[tokio::test]
 async fn advice_is_carried_once_per_category_over_the_wire() {
     // 16 classified goals collapsing to 4 keys when this was written, which is
     // what makes the duplication visible; a fixture with one failure would pass
@@ -8960,18 +8964,12 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
         "the split must cut at least a quarter here: {actual} against {unsplit} unsplit"
     );
 
-    // And the part it does not save. Both reasons restate the advice per goal,
-    // and they are pinned per-goal by an older test, so this is the ceiling on
-    // what the split can do rather than a defect to fix here.
+    // And the part it does not save. next_action.reason restates the advice per
+    // goal, and it is pinned per-goal by an older test, so this is the ceiling
+    // on what the split can do rather than a defect to fix here.
     let reasons: usize = classified
         .iter()
-        .map(|c| {
-            c["suggested_next_tool"]["reason"]
-                .as_str()
-                .unwrap_or("")
-                .len()
-                + c["next_action"]["reason"].as_str().unwrap_or("").len()
-        })
+        .map(|c| c["next_action"]["reason"].as_str().unwrap_or("").len())
         .sum();
     assert!(
         reasons > (unsplit - actual) / 4,
@@ -8982,15 +8980,14 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
     );
     eprintln!(
         "advice split: {} goals, {} keys, {actual} bytes assembled against \
-         {unsplit} unsplit, {reasons} still repeated in the two reasons",
+         {unsplit} unsplit, {reasons} still repeated in next_action.reason",
         classified.len(),
         keys.len()
     );
 
-    // What truncating each reason to its first sentence would save. Reported
+    // What truncating the reason to its first sentence would save. Reported
     // rather than acted on, because the saving was measured and the change was
-    // then rejected on the text: 12888 bytes against 5976, so about 18 percent
-    // of the whole payload, but for several categories the first sentence is a
+    // then rejected on the text: for several categories the first sentence is a
     // diagnosis rather than an action. "Two different faults share this
     // branch." and "The callee's requires is not established at this call."
     // both put the thing to do in the second sentence, so a caller reading one
@@ -8999,11 +8996,8 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
     let first_sentence_bytes: usize = classified
         .iter()
         .map(|c| {
-            let one = |field: &str| {
-                let text = c[field]["reason"].as_str().unwrap_or("");
-                text.find(". ").map_or(text.len(), |end| end + 1)
-            };
-            one("suggested_next_tool") + one("next_action")
+            let text = c["next_action"]["reason"].as_str().unwrap_or("");
+            text.find(". ").map_or(text.len(), |end| end + 1)
         })
         .sum();
     eprintln!(
@@ -9024,6 +9018,29 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
     // an addition that size. Rerun this test to see the current figure in the
     // line above. Raising the ceiling is a legitimate change; doing it without
     // noticing is the one this stops.
+    //
+    // The mix is pinned first, because the average is a function of it and 11
+    // percent is not much room. The categories carry reason strings of very
+    // different lengths, the rte-timeout one running about two and a half times
+    // the generic, and each goal carries its reason twice. So a slower runner
+    // that times out more goals, or a faster one that closes some, moves this
+    // average without anything having been added to the payload, and the
+    // ceiling failure would then name a text growth that did not happen.
+    let mut by_category: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for c in &classified {
+        *by_category
+            .entry(c["category"].as_str().unwrap_or("?"))
+            .or_default() += 1;
+    }
+    assert_eq!(
+        by_category.get("timeout").copied().unwrap_or(0),
+        classified.len(),
+        "the ceiling below is calibrated on an all-timeout mix and this run is \
+         {by_category:?}. The prover or the budget moved, so re-measure the \
+         per-goal figure before reading a ceiling failure as added text."
+    );
+
     let per_goal = actual / classified.len();
     assert!(
         per_goal < 2600,

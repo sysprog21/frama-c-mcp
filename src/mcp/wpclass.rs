@@ -389,7 +389,11 @@ pub fn classify_wp_failure_from_goal(
         "normalized_status": normalized_status,
         "goal_kind": goal_kind,
         "evidence": evidence,
-        "suggested_next_tool": next_action,
+
+        // One name, not two. This carried the same object under both for a
+        // while, which cost over 6 KB across a 16-goal reply for nothing: the
+        // values were byte-identical, so a caller reading either got the same
+        // answer and every caller paid for both.
         "next_action": next_action,
         "wp_timeout_triage": timeout_triage,
         "proofread_report": report,
@@ -767,17 +771,17 @@ fn proofread_finding_from_wp_failure(
 /// with every other goal of its kind.
 ///
 /// Two different duplications live in a classification and only one of them is
-/// across goals. Within a single goal, `runtime_check_suggestion` appears three
-/// times: standalone, nested inside `next_action`, and again inside
-/// `semantic_verdict`. Across goals, the rendered `proofread_report` and the
+/// across goals. Within a single goal, "runtime_check_suggestion" appears
+/// three times: standalone, nested inside "next_action", and again inside
+/// "semantic_verdict". Across goals, the rendered "proofread_report" and the
 /// E-ACSL advice are byte-identical for everything sharing a category and goal
 /// kind. Measured on one function whose goals were legitimately all unproved,
 /// the two together came to 106 KB across 21 goals, against 1.7 KB of the
 /// fields a caller triages from.
 ///
 /// What stays on the goal is what varies with it or what a caller reads per
-/// goal: the verdict fields, its own evidence, `suggested_next_tool` (whose
-/// reason carries this goal's file and line) and `wp_timeout_triage`. The
+/// goal: the verdict fields, its own evidence, "next_action" (whose reason
+/// carries this goal's file and line) and "wp_timeout_triage". The
 /// stdio suite asserts the last two per goal, which is the contract and not an
 /// accident.
 pub fn split_goal_classification(
@@ -806,7 +810,7 @@ pub fn split_goal_classification(
     // The nested copy inside next_action goes; the standalone one is hoisted.
     // Dropping it here is what makes the per-goal half small, and it is the
     // same object either way.
-    let mut next_action = get("suggested_next_tool");
+    let mut next_action = get("next_action");
     if let Some(obj) = next_action.as_object_mut() {
         obj.remove("runtime_check_suggestion");
     }
@@ -819,7 +823,6 @@ pub fn split_goal_classification(
         "normalized_status": get("normalized_status"),
         "goal_kind": get("goal_kind"),
         "evidence": get("evidence"),
-        "suggested_next_tool": next_action.clone(),
         "next_action": next_action,
         "wp_timeout_triage": get("wp_timeout_triage"),
         "advice_key": key.clone(),

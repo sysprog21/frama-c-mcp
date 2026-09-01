@@ -100,7 +100,7 @@ transcribed. The same rule as `since` applies: only a run from this session can
 be named, and an unknown hash is an error rather than a shrug.
 
 A goal that failed carries `failure_classification`. Most of it is that goal's
-own: its status, its evidence, and a `suggested_next_tool` whose reason names
+own: its status, its evidence, and a `next_action` whose reason names
 the file and line. The part that is a function of the category rather than of
 the goal, the longer explanation and any runtime-check suggestion, is sent once
 per `category:goal_kind` pair and rides a single goal in the list under

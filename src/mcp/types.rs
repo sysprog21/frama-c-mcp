@@ -810,7 +810,7 @@ pub struct StoreFunctionConclusionParams {
     pub proof_receipt: Option<serde_json::Value>,
     /// sha256 of a receipt this session produced, in place of the object.
     ///
-    /// A separate field rather than a string in `proof_receipt`, because that
+    /// A separate field rather than a string in "proof_receipt", because that
     /// one is coerced: a string there is parsed as JSON so a client that
     /// stringifies objects still works, and a bare 64-hex digest is not valid
     /// JSON, so it never reaches the handler. Discovered by an end-to-end test
