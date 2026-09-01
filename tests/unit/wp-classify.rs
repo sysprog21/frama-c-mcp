@@ -328,6 +328,67 @@ fn advice_key_groups_by_category_and_kind() {
     assert_ne!(of("rte_mem_access"), of("ensures"));
 }
 
+/// A classification quoted on its own has to bring its advice with it.
+///
+/// The split sends each advice once, on the first classified goal of its key,
+/// which is right for an array read whole and wrong for a single goal lifted
+/// out of one. check embeds exactly one: recommended_next_call.classification
+/// is the first non-valid goal, which is the carrier only by luck. Before this
+/// resolved the key, that field was status plumbing with no why_problem, no
+/// suggested_fix and no semantic_verdict, and nothing asserted its contents.
+#[test]
+fn a_quoted_classification_resolves_its_advice_key() {
+    use frama_c_mcp::mcp::server::analysis::classification_with_advice;
+
+    let classify = |kind: &str| {
+        classify_wp_failure_from_goal(
+            &json!({
+                "name": "mem_access",
+                "goal_kind": kind,
+                "normalized_status": "timeout",
+                "source_location": {"file": "src.c", "line": 40, "column": 8}
+            }),
+            Some("collect"),
+        )
+    };
+    let (carrier_half, key, advice) = split_goal_classification(&classify("rte_mem_access"));
+    let (follower_half, follower_key, _) = split_goal_classification(&classify("rte_mem_access"));
+    assert_eq!(key, follower_key, "the fixture needs both goals on one key");
+
+    let mut carrier_half = carrier_half;
+    carrier_half
+        .as_object_mut()
+        .unwrap()
+        .insert("advice".to_string(), advice.clone());
+    let goals = vec![
+        json!({"stable_goal_id": "sg-carrier", "failure_classification": carrier_half}),
+        json!({"stable_goal_id": "sg-follower", "failure_classification": follower_half}),
+    ];
+
+    // The follower is the one check would quote, and it holds no advice.
+    assert!(
+        goals[1]["failure_classification"].get("advice").is_none(),
+        "the fixture is pointless unless the second goal is a follower"
+    );
+    let resolved = classification_with_advice(&goals[1], &goals);
+    assert_eq!(
+        resolved["advice"], advice,
+        "a follower's key must resolve to its carrier's advice: {resolved}"
+    );
+    assert!(resolved["advice"]["suggested_fix"]
+        .as_str()
+        .is_some_and(|fix| !fix.is_empty()));
+
+    // The carrier is returned untouched rather than given a second copy.
+    assert_eq!(classification_with_advice(&goals[0], &goals)["advice"], advice);
+
+    // A key no sibling carries leaves the classification as it was, rather than
+    // inventing an empty advice block.
+    let orphan = json!({"failure_classification": {"advice_key": "timeout:nothing"}});
+    let resolved = classification_with_advice(&orphan, &goals);
+    assert!(resolved.get("advice").is_none(), "{resolved}");
+}
+
 #[test]
 fn proofread_report_sorts_by_severity_then_file_line() {
     let report = proofread_report(vec![

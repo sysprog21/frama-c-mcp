@@ -846,6 +846,25 @@ pub fn split_goal_classification(
     (per_goal, key, advice)
 }
 
+/// One goal's classification with its own advice attached rather than shared.
+///
+/// The goal-list path hoists each advice onto the first goal of its key,
+/// because a caller reads that array whole and can follow advice_key to a
+/// sibling. A goal handed over on its own has no sibling to follow the key to,
+/// so it carries the block itself. Both single-goal paths call this, so the two
+/// cannot drift into answering with different shapes.
+pub fn goal_classification_with_own_advice(
+    goal: &serde_json::Value,
+    function: Option<&str>,
+) -> serde_json::Value {
+    let (mut per_goal, _key, advice) =
+        split_goal_classification(&classify_wp_failure_from_goal(goal, function));
+    if let Some(object) = per_goal.as_object_mut() {
+        object.insert("advice".to_string(), advice);
+    }
+    per_goal
+}
+
 fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
     match category {
         "rte" => {

@@ -1986,11 +1986,52 @@ fn first_alarm_next_call(alarms: &serde_json::Value) -> Option<serde_json::Value
     })
 }
 
+/// One goal's classification, with the advice its key names folded back in.
+///
+/// get_wp_goals sends each advice once, on the first classified goal of its
+/// key, because repeating it per goal is what made a stuck function
+/// unreadable. That is right for an array a caller reads whole and wrong the
+/// moment a single classification is lifted out of it: quoted on its own, a
+/// non-carrier's classification is status plumbing and an advice_key pointing
+/// at a sibling the caller was never handed. Anything embedding one goal has
+/// to resolve the key first, which is what this does.
+pub fn classification_with_advice(
+    goal: &serde_json::Value,
+    goals: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut classification = goal
+        .get("failure_classification")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if classification.get("advice").is_some() {
+        return classification;
+    }
+    let Some(key) = classification
+        .get("advice_key")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return classification;
+    };
+    let advice = goals.iter().find_map(|sibling| {
+        let sibling = sibling.get("failure_classification")?;
+        if sibling.get("advice_key").and_then(|value| value.as_str()) != Some(key.as_str()) {
+            return None;
+        }
+        sibling.get("advice").cloned()
+    });
+    if let (Some(advice), Some(object)) = (advice, classification.as_object_mut()) {
+        object.insert("advice".to_string(), advice);
+    }
+    classification
+}
+
 fn first_wp_goal_next_call(
     goals: &serde_json::Value,
     function: Option<&str>,
 ) -> Option<serde_json::Value> {
-    goals.as_array()?.iter().find_map(|goal| {
+    let goals = goals.as_array()?;
+    goals.iter().find_map(|goal| {
         let normalized_status = goal
             .get("normalized_status")
             .and_then(|value| value.as_str())
@@ -2005,19 +2046,20 @@ fn first_wp_goal_next_call(
         if normalized_status == Some("valid") || raw_status.as_deref() == Some("valid") {
             return None;
         }
+        let classification = classification_with_advice(goal, goals);
         if let Some(function) = function {
             Some(json!({
                 "tool": "get_wp_goals",
                 "args": {"want": ["vc"], "function": function},
                 "reason": "WP has a non-valid goal; inspect VC details and the attached failure_classification before changing the annotation.",
-                "classification": goal.get("failure_classification").cloned().unwrap_or(serde_json::Value::Null),
+                "classification": classification,
             }))
         } else {
             Some(json!({
                 "tool": "get_wp_goals",
                 "args": {},
                 "reason": "WP has a non-valid goal; inspect its failure_classification before changing the annotation.",
-                "classification": goal.get("failure_classification").cloned().unwrap_or(serde_json::Value::Null),
+                "classification": classification,
             }))
         }
     })
@@ -2238,8 +2280,15 @@ fn enrich_vcs_with_goals(
             }
         } else {
             let prover_result = wp_prover_result(vc);
+
+            // The same shape the goals above carry. A VC that matched no goal
+            // used to get the unsplit classification, so one reply could hand a
+            // caller two different layouts under one field name: siblings with
+            // an advice_key naming a shared block, and this one with the same
+            // content spread across proofread_report, runtime_check_suggestion
+            // and semantic_verdict and no key at all.
             let failure_classification = goal_needs_failure_classification(vc)
-                .then(|| classify_wp_failure_from_goal(vc, Some(function)));
+                .then(|| goal_classification_with_own_advice(vc, Some(function)));
             if let Some(obj) = vc.as_object_mut() {
                 obj.entry("prover_result".to_string())
                     .or_insert(prover_result);
@@ -4240,8 +4289,8 @@ impl FramaCMcpServer {
 
         // Add `goal_kind` and (if any) `hash_label` to each goal, so callers
         // can distinguish spec, source assert, and RTE failures.
-        let mut advice_seen: BTreeMap<String, (String, serde_json::Value)> = BTreeMap::new();
-        let mut augmented: Vec<serde_json::Value> = selected
+        let mut advice_carried: BTreeSet<String> = BTreeSet::new();
+        let augmented: Vec<serde_json::Value> = selected
             .into_iter()
             .map(|mut g| {
                 add_identity_fields(&mut g);
@@ -4263,40 +4312,32 @@ impl FramaCMcpServer {
                 // three stdio tests walk it expecting that. Carrying it on a
                 // real goal keeps the contract and still emits each advice
                 // once.
+                //
+                // The carrier is the first classified goal of its key, in the
+                // order this array is about to be emitted in. That is what
+                // makes the key resolvable in a truncated view, and it is the
+                // whole reason the election is positional: check summarizes
+                // this array with summarize_entries, which keeps the first few
+                // entries passing goal_needs_failure_classification, the same
+                // predicate that decides classification here. So the carrier of
+                // a key is scanned before every other goal of that key and is
+                // kept whenever any of them is. Electing by smallest
+                // stable_goal_id instead, which an earlier version did, picks a
+                // digest uncorrelated with position, and a shown goal's
+                // advice_key then routinely named a carrier that truncation had
+                // dropped, leaving that advice in no part of the reply.
                 if goal_needs_failure_classification(&g) {
                     let classification = classify_wp_failure_from_goal(&g, function);
                     let (mut per_goal, key, advice) = split_goal_classification(&classification);
-                    match g.get("stable_goal_id").and_then(|value| value.as_str()) {
-                        Some(id) => {
-                            let id = id.to_string();
-                            advice_seen
-                                .entry(key)
-                                .and_modify(|(carrier, _)| {
-                                    // Smallest stable id wins, not first
-                                    // encountered. Two identical runs must
-                                    // produce one receipt, and "first" makes
-                                    // the payload depend on an order this
-                                    // function does not fix:
-                                    // two_identical_runs_produce_one_receipt
-                                    // caught exactly that.
-                                    if id < *carrier {
-                                        *carrier = id.clone();
-                                    }
-                                })
-                                .or_insert_with(|| (id, advice));
-                        }
-                        None => {
-                            // finish_goal gives every goal an id, so this is
-                            // unreachable today. It is written out anyway
-                            // because the second pass finds the carrier by id:
-                            // a goal without one could win the election and
-                            // then never be found again, and the advice for its
-                            // whole key would vanish with no diagnostic.
-                            // Duplication is the thing this split exists to
-                            // reduce, and it is still the better failure.
-                            if let Some(obj) = per_goal.as_object_mut() {
-                                obj.insert("advice".to_string(), advice);
-                            }
+
+                    // insert answers whether this key has been seen, so first
+                    // wins and nothing later can attach a second copy. Goals
+                    // with no stable_goal_id need no special case any more: the
+                    // carrier is a position rather than a name, so there is
+                    // nothing for a later pass to fail to look up.
+                    if advice_carried.insert(key) {
+                        if let Some(obj) = per_goal.as_object_mut() {
+                            obj.insert("advice".to_string(), advice);
                         }
                     }
                     if let Some(obj) = g.as_object_mut() {
@@ -4306,36 +4347,6 @@ impl FramaCMcpServer {
                 g
             })
             .collect();
-
-        // Attached in a second pass, to the goal each key elected above. It
-        // cannot be folded into the pass above: which goal carries a key is not
-        // known until every goal has been classified.
-        for goal in augmented.iter_mut() {
-            // Borrowed only for as long as it takes to decide, so the insert
-            // below can take the goal mutably.
-            let advice = {
-                let Some(id) = goal.get("stable_goal_id").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                let Some(key) = goal
-                    .get("failure_classification")
-                    .and_then(|c| c.get("advice_key"))
-                    .and_then(|value| value.as_str())
-                else {
-                    continue;
-                };
-                match advice_seen.get(key) {
-                    Some((carrier, advice)) if carrier.as_str() == id => advice.clone(),
-                    _ => continue,
-                }
-            };
-            if let Some(obj) = goal
-                .get_mut("failure_classification")
-                .and_then(|c| c.as_object_mut())
-            {
-                obj.insert("advice".to_string(), advice);
-            }
-        }
 
         Ok(json!(augmented))
     }
@@ -5132,11 +5143,18 @@ impl FramaCMcpServer {
         let goals_by_marker = property_status_map(&goals);
         for goal in &mut goals {
             finish_goal(goal, &goals_by_marker, Some(&resolved.function));
-            let failure_classification = goal_needs_failure_classification(goal)
-                .then(|| classify_wp_failure_from_goal(goal, Some(&resolved.function)));
-            if let Some(obj) = goal.as_object_mut() {
-                if let Some(classification) = failure_classification {
-                    obj.insert("failure_classification".to_string(), classification);
+
+            // The same split the goal list uses, so failure_classification
+            // means one thing across this tool rather than two. What differs is
+            // that nothing is deduplicated here: this path answers an explicit
+            // want ["vc"] for a handful of goals read one at a time, so every
+            // goal carries its own advice and none of them has to resolve a key
+            // against a sibling.
+            if goal_needs_failure_classification(goal) {
+                let per_goal =
+                    goal_classification_with_own_advice(goal, Some(&resolved.function));
+                if let Some(object) = goal.as_object_mut() {
+                    object.insert("failure_classification".to_string(), per_goal);
                 }
             }
         }

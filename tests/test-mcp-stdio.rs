@@ -9053,3 +9053,92 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
 
     let _ = client.cancel().await;
 }
+
+/// An advice_key a caller is handed has to resolve in the payload it was
+/// handed, not in the array the server happened to build.
+///
+/// This is the failure the split shipped with and no test could see. check
+/// summarizes wp_goals through summarize_entries, which keeps the first few
+/// goals passing goal_needs_failure_classification and reports the rest as a
+/// count. The carrier was elected by smallest stable_goal_id, a digest with no
+/// relation to position, so a shown goal routinely named a carrier that was
+/// among the omitted entries and its advice was in no part of the reply, while
+/// the playbook promised the opposite. Electing the first classified goal of
+/// each key instead makes the two agree by construction: check keeps goals on
+/// the same predicate that classifies them, so the carrier of a key is scanned
+/// before every other goal of that key and survives whenever any of them does.
+///
+/// Both halves are asserted, because they fail apart. The truncated payload is
+/// the election; recommended_next_call is a single classification lifted out
+/// of the array, which loses its advice however the election works.
+#[tokio::test]
+async fn a_truncated_check_still_resolves_every_advice_key() {
+    // Several failing goals over more than one category, and comfortably more
+    // than the five a summarized check shows. bubble_sort.c is the wrong
+    // fixture for this and was tried first: it truncates, but its four
+    // smallest-id carriers all landed inside the shown five, so the test passed
+    // against the very code it was written to fail.
+    let c_file = workspace_path("tests/fixtures/tutorial/linked-n.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let checked = call_tool_json(
+        &client,
+        "check",
+        json!({"function": "isolated_loop_1", "want": ["wp"], "wp": {"timeout": 5}}),
+    )
+    .await
+    .unwrap();
+
+    let shown = checked["wp_goals"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a summarized check reports goals under entries: {checked}"));
+    assert!(
+        checked["wp_goals"]["omitted"].as_u64().unwrap_or(0) > 0,
+        "this fixture is here because check truncates it, and it did not: {}",
+        checked["wp_goals"]
+    );
+
+    let classified: Vec<&serde_json::Value> = shown
+        .iter()
+        .filter_map(|goal| goal.get("failure_classification"))
+        .collect();
+    assert!(
+        classified.len() >= 2,
+        "nothing to demonstrate with {} classified goals shown",
+        classified.len()
+    );
+
+    // Every key named in the truncated view is carried in the truncated view.
+    let carried: std::collections::BTreeSet<&str> = classified
+        .iter()
+        .filter(|c| c.get("advice").is_some())
+        .filter_map(|c| c["advice_key"].as_str())
+        .collect();
+    let named: std::collections::BTreeSet<&str> = classified
+        .iter()
+        .filter_map(|c| c["advice_key"].as_str())
+        .collect();
+    let dangling: Vec<&&str> = named.difference(&carried).collect();
+    assert!(
+        dangling.is_empty(),
+        "{} of {} shown keys resolve to a carrier check did not send: {dangling:?}. \
+         The advice for those categories is in no part of this reply.",
+        dangling.len(),
+        named.len()
+    );
+
+    // And the one classification check quotes on its own carries its advice,
+    // rather than an advice_key pointing at a goal the caller never received.
+    let quoted = &checked["recommended_next_call"]["classification"];
+    if !quoted.is_null() {
+        assert!(
+            quoted["advice"]["suggested_fix"]
+                .as_str()
+                .is_some_and(|fix| !fix.is_empty()),
+            "the recommended call quotes one goal to explain itself, and it \
+             explains nothing without the advice its key names: {quoted}"
+        );
+    }
+
+    let _ = client.cancel().await;
+}
