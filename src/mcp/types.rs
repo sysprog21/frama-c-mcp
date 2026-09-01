@@ -186,6 +186,22 @@ pub struct ReloadProjectParams {
     /// Enable generated RTE annotations by restarting Frama-C with `-rte`.
     /// Default: false.
     pub rte: Option<bool>,
+    /// Register what the project's build system proves each target under, as an
+    /// object keyed by target name. Emit it from the build system rather than
+    /// writing it here, so it cannot drift from the command that decides:
+    /// "make print-verify-profiles" or the equivalent. Each entry may carry
+    /// sources, functions, model, machdep, include_paths, defines,
+    /// force_includes, provers, timeout_seconds and reproduce. Registered for
+    /// the session; passing it again replaces the set.
+    pub verify_profiles: Option<serde_json::Value>,
+    /// Where verify_profiles came from, recorded so a later reader can re-run it
+    /// rather than trust the copy.
+    pub verify_profiles_source: Option<String>,
+    /// Load the sources and preprocessor flags of a registered profile. Any
+    /// explicit files, include_paths, defines, force_includes or machdep in
+    /// this same call win over it, so a caller can deviate on purpose, and the
+    /// response says what was taken from the profile either way.
+    pub verify_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -277,6 +293,12 @@ pub struct RunWpParams {
     /// Retry timed-out goals once at double the prover timeout and report which
     /// flip, telling "not proved" from "not proved yet". Off by default.
     pub retry_unproved: Option<bool>,
+    /// Prove under a profile registered through reload_project: its model,
+    /// provers and timeout. This server's defaults are not what a project's
+    /// proof targets use, and a goal discharged under the wrong memory model is
+    /// not evidence about that target. An explicit model, prover or timeout in
+    /// this same call wins, and the response reports what came from where.
+    pub verify_profile: Option<String>,
 }
 
 // Default is derived so callers can name the two or three fields they care
@@ -403,9 +425,16 @@ pub struct CheckParams {
     /// alarm. The verdict, incomplete[] and recommended_next_call are computed
     /// from the complete data either way.
     pub detail: Option<Detail>,
-    /// EVA precision profile: "fast", "default", or "deep".
+    /// EVA precision profile: "fast", "default", or "deep". Unrelated to
+    /// verify_profile below, which names a proof target of the project's build
+    /// system; these two were one word apart and mean nothing alike.
     #[schemars(skip)]
     pub profile: Option<String>,
+    /// Reload and prove under a profile registered by an earlier
+    /// reload_project: its sources and preprocessor flags for the reload, its
+    /// model, provers and timeout for the proof. That is what makes the result
+    /// evidence about that target rather than about this server's defaults.
+    pub verify_profile: Option<String>,
     #[schemars(skip)]
     pub precision: Option<i32>,
     #[schemars(skip)]

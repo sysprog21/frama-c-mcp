@@ -249,15 +249,33 @@ pub const EVA_READBACK_REQUESTS: &[(&str, &str)] = &[
     ("domains", "kernel.parameters.getEvaDomains"),
     ("plevel", "kernel.parameters.getEvaPlevel"),
     ("widening_delay", "kernel.parameters.getEvaWideningDelay"),
-    ("subdivide_non_linear", "kernel.parameters.getEvaSubdivideNonLinear"),
-    ("partition_history", "kernel.parameters.getEvaPartitionHistory"),
+    (
+        "subdivide_non_linear",
+        "kernel.parameters.getEvaSubdivideNonLinear",
+    ),
+    (
+        "partition_history",
+        "kernel.parameters.getEvaPartitionHistory",
+    ),
     ("auto_loop_unroll", "kernel.parameters.getEvaAutoLoopUnroll"),
     ("min_loop_unroll", "kernel.parameters.getEvaMinLoopUnroll"),
-    ("default_loop_unroll", "kernel.parameters.getEvaDefaultLoopUnroll"),
-    ("remove_redundant_alarms", "kernel.parameters.getEvaRemoveRedundantAlarms"),
+    (
+        "default_loop_unroll",
+        "kernel.parameters.getEvaDefaultLoopUnroll",
+    ),
+    (
+        "remove_redundant_alarms",
+        "kernel.parameters.getEvaRemoveRedundantAlarms",
+    ),
     ("split_return", "kernel.parameters.getEvaSplitReturn"),
-    ("equality_through_calls", "kernel.parameters.getEvaEqualityThroughCalls"),
-    ("octagon_through_calls", "kernel.parameters.getEvaOctagonThroughCalls"),
+    (
+        "equality_through_calls",
+        "kernel.parameters.getEvaEqualityThroughCalls",
+    ),
+    (
+        "octagon_through_calls",
+        "kernel.parameters.getEvaOctagonThroughCalls",
+    ),
 ];
 
 /// What EVA actually ran with, read back rather than asserted.
@@ -359,6 +377,33 @@ pub fn tool_result_json(result: CallToolResult) -> serde_json::Value {
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::from_str(&text).unwrap_or_else(|_| json!(text))
+}
+
+/// Attach the profile a run was made under to whatever that run answered with.
+///
+/// run_wp has three exits, and the profile applies to all of them: the sandbox
+/// scope, the isolated per-prover retries, and the main path. A response that
+/// omits it leaves the model a caller proved under recorded nowhere they will
+/// look.
+///
+/// Written against the object rather than through index assignment, which
+/// panics on a payload that is not one. Nothing reaching here answers with a
+/// bare array or string today; the point is that this takes an arbitrary
+/// CallToolResult, so a future one that did would take the server down rather
+/// than lose a field.
+fn with_verify_profile(
+    result: CallToolResult,
+    profile: Option<serde_json::Value>,
+) -> CallToolResult {
+    let Some(profile) = profile else {
+        return result;
+    };
+    let mut payload = tool_result_json(result);
+    let Some(object) = payload.as_object_mut() else {
+        return json_result(payload);
+    };
+    object.insert("verify_profile".to_string(), profile);
+    json_result(payload)
 }
 
 fn check_step_error(error: &McpError) -> serde_json::Value {
@@ -553,10 +598,7 @@ fn alarm_is_undischarged(alarm: &serde_json::Value) -> bool {
 /// that function's obligations alone, and the lemma stays debt. `noresult` is
 /// excluded for alarms, where it means EVA had nothing to say; here it is the
 /// whole problem.
-fn property_is_unproved_lemma(
-    property: &serde_json::Value,
-    wp_goals: &serde_json::Value,
-) -> bool {
+fn property_is_unproved_lemma(property: &serde_json::Value, wp_goals: &serde_json::Value) -> bool {
     if property.get("kind").and_then(|value| value.as_str()) != Some("lemma") {
         return false;
     }
@@ -594,10 +636,7 @@ fn property_is_unproved_lemma(
 /// clause under it is fine, and the property table carries no parent links to
 /// check that against. Two entries naming one defect is noise; one missing
 /// entry is a false OK.
-fn property_is_disproved(
-    property: &serde_json::Value,
-    wp_goals: &serde_json::Value,
-) -> bool {
+fn property_is_disproved(property: &serde_json::Value, wp_goals: &serde_json::Value) -> bool {
     matches!(
         property_normalized_status(property),
         "invalid" | "invalid_under_hyp"
@@ -627,7 +666,9 @@ fn goals_for_property_all_valid(
         if goal_marker != Some(marker) {
             continue;
         }
-        let goal_status = goal.get("normalized_status").and_then(|value| value.as_str());
+        let goal_status = goal
+            .get("normalized_status")
+            .and_then(|value| value.as_str());
         covered = true;
         all_valid &= goal_status == Some("valid");
     }
@@ -862,10 +903,7 @@ pub fn present_statuses<'a>(
 /// An empty list is the answer to "which goals are valid" on a run that proved
 /// none, and it is a lie in answer to "which goals are vaild". Only the second
 /// is rejected.
-pub fn reject_unknown_status(
-    status: &str,
-    present: &BTreeSet<&str>,
-) -> Result<(), McpError> {
+pub fn reject_unknown_status(status: &str, present: &BTreeSet<&str>) -> Result<(), McpError> {
     let matches = |candidate: &&str| candidate.eq_ignore_ascii_case(status);
     if status.eq_ignore_ascii_case(GOAL_STATUS_UNPROVED)
         || KNOWN_GOAL_STATUSES.iter().any(matches)
@@ -1122,7 +1160,10 @@ pub struct WantedAnalyses {
 }
 
 impl WantedAnalyses {
-    pub const BOTH: Self = Self { eva: true, wp: true };
+    pub const BOTH: Self = Self {
+        eva: true,
+        wp: true,
+    };
 
     /// Both unless the caller narrowed it. An empty list is read the same way
     /// as none at all: asking for nothing is a request nobody means, and
@@ -1607,7 +1648,11 @@ type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
 /// Looped, not suffixed once: a caller who passes "a" twice and also passes
 /// "a#1" would otherwise get two variants called "a#1", and duplicate_ast
 /// names a label, so it would point at whichever of them landed first.
-fn claim_label(taken: &mut std::collections::HashSet<String>, label: String, from: usize) -> String {
+fn claim_label(
+    taken: &mut std::collections::HashSet<String>,
+    label: String,
+    from: usize,
+) -> String {
     if taken.insert(label.clone()) {
         return label;
     }
@@ -1646,20 +1691,27 @@ pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Va
     // indistinguishable from a matrix that really was checked and really was
     // clean. A comparison that did not happen must not read as one that
     // happened and found nothing.
-    let unestablished = results.iter().filter(|entry| digest_of(entry).is_none()).count();
+    let unestablished = results
+        .iter()
+        .filter(|entry| digest_of(entry).is_none())
+        .count();
 
     let reason = if duplicate_count > 0 {
-        json!("Two or more variants asked for different code and analysed byte-identical \
+        json!(
+            "Two or more variants asked for different code and analysed byte-identical \
                ASTs, so they are one configuration checked twice rather than several \
                checked once. Equal goal counts cannot show this; the digests can. \
                Variants that differ only in the WP model are not counted here: no proof \
-               option changes the AST, so sharing one is expected.")
+               option changes the AST, so sharing one is expected."
+        )
     } else if unestablished > 0 {
-        json!("At least one variant has no AST digest, so it was compared to nothing and this \
+        json!(
+            "At least one variant has no AST digest, so it was compared to nothing and this \
                run cannot say whether the configurations differ. Read \
                proof_receipt.subject.ast_digest_unavailable_reason on that variant: the usual \
                causes are the ast-utils plug-in not being installed and printSource outrunning \
-               its budget on a large project.")
+               its budget on a large project."
+        )
     } else {
         serde_json::Value::Null
     };
@@ -1696,7 +1748,15 @@ pub fn check_incomplete_items(
     let mut incomplete = Vec::new();
     ast_diagnostic_gaps(&mut incomplete, reload, AST_WARNING_ALLOWLIST);
     unrequested_analysis_gaps(&mut incomplete, rte, wanted);
-    step_failure_gaps(&mut incomplete, reload, eva, eva_alarms, wp, wp_goals, wanted);
+    step_failure_gaps(
+        &mut incomplete,
+        reload,
+        eva,
+        eva_alarms,
+        wp,
+        wp_goals,
+        wanted,
+    );
     property_row_gaps(&mut incomplete, eva_alarms, wp_goals);
     let judged_goals = wp_goal_gaps(&mut incomplete, eva_alarms, wp_goals);
     proofread_finding_gaps(&mut incomplete, wp, &judged_goals);
@@ -1853,9 +1913,7 @@ pub fn unproved_assumption_findings(
     let mut findings = Vec::new();
     let mut seen = HashSet::new();
     for goal in goals {
-        let status = normalize_frama_c_status(
-            own_status(goal).unwrap_or("unknown"),
-        );
+        let status = normalize_frama_c_status(own_status(goal).unwrap_or("unknown"));
 
         // The same guard the GOAL_NOT_VALID loop applies, for the same reason.
         // A goal WP left unknown whose property consolidated to valid was
@@ -2416,6 +2474,29 @@ fn enrich_vcs_with_goals(
     }
 }
 
+/// Whether a call names the same functions the profile declares.
+///
+/// Compared on the bare names. A sandbox target is written "exp42:foo", and a
+/// profile names the function rather than the experiment holding it, so
+/// comparing the qualified form would refuse every sandbox run, and rewriting
+/// the caller's list to bare names would leave the sandbox unable to resolve
+/// them. So the qualifier is stripped for the comparison and the caller's list
+/// is left alone.
+///
+/// Lifted out of apply_verify_profile to be testable at all: that method needs
+/// a live server, and this is the part of it most likely to be broken by a
+/// later simplification back to a plain equality.
+pub fn profile_covers_exactly(requested: &[String], declared: &[String]) -> bool {
+    fn bare(function: &str) -> &str {
+        function
+            .split_once(':')
+            .map_or(function, |(_, name)| name)
+    }
+    let requested: BTreeSet<&str> = requested.iter().map(|f| bare(f)).collect();
+    let declared: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+    requested == declared
+}
+
 #[tool_router(router = analysis_router, vis = "pub(crate)")]
 impl FramaCMcpServer {
     fn expand_eva_profile(
@@ -2914,6 +2995,13 @@ impl FramaCMcpServer {
                 force_includes: params.force_includes,
                 machdep: params.machdep,
                 compilation_database: params.compilation_database,
+
+                // check does not register profiles; it names one that a
+                // reload_project already registered, so a caller cannot make
+                // one up in the same breath as proving under it.
+                verify_profiles: None,
+                verify_profiles_source: None,
+                verify_profile: params.verify_profile.clone(),
                 rte: Some(params.rte.unwrap_or(true)),
 
                 // check's own detail governs goals and alarms; the function
@@ -2975,6 +3063,7 @@ impl FramaCMcpServer {
                     cancel: None,
                     drain_timeout_seconds: None,
                     retry_unproved: params.retry_unproved,
+                    verify_profile: params.verify_profile.clone(),
                 },
                 params.function.as_deref(),
             )
@@ -3014,7 +3103,8 @@ impl FramaCMcpServer {
         // crashed backend as a wrong specification.
         let backend_diagnosis = wp_backend_diagnosis(
             &messages,
-            wp.pointer("/effective_wp_config/model").and_then(|value| value.as_str()),
+            wp.pointer("/effective_wp_config/model")
+                .and_then(|value| value.as_str()),
         );
 
         // An abort is only a gap when it left something unjudged. WP runs
@@ -3024,10 +3114,8 @@ impl FramaCMcpServer {
         // "incomplete" over a backend hiccup no goal is waiting on, which is
         // the same wrong answer in the other direction. The diagnosis is still
         // reported; only the verdict is left alone.
-        let anomaly_left_goals_unjudged = wp_backend_anomaly_left_goal_unjudged(
-            &backend_diagnosis,
-            &wp_goals,
-        );
+        let anomaly_left_goals_unjudged =
+            wp_backend_anomaly_left_goal_unjudged(&backend_diagnosis, &wp_goals);
         if anomaly_left_goals_unjudged {
             let field = |name: &str| {
                 backend_diagnosis
@@ -3745,6 +3833,56 @@ impl FramaCMcpServer {
         })
     }
 
+    /// Fill a proof run's config from a registered profile, without overriding
+    /// a value the caller stated.
+    ///
+    /// Provers arrive as a list and leave as one comma-separated prover string,
+    /// because that is Frama-C's own "-wp-prover alt-ergo,z3" and it is not the
+    /// same request as this tool's plural `provers`, which runs a separate CLI
+    /// attempt per prover. Routing a profile through the plural would silently
+    /// change which execution path a run took.
+    async fn apply_verify_profile(
+        &self,
+        params: &mut RunWpParams,
+    ) -> Result<Option<serde_json::Value>, McpError> {
+        let Some(name) = params.verify_profile.clone() else {
+            return Ok(None);
+        };
+        let profile = self.verify_profile_named(&name).await?;
+        if !profile.functions.is_empty() {
+            if let Some(functions) = &params.functions {
+                if !profile_covers_exactly(functions, &profile.functions) {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "verify_profile \"{name}\" is the target that proves {:?}. This \
+                             call names {:?}, so its result would not be evidence about that \
+                             target. Drop verify_profile and pass the model directly to prove \
+                             a subset.",
+                            profile.functions, functions
+                        ),
+                        None,
+                    ));
+                }
+                // Left as the caller wrote them, qualifiers and all.
+            } else {
+                // The profile's order is the target's canonical proof identity.
+                params.functions = Some(profile.functions.clone());
+            }
+        }
+        params.model = params.model.take().or_else(|| profile.model.clone());
+        params.timeout = params.timeout.or(profile.timeout_seconds);
+        if params.prover.is_none() && params.provers.is_none() && !profile.provers.is_empty() {
+            params.prover = Some(profile.provers.join(","));
+        }
+        Ok(Some(json!({
+            "name": name,
+            "model": profile.model,
+            "provers": profile.provers,
+            "timeout_seconds": profile.timeout_seconds,
+            "reproduce": profile.reproduce,
+        })))
+    }
+
     #[tool(
         description = "Run WP deductive verification. Bare function names target the main \
             Frama-C instance; sandbox-prefixed names like exp42:foo target that sandbox. \
@@ -3753,10 +3891,16 @@ impl FramaCMcpServer {
     )]
     async fn run_wp(
         &self,
-        Parameters(params): Parameters<RunWpParams>,
+        Parameters(mut params): Parameters<RunWpParams>,
     ) -> Result<CallToolResult, McpError> {
         match run_wp_target_scope(&params)? {
-            RunWpScope::Sandbox => return self.run_wp_on_sandbox(&params).await,
+            RunWpScope::Sandbox => {
+                let profile_applied = self.apply_verify_profile(&mut params).await?;
+                return Ok(with_verify_profile(
+                    self.run_wp_on_sandbox(&params).await?,
+                    profile_applied,
+                ));
+            }
             RunWpScope::Main => {}
         }
 
@@ -3766,6 +3910,15 @@ impl FramaCMcpServer {
         if params.cancel == Some(true) {
             return self.cancel_wp_queue().await;
         }
+
+        // After the cancel above, for the reason stated there: resolving a
+        // profile can fail on a name, and a caller getting out of a run it
+        // cannot finish should not be refused over the config of a run it is
+        // abandoning. Before everything else, because a run under this server's
+        // defaults is not evidence about a target that declares its own model,
+        // and naming a profile is how those values arrive together rather than
+        // one transcription at a time.
+        let profile_applied = self.apply_verify_profile(&mut params).await?;
 
         // Check project lock for main instance WP
         if *self.project_locked.read().await {
@@ -3782,15 +3935,18 @@ impl FramaCMcpServer {
         // path; a singular `prover` and the environment defaults configure the
         // live instance instead. requested_provers already holds the trimmed
         // and validated list whenever `provers` was given.
-        if let Some(provers) = requested_provers.as_ref().filter(|_| params.provers.is_some()) {
+        if let Some(provers) = requested_provers
+            .as_ref()
+            .filter(|_| params.provers.is_some())
+        {
             let (files, project_options) = {
                 let main_state = self.main_frama_c_state.lock().await;
                 let state = main_state.as_ref().ok_or_else(no_project_loaded_err)?;
                 (state.files.clone(), state.project_options.clone())
             };
             let functions = params.functions.clone().unwrap_or_default();
-            return self
-                .run_isolated_wp_retries(IsolatedWpRetry {
+            return Ok(with_verify_profile(
+                self.run_isolated_wp_retries(IsolatedWpRetry {
                     files,
                     project_options,
                     rte_enabled: true,
@@ -3800,7 +3956,9 @@ impl FramaCMcpServer {
                     params: &params,
                     scope: "main",
                 })
-                .await;
+                .await?,
+                profile_applied,
+            ));
         }
 
         // Held across the whole transaction below: config, target resolution,
@@ -3858,7 +4016,9 @@ impl FramaCMcpServer {
         self.apply_wp_config(&client, &params, requested_provers.as_ref())
             .await?;
 
-        let targets = self.resolve_wp_targets(&client, params.functions.as_deref()).await?;
+        let targets = self
+            .resolve_wp_targets(&client, params.functions.as_deref())
+            .await?;
 
         // Every run regenerates, which is safe to repeat: measured on 33.0,
         // three successive runs over the same function give the same eight
@@ -3907,7 +4067,11 @@ impl FramaCMcpServer {
             .unwrap_or(WP_DRAIN_BUDGET);
         let mut tasks = drain_wp_tasks(&client, drain_budget).await?;
 
-        if self.wp_cancel_epoch.load(std::sync::atomic::Ordering::SeqCst) != cancel_epoch {
+        if self
+            .wp_cancel_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != cancel_epoch
+        {
             mark_cancelled_mid_run(&mut tasks);
         }
 
@@ -3969,6 +4133,23 @@ impl FramaCMcpServer {
             report_function,
         )
         .await?;
+
+        // Beside the goals rather than in the receipt: the receipt already
+        // records the model this ran under, and what this adds is which target
+        // that model was supposed to belong to, and the command that decides
+        // for it. A caller reading only the goals should not have to remember
+        // either.
+        // Written into the payload directly. The helper below exists for the
+        // two exits that only ever hold a CallToolResult; here the value is a
+        // Value one line up, and going through the envelope would pretty-print
+        // the whole WP document, drop the string, and print it again to add
+        // one key. json_result's own comment is about not copying this tree
+        // once, so doing it twice for a key insert is the cost it warns about.
+        if let Some(profile) = profile_applied {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("verify_profile".to_string(), profile);
+            }
+        }
         Ok(json_result(response))
     }
 
@@ -5023,7 +5204,10 @@ impl FramaCMcpServer {
             .cloned()
             .collect::<Vec<_>>();
         frontier.sort();
-        let ready_count = ready_functions.as_array().map(|ready| ready.len()).unwrap_or(0);
+        let ready_count = ready_functions
+            .as_array()
+            .map(|ready| ready.len())
+            .unwrap_or(0);
         let ready_functions_preview = ready_functions
             .as_array()
             .map(|ready| {
@@ -5036,14 +5220,16 @@ impl FramaCMcpServer {
                 )
             })
             .unwrap_or_else(|| ready_functions.clone());
-        let ready_functions_omitted = ready_count.saturating_sub(VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS);
+        let ready_functions_omitted =
+            ready_count.saturating_sub(VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS);
         let frontier_count = frontier.len();
         let frontier_preview = frontier
             .iter()
             .take(VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS)
             .cloned()
             .collect::<Vec<_>>();
-        let frontier_omitted = frontier_count.saturating_sub(VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS);
+        let frontier_omitted =
+            frontier_count.saturating_sub(VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS);
         let progress = json!({
             "defined_count": defined_functions.len(),
             "done_count": done.len(),
@@ -5183,7 +5369,8 @@ impl FramaCMcpServer {
         include_counter_examples: bool,
     ) -> Result<serde_json::Value, McpError> {
         let resolved = self.resolve_client(function).await?;
-        let external_wp_input = if include_wp_print || include_why3_dump || include_counter_examples {
+        let external_wp_input = if include_wp_print || include_why3_dump || include_counter_examples
+        {
             if let Some(experiment_id) = resolved.experiment_id.as_deref() {
                 let sandboxes = self.sandboxes.read().await;
                 sandboxes.metadata(experiment_id).map(|metadata| {
@@ -5281,8 +5468,7 @@ impl FramaCMcpServer {
             // goal carries its own advice and none of them has to resolve a key
             // against a sibling.
             if goal_needs_failure_classification(goal) {
-                let per_goal =
-                    goal_classification_with_own_advice(goal, Some(&resolved.function));
+                let per_goal = goal_classification_with_own_advice(goal, Some(&resolved.function));
                 if let Some(object) = goal.as_object_mut() {
                     object.insert("failure_classification".to_string(), per_goal);
                 }
@@ -5323,7 +5509,12 @@ impl FramaCMcpServer {
             }
         }
         if let Some(vcs) = vc_result.get_mut("vcs").and_then(|v| v.as_array_mut()) {
-            enrich_vcs_with_goals(vcs, function_marker.as_deref(), &resolved.function, &goals_by_wpo);
+            enrich_vcs_with_goals(
+                vcs,
+                function_marker.as_deref(),
+                &resolved.function,
+                &goals_by_wpo,
+            );
             if let Some(blocks) = wp_print_payload
                 .as_ref()
                 .and_then(|payload| payload.get("blocks"))

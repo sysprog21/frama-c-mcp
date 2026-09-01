@@ -275,6 +275,49 @@ that points out of it are all refused.
 must be `e-acsl-gcc` or `e-acsl-gcc.sh`, resolved through PATH. Both names
 exist because installs differ.
 
+### Proving what the build system proves
+
+This server's WP defaults are not what a project's proof targets use. A goal
+discharged under `Typed+nocast` says nothing about a target that declares
+`caveat`, so evidence produced under the wrong model is not evidence about that
+target at all.
+
+Register what the build system says, and name it on the same call or a later
+one. Registration happens before the load, so one call can both hand over the
+set and load under one of them:
+
+```
+reload_project {verify_profiles: <json>, verify_profiles_source: "make print-verify-profiles",
+                verify_profile: "elf"}   # registers, then loads elf's sources and cpp flags
+run_wp         {verify_profile: "elf"}   # its model, provers and timeout
+check          {verify_profile: "elf"}   # both
+reload_project {verify_profile: "gva"}   # a later target, already registered
+```
+
+Registering without naming a profile and without `files` is not a load, and a
+fresh session answers it with "no project loaded" because there is nothing to
+reparse. A malformed set is refused before anything is replaced; a set that
+parses is registered even if the load that follows it fails.
+
+Each profile may carry `sources`, `functions`, `model`, `machdep`,
+`include_paths`, `defines`, `force_includes`, `provers`, `timeout_seconds` and
+`reproduce`. Emit the JSON from the build system that defines the targets
+rather than writing it by hand, so it cannot drift from the command that
+decides. An unknown key is refused rather than ignored. A profile
+whose model key is misspelled as `models` would otherwise register with no
+model at all, and the next run would prove under this server's default and
+report it as that target's evidence, which is the failure profiles exist to
+prevent. Naming a profile nobody registered is refused too, rather than
+falling back to the default.
+
+An explicit `model`, `machdep` or include path in the same call wins over the
+profile, so deviating on purpose stays possible, and the response reports what
+came from the profile either way.
+
+`reproduce` is the command that actually decides. This server is an
+accelerator: goals discharging here are progress, and the project's own command
+is the verdict.
+
 `reload_project {include_paths, defines, force_includes}` become preprocessor
 flags, and Frama-C hands those to a shell (its `-cpp-extra-args` is "unsafe in
 sandbox mode"). Each entry is therefore restricted to `[A-Za-z0-9_./+-]`, plus

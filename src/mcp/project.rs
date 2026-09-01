@@ -361,6 +361,61 @@ impl FramaCMcpServer {
         Ok(json_result(result))
     }
 
+    /// Register what the build system says, then resolve the name a caller
+    /// gave, returning the profile and the report of what it supplied.
+    ///
+    /// Registration happens first so one call can both hand over the profiles
+    /// and load under one of them.
+    async fn resolve_verify_profile(
+        &self,
+        params: &ReloadProjectParams,
+    ) -> Result<(Option<crate::state::VerificationProfile>, Option<serde_json::Value>), McpError>
+    {
+        // Registered and resolved under one guard. Dropping it between the two
+        // leaves a window where a second caller replaces the set, and this call
+        // then loads another target's model or is refused over a name it just
+        // registered itself.
+        // Parsed before the guard, so a malformed set is refused without having
+        // replaced anything.
+        let registering = params
+            .verify_profiles
+            .as_ref()
+            .map(crate::state::parse_verification_profiles)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let profile = {
+            let mut state = self.state.write().await;
+            if let Some(parsed) = registering {
+                state.verification_profiles = parsed;
+                state.verification_profiles_source = params.verify_profiles_source.clone();
+            }
+            match &params.verify_profile {
+                Some(name) => Some(
+                    state
+                        .verification_profiles
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| unknown_verify_profile(name, &state.verification_profiles))?,
+                ),
+                None => None,
+            }
+        };
+
+        // The profile supplies what the caller did not. An explicit value wins,
+        // because deviating on purpose is a thing to be able to do; what the
+        // response reports is which of the two each value came from.
+        let profile_used = profile.as_ref().map(|profile| {
+            json!({
+                "name": params.verify_profile,
+                "sources": profile.sources,
+                "model": profile.model,
+                "machdep": profile.machdep,
+                "reproduce": profile.reproduce,
+            })
+        });
+        Ok((profile, profile_used))
+    }
+
     #[tool(
         description = "Reload C source files, reparse the AST, and refresh cached project state. \
         Existing EVA/WP results are invalidated. Set rte=true to restart Frama-C with generated runtime-error annotations."
@@ -379,12 +434,30 @@ impl FramaCMcpServer {
             ));
         }
 
+        let (profile, profile_used) = self.resolve_verify_profile(&params).await?;
+
+        // The profile's sources are what "load this target" means, and they
+        // stand in only where the caller named none.
+        let requested_files = params.files.clone().or_else(|| {
+            profile
+                .as_ref()
+                .filter(|profile| !profile.sources.is_empty())
+                .map(|profile| profile.sources.clone())
+        });
+
         let rte = params.rte.unwrap_or(false);
+        let from_profile = |explicit: Option<Vec<String>>, pick: fn(&crate::state::VerificationProfile) -> &Vec<String>| {
+            explicit.unwrap_or_else(|| {
+                profile.as_ref().map(|profile| pick(profile).clone()).unwrap_or_default()
+            })
+        };
         let project_options = ProjectLoadOptions {
-            include_paths: params.include_paths.unwrap_or_default(),
-            defines: params.defines.unwrap_or_default(),
-            force_includes: params.force_includes.unwrap_or_default(),
-            machdep: params.machdep,
+            include_paths: from_profile(params.include_paths, |p| &p.include_paths),
+            defines: from_profile(params.defines, |p| &p.defines),
+            force_includes: from_profile(params.force_includes, |p| &p.force_includes),
+            machdep: params
+                .machdep
+                .or_else(|| profile.as_ref().and_then(|profile| profile.machdep.clone())),
             compilation_database: params.compilation_database,
         };
         validate_project_options(&project_options)?;
@@ -428,7 +501,7 @@ impl FramaCMcpServer {
         // is handed the database instead of re-fetching one the guard had
         // already found. A guard cannot bind, which is the whole reason the old
         // arm had to assert.
-        let files = match (params.files, project_options.compilation_database.as_ref()) {
+        let files = match (requested_files, project_options.compilation_database.as_ref()) {
             (Some(f), _) => f,
             (None, Some(database)) => compile_database_files(database)?,
             (None, None) => {
@@ -585,7 +658,7 @@ impl FramaCMcpServer {
                 .collect()
         };
 
-        let result = json!({
+        let mut result = json!({
             "functions": entries,
             "detail": detail.as_str(),
             "files": files,
@@ -605,6 +678,22 @@ impl FramaCMcpServer {
             "messages": messages,
             "messages_truncated": truncated,
         });
+
+        // Named only when one was applied, and reporting what it supplied
+        // rather than that it existed: the point is that a later reader can see
+        // the model and the reproducing command this load was made under.
+        if let Some(used) = profile_used {
+            result["verify_profile"] = used;
+        }
+        {
+            let state = self.state.read().await;
+            if !state.verification_profiles.is_empty() {
+                result["verify_profiles_registered"] = json!({
+                    "names": state.verification_profiles.keys().collect::<Vec<_>>(),
+                    "source": state.verification_profiles_source,
+                });
+            }
+        }
         Ok(json_result(result))
     }
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
+use frama_c_mcp::mcp::server::analysis::profile_covers_exactly;
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
 
@@ -2144,4 +2145,46 @@ fn a_comma_separated_prover_argument_names_each_of_them() {
         effective_wp_provers_from(&single, None).unwrap(),
         Some(vec!["z3".to_string()])
     );
+}
+
+/// The comparison a profile makes before it will call a run its evidence.
+///
+/// Extracted from apply_verify_profile, which needs a live server, because a
+/// sandbox target is written "exp42:foo" and a profile names "foo". Comparing
+/// the qualified form refuses every sandbox run; that is the regression this
+/// pins, and nothing else in any suite would catch it.
+#[test]
+fn a_profile_matches_a_sandbox_target_by_its_bare_name() {
+    let declared = vec!["elf_phdr_fetch".to_string(), "hex_nibble".to_string()];
+
+    // Unqualified, in a different order: the same target.
+    assert!(profile_covers_exactly(
+        &["hex_nibble".to_string(), "elf_phdr_fetch".to_string()],
+        &declared
+    ));
+
+    // Sandbox-qualified: still the same functions, in an experiment.
+    assert!(profile_covers_exactly(
+        &[
+            "exp42:elf_phdr_fetch".to_string(),
+            "exp42:hex_nibble".to_string()
+        ],
+        &declared
+    ));
+
+    // A subset is not the target, which is the whole point of the check.
+    assert!(!profile_covers_exactly(
+        &["exp42:hex_nibble".to_string()],
+        &declared
+    ));
+
+    // Nor is a superset, or a different function entirely.
+    assert!(!profile_covers_exactly(
+        &[
+            "elf_phdr_fetch".to_string(),
+            "hex_nibble".to_string(),
+            "elf_segment_extent".to_string()
+        ],
+        &declared
+    ));
 }

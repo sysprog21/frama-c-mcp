@@ -1158,13 +1158,13 @@ pub fn no_project_loaded_err() -> McpError {
     no_project_loaded_error()
 }
 
+pub const MCP_TOOL_COUNT: usize = 15;
+
 /// "sandbox does not exist" error - returned when require_sandbox fails for all
 /// non-create sandbox tools.
 pub fn sandbox_not_found_err(experiment_id: &str, existing: &[String]) -> McpError {
     sandbox_not_found_error(experiment_id, existing)
 }
-
-pub const MCP_TOOL_COUNT: usize = 15;
 
 /// The revision a client gets when it asks for one rmcp does not recognize.
 ///
@@ -1561,6 +1561,49 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         return None;
     }
     Some(flags.join(" "))
+}
+
+/// The refusal for a name nobody registered, with what is registered beside it.
+///
+/// Taken out of the lookup so a caller already holding the state guard can
+/// build the same message without dropping it, which is what the registration
+/// path has to do to stay atomic.
+pub fn unknown_verify_profile(
+    name: &str,
+    registered: &std::collections::BTreeMap<String, crate::state::VerificationProfile>,
+) -> McpError {
+    let known: Vec<&str> = registered.keys().map(String::as_str).collect();
+    McpError::invalid_params(
+        format!(
+            "no verify_profile named \"{name}\". Registered: {}. Register them through \
+             reload_project, emitted by the build system that defines the targets, so they \
+             cannot drift from the command that decides.",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ),
+        None,
+    )
+}
+
+impl FramaCMcpServer {
+    /// A registered profile by name, or a refusal that says what is registered.
+    ///
+    /// Both tools that take a verify_profile resolve it through here. They had
+    /// a copy each, identical but for the closing sentence, which is how two
+    /// messages about one thing start disagreeing about it.
+    pub async fn verify_profile_named(
+        &self,
+        name: &str,
+    ) -> Result<crate::state::VerificationProfile, McpError> {
+        let state = self.state.read().await;
+        if let Some(profile) = state.verification_profiles.get(name) {
+            return Ok(profile.clone());
+        }
+        Err(unknown_verify_profile(name, &state.verification_profiles))
+    }
 }
 
 pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
