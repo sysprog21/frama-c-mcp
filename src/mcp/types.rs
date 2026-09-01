@@ -808,6 +808,14 @@ pub struct StoreFunctionConclusionParams {
     /// Proof receipt returned by run_wp or check.
     #[serde(default, deserialize_with = "deserialize_value_or_string")]
     pub proof_receipt: Option<serde_json::Value>,
+    /// sha256 of a receipt this session produced, in place of the object.
+    ///
+    /// A separate field rather than a string in `proof_receipt`, because that
+    /// one is coerced: a string there is parsed as JSON so a client that
+    /// stringifies objects still works, and a bare 64-hex digest is not valid
+    /// JSON, so it never reaches the handler. Discovered by an end-to-end test
+    /// after a unit test on the state alone had passed.
+    pub proof_receipt_sha256: Option<String>,
 
     // S1_info_gather outputs
     /// Callee names list

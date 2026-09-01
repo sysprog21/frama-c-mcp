@@ -4425,6 +4425,112 @@ async fn check_receipts_distinguish_eva_entry_points() {
     let _ = client.cancel().await;
 }
 
+/// The receipt a real run produced, named by its hash, is accepted as evidence.
+///
+/// The unit test for this covers SessionState alone. What it cannot show is the
+/// path a caller actually takes: run_wp, read sha256 off the receipt, hand that
+/// string back. Every other conclusion test here builds a synthetic receipt
+/// with fixture_receipt, so the real run_wp-to-store path had no coverage in
+/// either direction.
+///
+/// The hash exists because the object cannot practically be echoed: acceptance
+/// recomputes the digest over the receipt's serialized bytes, and one
+/// function's receipt is roughly 8 KB whose bulk is a goal array. Resolving the
+/// hash checks the same bytes, since they are the ones this process wrote.
+#[tokio::test]
+async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
+    // A fixture that proves clean, because a verified conclusion is also
+    // checked against its summary: storing one whose goals are not all valid is
+    // refused on that ground before the receipt is ever consulted, which would
+    // leave the path under test unexercised.
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let run = call_tool_json(&client, "run_wp", json!({"timeout": 5}))
+        .await
+        .unwrap();
+    let sha = run["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("run_wp returns a receipt with a sha256")
+        .to_string();
+
+    // Derived from the run, not invented: storing a conclusion also checks the
+    // summary against the receipt's goal count, so a made-up total is refused
+    // even when the receipt itself is genuine. That check is the reason this
+    // test reads the goals rather than asserting a convenient number.
+    let goals = run["proof_receipt"]["goals"]
+        .as_array()
+        .expect("a receipt carries its goals");
+    let total = goals.len();
+    let valid = goals.iter().filter(|g| g["status"] == "valid").count();
+
+    let stored = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {
+                "total": total, "valid": valid,
+                "unknown": total - valid, "timeout": 0, "failed": 0
+            },
+            "proof_receipt_sha256": sha,
+        }),
+    )
+    .await;
+    assert!(
+        stored.is_ok(),
+        "a hash this session produced must be accepted: {stored:?}"
+    );
+
+    // And it must read back as the receipt, not as the string it arrived as.
+    let listed = call_tool_json(
+        &client,
+        "list",
+        json!({"kind": "conclusions", "function": "abs_int"}),
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&listed).unwrap();
+    assert!(
+        text.contains(&sha),
+        "the stored conclusion must carry the receipt the hash named: {text}"
+    );
+    assert!(
+        text.contains("frama-c-mcp.proof-receipt"),
+        "and it must be the receipt object, not the bare hash: {text}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A hash this session never produced is refused, and says so. An unknown run
+/// and an empty one are different answers, the same rule get_wp_goals {since}
+/// already follows.
+#[tokio::test]
+async fn an_unknown_receipt_hash_is_refused() {
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let stored = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
+            "proof_receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }),
+    )
+    .await;
+    assert!(
+        stored.is_err(),
+        "an unknown hash must not stand in for evidence: {stored:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
 #[tokio::test]
 async fn two_identical_runs_produce_one_receipt() {
     // The claim this server rests on is that two runs are comparable exactly

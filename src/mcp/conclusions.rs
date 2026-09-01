@@ -5,7 +5,11 @@ impl FramaCMcpServer {
     #[tool(
         description = "Store or update the verification conclusion for a function. \
         Supports incremental updates: fields set to null preserve previous values. \
-        Stores only status, notes, committed specs, WP summary, proof receipt, and direct callees."
+        Stores only status, notes, committed specs, WP summary, proof receipt, and direct callees. \
+        Evidence for a verified status arrives as proof_receipt, the object run_wp returned, or \
+        more usefully as proof_receipt_sha256, the digest from it: a receipt is accepted only if \
+        its bytes hash to what this server wrote, so echoing one back by hand is both large and \
+        fragile, while the digest resolves to the same bytes here. Pass one or the other."
     )]
     async fn store_function_conclusion(
         &self,
@@ -37,6 +41,38 @@ impl FramaCMcpServer {
             .transpose()
             .map_err(|e| McpError::invalid_params(format!("invalid wp_summary: {e}"), None))?;
 
+        // A receipt may arrive as itself or, in proof_receipt_sha256, as the
+        // digest of one this session wrote. The second is what makes the tool
+        // usable from an MCP client: acceptance recomputes the hash over the
+        // receipt's serialized bytes, so evidence has to be byte-exact, and a
+        // caller's only way to supply it is to echo roughly 8 KB through its
+        // own context. Resolving the digest here checks the same bytes, because
+        // they are the ones this process produced; what it removes is the
+        // transcription, not the check.
+        let proof_receipt = match (params.proof_receipt, params.proof_receipt_sha256) {
+            (Some(receipt), None) => Some(receipt),
+            (None, Some(sha256)) => {
+                let Some(receipt) = self.state.read().await.receipt_body(&sha256).cloned() else {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "no receipt with sha256 {sha256} was produced by this session; \
+                             pass proof_receipt itself, or re-run run_wp and use the sha256 \
+                             it returns"
+                        ),
+                        None,
+                    ));
+                };
+                Some(receipt)
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "pass proof_receipt or proof_receipt_sha256, not both",
+                    None,
+                ))
+            }
+            (None, None) => None,
+        };
+
         let func_name = params.function;
         // The name becomes a directory under .frama-c-mcp/.
         require_safe_path_segment(&func_name, "function")?;
@@ -50,7 +86,7 @@ impl FramaCMcpServer {
             wp_summary,
             notes: params.notes,
             callees: params.callees,
-            proof_receipt: params.proof_receipt,
+            proof_receipt,
         };
 
         let mut state = self.state.write().await;

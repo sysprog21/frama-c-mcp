@@ -176,6 +176,45 @@ fn classify_wp_failure_includes_proofread_report_shape() {
     assert_eq!(finding["clause_or_goal_kind"], "rte_division");
 }
 
+/// A receipt is accepted only when its bytes hash to what the server wrote, so
+/// the object cannot practically be echoed back by an MCP client: one
+/// function's receipt is 8 KB whose bulk is the goal array, and a single slip
+/// is rejected with no indication of which field moved. The session therefore
+/// keeps the body next to the goals, and the hash resolves to it.
+#[test]
+fn session_remembers_receipt_body_for_lookup_by_hash() {
+    use frama_c_mcp::state::SessionState;
+
+    let mut state = SessionState::default();
+    let goals = vec![json!({"stable_goal_id": "sg_1", "status": "valid"})];
+    let receipt = json!({"schema": "frama-c-mcp.proof-receipt", "sha256": "abc123"});
+
+    state.remember_receipt("abc123", &goals, receipt.clone());
+
+    assert_eq!(state.receipt_body("abc123"), Some(&receipt));
+    assert_eq!(state.receipt_goals("abc123").map(<[_]>::len), Some(1));
+    assert!(
+        state.receipt_body("never-produced").is_none(),
+        "an unknown hash must not resolve: it is an error, not an empty receipt"
+    );
+}
+
+/// The goals-only writer stays usable, and a later call that does know the body
+/// fills it in rather than being dropped as a duplicate.
+#[test]
+fn remembering_goals_first_then_body_keeps_both() {
+    use frama_c_mcp::state::SessionState;
+
+    let mut state = SessionState::default();
+    let goals = vec![json!({"stable_goal_id": "sg_1", "status": "valid"})];
+    state.remember_receipt_goals("abc123", &goals);
+    assert!(state.receipt_body("abc123").is_none());
+
+    let receipt = json!({"schema": "frama-c-mcp.proof-receipt", "sha256": "abc123"});
+    state.remember_receipt("abc123", &goals, receipt.clone());
+    assert_eq!(state.receipt_body("abc123"), Some(&receipt));
+}
+
 #[test]
 fn proofread_report_sorts_by_severity_then_file_line() {
     let report = proofread_report(vec![
