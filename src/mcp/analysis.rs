@@ -2497,6 +2497,22 @@ pub fn profile_covers_exactly(requested: &[String], declared: &[String]) -> bool
     requested == declared
 }
 
+/// Whether the main project was loaded with the inputs a profile declares.
+///
+/// An empty source list means the profile does not constrain sources; the
+/// other fields are exactly the defaults `reload_project` applies from it.
+pub fn profile_matches_loaded_project(
+    profile: &crate::state::VerificationProfile,
+    files: &[String],
+    options: &ProjectLoadOptions,
+) -> bool {
+    (profile.sources.is_empty() || profile.sources == files)
+        && profile.include_paths == options.include_paths
+        && profile.defines == options.defines
+        && profile.force_includes == options.force_includes
+        && profile.machdep == options.machdep
+}
+
 #[tool_router(router = analysis_router, vis = "pub(crate)")]
 impl FramaCMcpServer {
     fn expand_eva_profile(
@@ -3844,11 +3860,24 @@ impl FramaCMcpServer {
     async fn apply_verify_profile(
         &self,
         params: &mut RunWpParams,
+        verify_loaded_project: bool,
     ) -> Result<Option<serde_json::Value>, McpError> {
         let Some(name) = params.verify_profile.clone() else {
             return Ok(None);
         };
         let profile = self.verify_profile_named(&name).await?;
+        if verify_loaded_project {
+            let state = self.main_frama_c_state.lock().await;
+            let state = state.as_ref().ok_or_else(no_project_loaded_err)?;
+            if !profile_matches_loaded_project(&profile, &state.files, &state.project_options) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "verify_profile \"{name}\" does not match the loaded project. Reload its sources and load settings before using it as proof evidence."
+                    ),
+                    None,
+                ));
+            }
+        }
         if !profile.functions.is_empty() {
             if let Some(functions) = &params.functions {
                 if !profile_covers_exactly(functions, &profile.functions) {
@@ -3895,7 +3924,7 @@ impl FramaCMcpServer {
     ) -> Result<CallToolResult, McpError> {
         match run_wp_target_scope(&params)? {
             RunWpScope::Sandbox => {
-                let profile_applied = self.apply_verify_profile(&mut params).await?;
+                let profile_applied = self.apply_verify_profile(&mut params, false).await?;
                 return Ok(with_verify_profile(
                     self.run_wp_on_sandbox(&params).await?,
                     profile_applied,
@@ -3917,8 +3946,15 @@ impl FramaCMcpServer {
         // abandoning. Before everything else, because a run under this server's
         // defaults is not evidence about a target that declares its own model,
         // and naming a profile is how those values arrive together rather than
-        // one transcription at a time.
-        let profile_applied = self.apply_verify_profile(&mut params).await?;
+        // one transcription at a time. Keep the project from changing between
+        // profile validation and the profiled run. Unprofiled isolated retries
+        // retain their old parallel path below.
+        let profile_wp_guard = if params.verify_profile.is_some() {
+            Some(self.main_wp_lock.lock().await)
+        } else {
+            None
+        };
+        let profile_applied = self.apply_verify_profile(&mut params, true).await?;
 
         // Check project lock for main instance WP
         if *self.project_locked.read().await {
@@ -3967,7 +4003,11 @@ impl FramaCMcpServer {
         // two concurrent runs overwrite each other's config mid-flight and each
         // reports the union of both runs' goals. cancel_wp_queue takes no lock,
         // so a run stuck in drain can still be cancelled.
-        let _wp_op_guard = self.main_wp_lock.lock().await;
+        let _wp_op_guard = if profile_wp_guard.is_none() {
+            Some(self.main_wp_lock.lock().await)
+        } else {
+            None
+        };
 
         // Rechecked under the lock: verify_program_step can set the flag while
         // this call waits for a run ahead of it, and the check at the top of
@@ -4138,13 +4178,13 @@ impl FramaCMcpServer {
         // records the model this ran under, and what this adds is which target
         // that model was supposed to belong to, and the command that decides
         // for it. A caller reading only the goals should not have to remember
-        // either.
-        // Written into the payload directly. The helper below exists for the
-        // two exits that only ever hold a CallToolResult; here the value is a
-        // Value one line up, and going through the envelope would pretty-print
-        // the whole WP document, drop the string, and print it again to add
-        // one key. json_result's own comment is about not copying this tree
-        // once, so doing it twice for a key insert is the cost it warns about.
+        // either. Written into the payload directly. The helper below exists
+        // for the two exits that only ever hold a CallToolResult; here the
+        // value is a Value one line up, and going through the envelope would
+        // pretty-print the whole WP document, drop the string, and print it
+        // again to add one key. json_result's own comment is about not copying
+        // this tree once, so doing it twice for a key insert is the cost it
+        // warns about.
         if let Some(profile) = profile_applied {
             if let Some(object) = response.as_object_mut() {
                 object.insert("verify_profile".to_string(), profile);

@@ -1276,6 +1276,7 @@ pub fn wp_run_response(
     proofread_report: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let model = params.model.as_deref().unwrap_or(default_wp_model());
+
     // Reported as the list it names, in either spelling. Echoing the singular
     // argument verbatim would print "alt-ergo,z3" beside an effective list of
     // two, and every sibling block here pairs requested with effective in one
@@ -1394,6 +1395,7 @@ fn requested_wp_provers(params: &RunWpParams) -> Result<Option<Vec<String>>, Mcp
             None,
         ));
     }
+
     // The singular argument is comma-separated, which is what -wp-prover and
     // FRAMAC_PROVERS both accept and what parse_wp_provers already does with
     // the environment. Wrapping it whole in a one-element list made

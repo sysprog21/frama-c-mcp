@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
-use frama_c_mcp::mcp::server::analysis::profile_covers_exactly;
+use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
 
@@ -2135,8 +2135,8 @@ fn a_comma_separated_prover_argument_names_each_of_them() {
         Some(vec!["alt-ergo".to_string(), "z3".to_string()])
     );
 
-    // One name still means one prover, and the singular argument still does
-    // not select the isolated per-prover path.
+    // One name still means one prover, and the singular argument still does not
+    // select the isolated per-prover path.
     let single = RunWpParams {
         prover: Some("z3".to_string()),
         ..RunWpParams::default()
@@ -2187,4 +2187,26 @@ fn a_profile_matches_a_sandbox_target_by_its_bare_name() {
         ],
         &declared
     ));
+}
+
+#[test]
+fn a_profile_only_labels_its_loaded_project() {
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        include_paths: vec!["include".into()],
+        defines: vec!["TARGET=1".into()],
+        force_includes: vec!["target.h".into()],
+        machdep: Some("x86_64".into()),
+        ..Default::default()
+    };
+    let options = ProjectLoadOptions {
+        include_paths: vec!["include".into()],
+        defines: vec!["TARGET=1".into()],
+        force_includes: vec!["target.h".into()],
+        machdep: Some("x86_64".into()),
+        ..Default::default()
+    };
+    assert!(profile_matches_loaded_project(&profile, &["src/target.c".into()], &options));
+    assert!(!profile_matches_loaded_project(&profile, &["src/other.c".into()], &options));
+    assert!(!profile_matches_loaded_project(&profile, &["src/target.c".into()], &ProjectLoadOptions::default()));
 }

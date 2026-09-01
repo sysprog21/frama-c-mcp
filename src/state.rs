@@ -261,6 +261,7 @@ pub fn parse_verification_profiles(
     for (name, body) in object {
         let mut profile: VerificationProfile = serde_json::from_value(body.clone())
             .map_err(|e| format!("profile \"{name}\": {e}"))?;
+
         // Function and prover names are trimmed, and one that is nothing but
         // padding is refused. The remaining lists contain command arguments or
         // paths, whose spelling must be left for their later validation.
@@ -269,8 +270,8 @@ pub fn parse_verification_profiles(
         // equality later, so " elf_phdr_fetch " would register, match no
         // function all session, and then produce a refusal printing it against
         // the name it differs from only by two spaces. Trimming is what the
-        // prover argument already does with the same kind of input, and a
-        // blank left after it was a build system emitting nothing by accident.
+        // prover argument already does with the same kind of input, and a blank
+        // left after it was a build system emitting nothing by accident.
         for (field, entries) in [
             ("functions", &mut profile.functions),
             ("provers", &mut profile.provers),

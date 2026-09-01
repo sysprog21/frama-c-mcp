@@ -194,7 +194,8 @@ pub struct ReloadProjectParams {
     /// force_includes, provers, timeout_seconds and reproduce. Registered for
     /// the session; passing it again replaces the set.
     pub verify_profiles: Option<serde_json::Value>,
-    /// Where verify_profiles came from, recorded so a later reader can re-run it
+    /// Where verify_profiles came from, recorded so a later reader can re-run
+    /// it
     /// rather than trust the copy.
     pub verify_profiles_source: Option<String>,
     /// Load the sources and preprocessor flags of a registered profile. Any
