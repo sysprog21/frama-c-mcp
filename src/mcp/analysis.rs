@@ -1607,11 +1607,11 @@ pub fn ast_diagnostic_gaps(
     // which is what lets the zero-count branch below skip a category instead of
     // having to hedge it, and it is what keeps two checks of one session
     // reporting the same codes: an entry that appeared only on the second would
-    // move proof_receipt.sha256, since the receipt digests incomplete.
-    // A record that says why it is empty is a finding rather than silence.
-    // Reading it as a clean parse would let check answer "proved" on the one
-    // shape where nothing established that the analyzed program is the
-    // compiled one, which is the claim these codes exist to make.
+    // move proof_receipt.sha256, since the receipt digests incomplete. A record
+    // that says why it is empty is a finding rather than silence. Reading it as
+    // a clean parse would let check answer "proved" on the one shape where
+    // nothing established that the analyzed program is the compiled one, which
+    // is the claim these codes exist to make.
     if let Some(reason) = diagnostics["unavailable"].as_str() {
         incomplete.push(json!({
             "code": incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE,
@@ -1642,6 +1642,7 @@ pub fn ast_diagnostic_gaps(
             }));
             continue;
         }
+
         // A classified category left the loop above, so the only thing that
         // keeps one out of the aggregate here is a row saying why its silence
         // is deliberate.
@@ -4220,22 +4221,102 @@ impl FramaCMcpServer {
 
         // Add `goal_kind` and (if any) `hash_label` to each goal, so callers
         // can distinguish spec, source assert, and RTE failures.
-        let augmented: Vec<serde_json::Value> = selected
+        let mut advice_seen: BTreeMap<String, (String, serde_json::Value)> = BTreeMap::new();
+        let mut augmented: Vec<serde_json::Value> = selected
             .into_iter()
             .map(|mut g| {
                 add_identity_fields(&mut g);
                 enrich_goal_with_property_status(&mut g, &properties_by_marker);
                 finish_goal(&mut g, &goals_by_marker, stable_scope.as_deref());
-                let failure_classification = goal_needs_failure_classification(&g)
-                    .then(|| classify_wp_failure_from_goal(&g, function));
-                if let Some(obj) = g.as_object_mut() {
-                    if let Some(classification) = failure_classification {
-                        obj.insert("failure_classification".to_string(), classification);
+
+                // The goal keeps what is its own. The advice, which is a
+                // function of category and goal kind rather than of the goal,
+                // rides on the first goal of each pair and the rest name it by
+                // key. Attaching the whole classification per goal is what made
+                // a legitimately-stuck function unreadable: 21 goals, 147 KB,
+                // of which the duplicated advice was 106 KB, against 1.7 KB of
+                // triage fields and two distinct categories underneath.
+                //
+                // An earlier attempt capped how many goals carried the block,
+                // which still duplicated up to the cap and dropped advice past
+                // it. A second appended the advice as one extra array element,
+                // which is worse: every element of this array is a goal, and
+                // three stdio tests walk it expecting that. Carrying it on a
+                // real goal keeps the contract and still emits each advice
+                // once.
+                if goal_needs_failure_classification(&g) {
+                    let classification = classify_wp_failure_from_goal(&g, function);
+                    let (mut per_goal, key, advice) = split_goal_classification(&classification);
+                    match g.get("stable_goal_id").and_then(|value| value.as_str()) {
+                        Some(id) => {
+                            let id = id.to_string();
+                            advice_seen
+                                .entry(key)
+                                .and_modify(|(carrier, _)| {
+                                    // Smallest stable id wins, not first
+                                    // encountered. Two identical runs must
+                                    // produce one receipt, and "first" makes
+                                    // the payload depend on an order this
+                                    // function does not fix:
+                                    // two_identical_runs_produce_one_receipt
+                                    // caught exactly that.
+                                    if id < *carrier {
+                                        *carrier = id.clone();
+                                    }
+                                })
+                                .or_insert_with(|| (id, advice));
+                        }
+                        None => {
+                            // finish_goal gives every goal an id, so this is
+                            // unreachable today. It is written out anyway
+                            // because the second pass finds the carrier by id:
+                            // a goal without one could win the election and
+                            // then never be found again, and the advice for its
+                            // whole key would vanish with no diagnostic.
+                            // Duplication is the thing this split exists to
+                            // reduce, and it is still the better failure.
+                            if let Some(obj) = per_goal.as_object_mut() {
+                                obj.insert("advice".to_string(), advice);
+                            }
+                        }
+                    }
+                    if let Some(obj) = g.as_object_mut() {
+                        obj.insert("failure_classification".to_string(), per_goal);
                     }
                 }
                 g
             })
             .collect();
+
+        // Attached in a second pass, to the goal each key elected above. It
+        // cannot be folded into the pass above: which goal carries a key is not
+        // known until every goal has been classified.
+        for goal in augmented.iter_mut() {
+            // Borrowed only for as long as it takes to decide, so the insert
+            // below can take the goal mutably.
+            let advice = {
+                let Some(id) = goal.get("stable_goal_id").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let Some(key) = goal
+                    .get("failure_classification")
+                    .and_then(|c| c.get("advice_key"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                match advice_seen.get(key) {
+                    Some((carrier, advice)) if carrier.as_str() == id => advice.clone(),
+                    _ => continue,
+                }
+            };
+            if let Some(obj) = goal
+                .get_mut("failure_classification")
+                .and_then(|c| c.as_object_mut())
+            {
+                obj.insert("advice".to_string(), advice);
+            }
+        }
 
         Ok(json!(augmented))
     }

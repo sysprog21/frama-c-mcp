@@ -8830,3 +8830,195 @@ async fn a_respawn_reports_the_new_process_parse() {
     assert_eq!(category_count(&respawned, "kernel:asm:clobber"), 2, "{respawned}");
     let _ = client.cancel().await;
 }
+
+#[tokio::test]
+/// The advice block rides one goal per category, over the wire.
+///
+/// The split was unit-tested on split_goal_classification alone, which is the
+/// same shape of evidence that let an earlier round of this work ship a
+/// regression: a change reasoned about from the outside, confirmed against a
+/// function rather than against the server. So this measures the assembled
+/// payload a client actually receives.
+///
+/// Writing it found two things a unit test could not. The split does hold end
+/// to end. And it saves less than it looks, because suggested_next_tool.reason
+/// and next_action.reason still carry the same advice text on every goal, and
+/// those stay per-goal on purpose. The second assertion below pins that number
+/// so the gap is a measurement rather than a belief.
+async fn advice_is_carried_once_per_category_over_the_wire() {
+    // 16 classified goals collapsing to 4 keys when this was written, which is
+    // what makes the duplication visible; a fixture with one failure would pass
+    // either way.
+    let c_file = workspace_path("tests/fixtures/bubble_sort.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    call_tool_json(&client, "run_wp", json!({"timeout": 5}))
+        .await
+        .unwrap();
+
+    // The receipt's goal array is ids and statuses only, by design: it is what
+    // two runs are compared on. The classification the split is about rides
+    // get_wp_goals, so that is what a client sees and what this measures.
+    let listed = call_tool_json(&client, "get_wp_goals", json!({"function": "bubble_sort"}))
+        .await
+        .unwrap();
+    let goals = listed
+        .as_array()
+        .expect("get_wp_goals returns a goal array");
+
+    let classified: Vec<&serde_json::Value> = goals
+        .iter()
+        .filter_map(|g| g.get("failure_classification"))
+        .collect();
+    assert!(
+        classified.len() >= 8,
+        "this fixture is here for its several failures, and it has {}",
+        classified.len()
+    );
+
+    // The fact the rte guidance rests on, pinned where it can be checked. The
+    // advice tells a caller to read the goal's own predicate rather than fetch
+    // it with context {want: ["rte_obligations"]}, and that is only true while
+    // every goal carries one. An earlier round of this work got it backwards,
+    // and nothing end to end would have caught it.
+    let without: Vec<&str> = goals
+        .iter()
+        .filter(|g| g.get("predicate").and_then(|p| p.as_str()).is_none())
+        .filter_map(|g| g["wpo"].as_str())
+        .collect();
+    assert!(
+        without.is_empty(),
+        "the rte advice says to read the goal's predicate, and {} of {} carry \
+         none: {without:?}. Either restore it or change the advice.",
+        without.len(),
+        goals.len()
+    );
+
+    let mut keys = std::collections::BTreeSet::new();
+    let mut carriers = 0usize;
+    for c in &classified {
+        keys.insert(
+            c["advice_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every classified goal names its advice: {c}"))
+                .to_string(),
+        );
+        if c.get("advice").is_some() {
+            carriers += 1;
+        }
+    }
+    assert!(
+        keys.len() < classified.len(),
+        "with {} goals collapsing to {} keys there is nothing to demonstrate",
+        classified.len(),
+        keys.len()
+    );
+    assert_eq!(
+        carriers,
+        keys.len(),
+        "one carrier per key, not {carriers} across {} keys",
+        keys.len()
+    );
+
+    // What it saves, against the shape it replaced: the same advice on every
+    // goal. Compared rather than asserted as a byte count, so a fixture or a
+    // wording change moves both sides together.
+    let advice: std::collections::BTreeMap<&str, &serde_json::Value> = classified
+        .iter()
+        .filter(|c| c.get("advice").is_some())
+        .map(|c| (c["advice_key"].as_str().unwrap(), &c["advice"]))
+        .collect();
+    let actual = serde_json::to_string(&classified).unwrap().len();
+
+    // Every goal would carry its key's advice, so the counterfactual is what is
+    // sent now plus one copy for each goal that does not hold one.
+    let unsplit = actual
+        + classified
+            .iter()
+            .filter(|c| c.get("advice").is_none())
+            .map(|c| {
+                let key = c["advice_key"].as_str().unwrap();
+                serde_json::to_string(advice[key]).unwrap().len()
+            })
+            .sum::<usize>();
+    assert!(
+        actual * 4 < unsplit * 3,
+        "the split must cut at least a quarter here: {actual} against {unsplit} unsplit"
+    );
+
+    // And the part it does not save. Both reasons restate the advice per goal,
+    // and they are pinned per-goal by an older test, so this is the ceiling on
+    // what the split can do rather than a defect to fix here.
+    let reasons: usize = classified
+        .iter()
+        .map(|c| {
+            c["suggested_next_tool"]["reason"]
+                .as_str()
+                .unwrap_or("")
+                .len()
+                + c["next_action"]["reason"].as_str().unwrap_or("").len()
+        })
+        .sum();
+    assert!(
+        reasons > (unsplit - actual) / 4,
+        "the per-goal reasons are the remaining duplication, and they are \
+         {reasons} bytes against {} hoisted; if that has changed, \
+         re-read whether the split is still where the payload goes",
+        unsplit - actual
+    );
+    eprintln!(
+        "advice split: {} goals, {} keys, {actual} bytes assembled against \
+         {unsplit} unsplit, {reasons} still repeated in the two reasons",
+        classified.len(),
+        keys.len()
+    );
+
+    // What truncating each reason to its first sentence would save. Reported
+    // rather than acted on, because the saving was measured and the change was
+    // then rejected on the text: 12888 bytes against 5976, so about 18 percent
+    // of the whole payload, but for several categories the first sentence is a
+    // diagnosis rather than an action. "Two different faults share this
+    // branch." and "The callee's requires is not established at this call."
+    // both put the thing to do in the second sentence, so a caller reading one
+    // goal would be left with a finding and no next step. The number is kept so
+    // the next person weighing this starts from it instead of re-measuring.
+    let first_sentence_bytes: usize = classified
+        .iter()
+        .map(|c| {
+            let one = |field: &str| {
+                let text = c[field]["reason"].as_str().unwrap_or("");
+                text.find(". ").map_or(text.len(), |end| end + 1)
+            };
+            one("suggested_next_tool") + one("next_action")
+        })
+        .sum();
+    eprintln!(
+        "reason ceiling: {reasons} bytes now, {first_sentence_bytes} if each \
+         reason stopped at its first sentence"
+    );
+
+    // The budget this whole split exists to defend. A classified goal costs
+    // what it costs; what broke before was guidance text growing inside
+    // failure_classification with nothing measuring it, so the growth reached a
+    // real function as an unreadable reply rather than as a failing test.
+    //
+    // Calibrated against the regression it exists to catch, not just against
+    // today's figure. 37431 bytes over 16 goals is 2340 per goal. The round of
+    // guidance edits that caused this added 641 bytes per goal, which lands at
+    // 2981, so a ceiling of 3000 would have let through the very thing it was
+    // written for. 2600 keeps about 11 percent of headroom and still fails on
+    // an addition that size. Rerun this test to see the current figure in the
+    // line above. Raising the ceiling is a legitimate change; doing it without
+    // noticing is the one this stops.
+    let per_goal = actual / classified.len();
+    assert!(
+        per_goal < 2600,
+        "a classified goal costs {per_goal} bytes, over the 2600 this test \
+         records. Something added text to failure_classification: either hoist \
+         it into the advice block, which is sent once per category, or raise \
+         this ceiling deliberately and say in the commit message what a caller \
+         gets for the extra bytes."
+    );
+
+    let _ = client.cancel().await;
+}

@@ -215,6 +215,103 @@ fn remembering_goals_first_then_body_keeps_both() {
     assert_eq!(state.receipt_body("abc123"), Some(&receipt));
 }
 
+/// Advice is a function of category and goal kind, so it belongs once per pair
+/// and not once per goal. This is the property that keeps a legitimately-stuck
+/// function readable: measured before the split, 21 unproved goals carried
+/// 106 KB of duplicated advice between them and shared two categories.
+#[test]
+fn splitting_a_classification_keeps_the_goal_half_small() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let (per_goal, key, advice) = split_goal_classification(&classification);
+
+    // The verdict stays on the goal: callers key on it, the stdio suite
+    // included.
+    assert_eq!(per_goal["category"], "timeout");
+    assert_eq!(per_goal["goal_kind"], "rte_mem_access");
+    assert!(per_goal["evidence"].is_array());
+    assert_eq!(per_goal["advice_key"], key);
+
+    // The rendered one-finding report does not: its fields are already on the
+    // goal and the rest is a markdown rendering of them. Nor does the E-ACSL
+    // advice, which appeared three times in one goal before this.
+    assert!(
+        per_goal.get("proofread_report").is_none(),
+        "the per-goal half must not carry the report: {per_goal}"
+    );
+    assert!(
+        per_goal.get("runtime_check_suggestion").is_none(),
+        "the E-ACSL advice is identical everywhere and belongs in the shared half"
+    );
+    assert!(
+        per_goal["suggested_next_tool"]
+            .get("runtime_check_suggestion")
+            .is_none(),
+        "and its copy nested inside next_action goes with it"
+    );
+
+    // What the stdio suite reads per goal stays per goal.
+    assert!(per_goal["suggested_next_tool"]["tool"].as_str().is_some());
+    assert!(
+        per_goal["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
+            .as_bool()
+            .is_some()
+    );
+
+    // Measured rather than aspired to: 2015 bytes against 5706 on this goal, so
+    // a little over a third. The rest is what the shared half now carries once.
+    // A tighter ratio is not available without moving suggested_next_tool or
+    // wp_timeout_triage, and the stdio suite reads both per goal.
+    let goal_bytes = serde_json::to_string(&per_goal).unwrap().len();
+    let whole_bytes = serde_json::to_string(&classification).unwrap().len();
+    assert!(
+        goal_bytes * 2 < whole_bytes,
+        "the per-goal half should be well under half the whole: {goal_bytes} \
+         against {whole_bytes}. A bare goal_bytes < whole_bytes would hold by \
+         construction, since the per-goal half is the whole with keys removed, \
+         so the factor is what makes this an assertion. If it trips, read the \
+         two numbers before changing it: a per-goal half that grew is the \
+         regression this guards, while a shared half that shrank means the \
+         split has stopped paying and the factor is what should move."
+    );
+
+    // The advice keeps what a caller acts on.
+    assert!(advice["suggested_fix"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert!(advice["why_problem"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+/// Two goals of one category and kind share an advice key, and two of
+/// different kinds do not: a timed-out rte obligation and a timed-out
+/// postcondition are told different things.
+#[test]
+fn advice_key_groups_by_category_and_kind() {
+    let of = |kind: &str| {
+        let c = classify_wp_failure_from_goal(
+            &json!({
+                "name": "g",
+                "goal_kind": kind,
+                "normalized_status": "timeout",
+                "source_location": {"file": "src.c", "line": 1, "column": 1}
+            }),
+            Some("f"),
+        );
+        split_goal_classification(&c).1
+    };
+    assert_eq!(of("rte_mem_access"), of("rte_mem_access"));
+    assert_ne!(of("rte_mem_access"), of("ensures"));
+}
+
 #[test]
 fn proofread_report_sorts_by_severity_then_file_line() {
     let report = proofread_report(vec![
@@ -1840,4 +1937,94 @@ fn ast_digest_separates_runs_that_goal_counts_cannot() {
     let unknown_b = build(serde_json::Value::Null);
     assert!(unknown_a["subject"]["ast_digest"].is_null());
     assert_ne!(unknown_a["sha256"], unknown_b["sha256"]);
+}
+
+/// An open runtime-error check has to name the tool that says which check it
+/// is. The goal name does not: mem_access_7 counts siblings generated from one
+/// statement, so a function holding several open checks on one line is
+/// indistinguishable from the goal list alone, and the next step without this
+/// pointer is to guess an invariant and re-prove, which costs a run per guess
+/// and does not converge.
+#[test]
+fn rte_finding_points_at_the_obligation_reader() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "unknown",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let finding = &classification["proofread_report"]["findings"][0];
+    assert_eq!(finding["category"], "rte");
+
+    // The predicate is on the goal already: measured, 21 of 21 goals from
+    // get_wp_goals carried one. Guidance that sends a caller elsewhere to find
+    // it is wrong about its own payload, which is what the first version of
+    // this advice got wrong.
+    let fix = finding["suggested_fix"].as_str().unwrap();
+    assert!(
+        fix.contains("predicate"),
+        "rte guidance must point at the goal's own predicate: {fix}"
+    );
+    assert!(
+        !fix.contains("returns the open predicate"),
+        "rte_obligations must not be described as the way to see the predicate: {fix}"
+    );
+    let why = finding["why_problem"].as_str().unwrap();
+    assert!(
+        why.contains("predicate"),
+        "the short form must say so too, since a caller may render only that: {why}"
+    );
+}
+
+/// A runtime-error check that times out is classified as a timeout, not as an
+/// rte, so it would otherwise get only the generic "retry, then read the VC".
+/// That is the shape most likely to strand a caller: retried at six times the
+/// budget it does not move, and the goal name alone cannot say which access is
+/// open, so the next thing tried is a guessed invariant.
+#[test]
+fn timed_out_rte_goal_still_names_the_obligation_reader() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let finding = &classification["proofread_report"]["findings"][0];
+    assert_eq!(finding["category"], "timeout");
+
+    let fix = finding["suggested_fix"].as_str().unwrap();
+    assert!(
+        fix.contains("retry_unproved"),
+        "the retry-first instruction must survive: {fix}"
+    );
+    assert!(
+        fix.contains("predicate"),
+        "a timed-out rte goal must still say where the predicate is: {fix}"
+    );
+}
+
+/// The non-rte timeout keeps the generic wording: there is no obligation
+/// reader for a postcondition, so pointing at one would be wrong.
+#[test]
+fn timed_out_non_rte_goal_keeps_the_generic_advice() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "post_condition",
+            "goal_kind": "ensures",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 7, "column": 1}
+        }),
+        Some("f"),
+    );
+    let fix = classification["proofread_report"]["findings"][0]["suggested_fix"]
+        .as_str()
+        .unwrap();
+    assert!(fix.contains("retry_unproved"));
+    assert!(!fix.contains("rte_obligations"));
 }

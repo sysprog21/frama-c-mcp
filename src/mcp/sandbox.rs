@@ -50,7 +50,12 @@ impl FramaCMcpServer {
     }
 
     #[tool(description = "Create a sandbox Frama-C instance for one function and its dependencies. \
-        Pass experiment_id for a stable sandbox name; omitted IDs are generated and collisions are rejected.")]
+        Pass experiment_id for a stable sandbox name; omitted IDs are generated and collisions are rejected. \
+        This is how an annotation is tried without touching the real source: the sandbox holds its own \
+        copy of the function and its dependencies, so a loop invariant that makes WP diverge costs a \
+        respawn rather than the session, and a strengthening that does not work leaves no edit to revert. \
+        Copying the source tree by hand does the same thing worse: the copy is not addressable by name, \
+        nothing reloads it, and the goals it produces cannot be diffed against the main project.")]
     pub async fn create_sandbox(
         &self,
         Parameters(params): Parameters<CreateSandboxParams>,
