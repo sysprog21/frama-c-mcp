@@ -2264,6 +2264,15 @@ pub struct FramaCMcpServer {
     sandboxes: Arc<RwLock<SandboxRegistry>>,
     /// Maximum concurrent sandboxes
     max_sandboxes: usize,
+    /// How many parse probes may run at once, for the whole server rather than
+    /// for one call.
+    ///
+    /// A per-call pool composes with nothing: two concurrent parse_surface
+    /// calls double it, and a session already holding max_sandboxes Frama-C
+    /// children pays for both. Each front end is a few hundred megabytes, so
+    /// the number that matters is how many exist, not how many one request
+    /// asked for.
+    parse_probe_slots: Arc<tokio::sync::Semaphore>,
     /// Path to frama-c binary (for spawning sandbox instances + main)
     frama_c_path: String,
     /// The directory holding the AST printed for the most recent run_e_acsl
@@ -2937,6 +2946,11 @@ impl FramaCMcpServer {
             state,
             sandboxes: Arc::new(RwLock::new(SandboxRegistry::default())),
             max_sandboxes,
+            parse_probe_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism()
+                    .map(|cores| cores.get().min(project::PARSE_PROBE_MAX_PARALLEL))
+                    .unwrap_or(2),
+            )),
             frama_c_path,
             current_ast_dir: Arc::new(AsyncMutex::new(None)),
             current_check_source_dir: Arc::new(AsyncMutex::new(None)),

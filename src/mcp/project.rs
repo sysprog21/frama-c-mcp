@@ -1003,10 +1003,9 @@ impl FramaCMcpServer {
         // One process per file, several at a time. The probes are independent
         // and each is short, but a serial sweep of a real tree is minutes of
         // wall clock for a question asked while waiting on the answer.
-        let limit = std::thread::available_parallelism()
-            .map(|cores| cores.get().min(PARSE_SURFACE_MAX_PARALLEL))
-            .unwrap_or(2);
-        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+        // The server's pool, not this call's. Two concurrent sweeps must not
+        // double the number of Frama-C children that exist.
+        let permits = self.parse_probe_slots.clone();
         let mut probes = tokio::task::JoinSet::new();
         for (index, file) in files.iter().enumerate() {
             let permits = permits.clone();
@@ -1170,9 +1169,10 @@ fn validate_cpp_entries(entries: &[String], complaint: &'static str) -> Result<(
     Ok(())
 }
 
-/// Parse probes running at once. One Frama-C front end is cheap, a tree's worth
-/// in series is not, and a machine's worth at once helps nobody.
-pub const PARSE_SURFACE_MAX_PARALLEL: usize = 8;
+/// Parse probes running at once, across the whole server. One Frama-C front
+/// end is cheap, a tree's worth in series is not, and a machine's worth at once
+/// helps nobody.
+pub const PARSE_PROBE_MAX_PARALLEL: usize = 8;
 
 /// What one file did.
 #[derive(Debug, Clone, PartialEq, Eq)]
