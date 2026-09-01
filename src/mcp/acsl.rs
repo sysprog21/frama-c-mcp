@@ -310,26 +310,29 @@ pub fn loop_annots_to_acsl(
         }
     }
 
-    // loop variant: Option<{acsl, behavior?}>
-    if let Some(var) = annot.get("variant") {
-        // Skip if explicitly null or missing acsl
-        if !var.is_null() {
-            let body = var.get("acsl").and_then(|x| x.as_str()).unwrap_or("");
-            if !body.trim().is_empty() {
-                let behavior = var.get("behavior").and_then(|x| x.as_str());
-                let path = format!("proposed_loop_annots[{}].variant", i);
-                match wrap_loop_clause("loop variant", body, behavior, behaviors, &path) {
-                    Ok(acsl_text) => result.push(Ok((
-                        acsl_text,
-                        "annot".to_string(),
-                        path,
-                        stmt_id,
-                        format!("{} variant", loop_label),
-                        Some(format!("{}_variant", base_label)),
-                    ))),
-                    Err(msg) => result.push(Err((path, msg))),
-                }
-            }
+    // loop variant: Option<{acsl, behavior?}> Explicitly null, missing, or
+    // blank acsl all mean the same thing here: no variant was proposed. Asked
+    // as one question so the wrapping below is not three branches deep.
+    let variant_body = annot
+        .get("variant")
+        .filter(|var| !var.is_null())
+        .and_then(|var| var.get("acsl"))
+        .and_then(|x| x.as_str())
+        .filter(|body| !body.trim().is_empty());
+    if let Some(body) = variant_body {
+        let var = &annot["variant"];
+        let behavior = var.get("behavior").and_then(|x| x.as_str());
+        let path = format!("proposed_loop_annots[{}].variant", i);
+        match wrap_loop_clause("loop variant", body, behavior, behaviors, &path) {
+            Ok(acsl_text) => result.push(Ok((
+                acsl_text,
+                "annot".to_string(),
+                path,
+                stmt_id,
+                format!("{} variant", loop_label),
+                Some(format!("{}_variant", base_label)),
+            ))),
+            Err(msg) => result.push(Err((path, msg))),
         }
     }
 

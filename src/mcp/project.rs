@@ -65,6 +65,7 @@ fn log_location(source: &str, cwd: &Path) -> serde_json::Value {
     if source.is_empty() {
         return json!({"unresolved": true});
     }
+
     // Frama-C prints "path", "path:line" or "path:line:column", so the numbers
     // come off the end one at a time and what is left is the path. A trailing
     // field that is not a number means the whole string is the path: a path can

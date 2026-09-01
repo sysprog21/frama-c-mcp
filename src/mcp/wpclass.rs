@@ -1307,10 +1307,11 @@ pub fn wp_backend_diagnosis(
             // second. The routing decision only asks whether the list is
             // non-empty, which is unaffected; a reader chasing every cast wants
             // the source, not this field.
-            if let Some(line) = message.pointer("/source/line") {
-                if !cast_lines.contains(line) {
-                    cast_lines.push(line.clone());
-                }
+            if let Some(line) = message
+                .pointer("/source/line")
+                .filter(|line| !cast_lines.contains(*line))
+            {
+                cast_lines.push(line.clone());
             }
         }
     }

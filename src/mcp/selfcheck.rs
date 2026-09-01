@@ -603,6 +603,19 @@ pub fn min_frama_c_version() -> String {
     format!("{}.{}", MIN_FRAMA_C_VERSION.0, MIN_FRAMA_C_VERSION.1)
 }
 
+/// The digit run at the front of an iterator, consumed from it.
+///
+/// Peeked rather than collected, so the first non-digit is left for the caller
+/// to see: the minor number ends at whatever follows it and that character is
+/// still part of the banner.
+fn take_digits(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) -> String {
+    let mut run = String::new();
+    while chars.peek().is_some_and(char::is_ascii_digit) {
+        run.push(chars.next().unwrap_or_default());
+    }
+    run
+}
+
 /// Major and minor version out of a "frama-c -version" banner, or None when it
 /// holds no version-shaped number outside parentheses.
 ///
@@ -646,10 +659,7 @@ pub fn frama_c_version(banner: &str) -> Option<(u32, u32)> {
         if !digits.is_empty() {
             let value = digits.parse::<u32>().ok();
             if ch == '.' {
-                let mut minor = String::new();
-                while chars.peek().is_some_and(char::is_ascii_digit) {
-                    minor.push(chars.next().unwrap_or_default());
-                }
+                let minor = take_digits(&mut chars);
                 return value.map(|major| (major, minor.parse::<u32>().unwrap_or(0)));
             }
             undotted = undotted.or(value);

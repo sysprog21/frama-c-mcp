@@ -445,18 +445,17 @@ fn result_values_determined(texts: &[String]) -> std::collections::BTreeSet<i64>
             let rhs = text[after..].trim_start();
             let equality_on_the_right =
                 rhs.strip_prefix("==").is_some_and(|rest| !rest.starts_with('>'));
-            if equality_on_the_right {
-                let off = after + (text[after..].len() - rhs.len()) + 2;
-                if let Some(v) = int_literal_after(text, off) {
-                    out.insert(v);
-                }
-            }
-            if text[..at].trim_end().ends_with("==") {
-                let lhs = text[..at].trim_end();
-                if let Some(v) = int_literal_before(text, lhs.len() - 2) {
-                    out.insert(v);
-                }
-            }
+            let on_the_right = equality_on_the_right
+                .then(|| after + (text[after..].len() - rhs.len()) + 2)
+                .and_then(|off| int_literal_after(text, off));
+            out.extend(on_the_right);
+
+            let lhs = text[..at].trim_end();
+            let on_the_left = lhs
+                .ends_with("==")
+                .then(|| int_literal_before(text, lhs.len() - 2))
+                .flatten();
+            out.extend(on_the_left);
             from = after;
         }
     }

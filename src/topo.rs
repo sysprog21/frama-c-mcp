@@ -76,12 +76,14 @@ pub fn compute_topological_order(vertices: &[String], edges: &[(String, String)]
         }
         let mut next_ready: Vec<NodeIndex> = vec![];
         for &g in &ready {
-            for caller in condensed.neighbors_directed(g, Direction::Incoming) {
+            let callers = condensed.neighbors_directed(g, Direction::Incoming);
+            next_ready.extend(callers.filter(|caller| {
+                // Decrementing is the point, not the filter: every caller loses
+                // one outstanding callee here, and the ones that reach zero are
+                // exactly the next level.
                 out_degree[caller.index()] -= 1;
-                if out_degree[caller.index()] == 0 {
-                    next_ready.push(caller);
-                }
-            }
+                out_degree[caller.index()] == 0
+            }));
         }
         ready = next_ready;
         current_level += 1;

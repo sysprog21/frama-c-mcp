@@ -1233,6 +1233,47 @@ pub fn incomplete_guidance(incomplete: &[serde_json::Value]) -> serde_json::Valu
 /// Returns the goals this pass judged, keyed by WP's obligation id, because
 /// the proofread findings below can only be attributed to a goal that was
 /// judged here.
+/// The gap a goal WP proved can still leave, or None when it leaves none.
+///
+/// Reaching this at all means the property verdict disagreed with the goal,
+/// since a property that consolidated to valid was skipped before the call.
+/// Dead code is one way; resting on an unestablished hypothesis is the other,
+/// and a goal in that second arm used to match neither test and go unreported
+/// with the verdict reading proved over it.
+fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json::Value> {
+    let field = |name: &str| goal.get(name).cloned().unwrap_or_else(|| json!(null));
+    if property_is_dead(goal) {
+        return Some(json!({
+            "code": incomplete_code::PROPERTY_DEAD,
+            "reason": "WP proved this goal, but its property sits in code EVA proved unreachable.",
+            "stable_goal_id": field("stable_goal_id"),
+            "frama_c_goal_name": field("frama_c_goal_name"),
+            "goal_kind": field("goal_kind"),
+            "normalized_status": status,
+            "property_status": field("normalized_property_status"),
+        }));
+    }
+    if goal_is_valid_under_hypotheses(goal) {
+        return Some(json!({
+            "code": incomplete_code::VALID_UNDER_HYP,
+            "reason": "WP proved this goal, but Frama-C consolidated its property as valid only under hypotheses that are not themselves established.",
+            "stable_goal_id": field("stable_goal_id"),
+            "frama_c_goal_name": field("frama_c_goal_name"),
+            "goal_kind": field("goal_kind"),
+            "normalized_status": status,
+            "property_status": field("normalized_property_status"),
+
+            // Which hypotheses, when the goal carries them.
+            // enrich_goal_with_property_status resolves "deps" against the
+            // property table, and naming them is the difference between this
+            // finding and the guess the unproved-assumption finding has to
+            // make.
+            "hypotheses": field("hypotheses"),
+        }));
+    }
+    None
+}
+
 fn wp_goal_gaps<'a>(
     incomplete: &mut Vec<serde_json::Value>,
     eva_alarms: &'a serde_json::Value,
@@ -1310,34 +1351,7 @@ fn wp_goal_gaps<'a>(
             // arm used to match neither test and go unreported, with the
             // verdict reading proved over it.
             if is_proved(status) {
-                if property_is_dead(goal) {
-                    incomplete.push(json!({
-                        "code": incomplete_code::PROPERTY_DEAD,
-                        "reason": "WP proved this goal, but its property sits in code EVA proved unreachable.",
-                        "stable_goal_id": goal.get("stable_goal_id").cloned().unwrap_or_else(|| json!(null)),
-                        "frama_c_goal_name": goal.get("frama_c_goal_name").cloned().unwrap_or_else(|| json!(null)),
-                        "goal_kind": goal.get("goal_kind").cloned().unwrap_or_else(|| json!(null)),
-                        "normalized_status": status,
-                        "property_status": goal.get("normalized_property_status").cloned().unwrap_or_else(|| json!(null)),
-                    }));
-                } else if goal_is_valid_under_hypotheses(goal) {
-                    incomplete.push(json!({
-                        "code": incomplete_code::VALID_UNDER_HYP,
-                        "reason": "WP proved this goal, but Frama-C consolidated its property as valid only under hypotheses that are not themselves established.",
-                        "stable_goal_id": goal.get("stable_goal_id").cloned().unwrap_or_else(|| json!(null)),
-                        "frama_c_goal_name": goal.get("frama_c_goal_name").cloned().unwrap_or_else(|| json!(null)),
-                        "goal_kind": goal.get("goal_kind").cloned().unwrap_or_else(|| json!(null)),
-                        "normalized_status": status,
-                        "property_status": goal.get("normalized_property_status").cloned().unwrap_or_else(|| json!(null)),
-
-                        // Which hypotheses, when the goal carries them.
-                        // enrich_goal_with_property_status resolves "deps"
-                        // against the property table, and naming them is the
-                        // difference between this finding and the guess the
-                        // unproved-assumption finding has to make.
-                        "hypotheses": goal.get("hypotheses").cloned().unwrap_or_else(|| json!(null)),
-                    }));
-                }
+                incomplete.extend(proved_goal_gap(goal, status));
                 continue;
             }
             incomplete.push(json!({
@@ -1473,6 +1487,21 @@ type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
 /// Free-standing so the decision can be tested without a Frama-C instance: the
 /// case that matters most is the one no integration test can stage, a run where
 /// every variant proved and no digest was ever established.
+/// Take "label", or the first "label#n" nobody has taken, and record it.
+///
+/// Looped, not suffixed once: a caller who passes "a" twice and also passes
+/// "a#1" would otherwise get two variants called "a#1", and duplicate_ast
+/// names a label, so it would point at whichever of them landed first.
+fn claim_label(taken: &mut std::collections::HashSet<String>, label: String, from: usize) -> String {
+    if taken.insert(label.clone()) {
+        return label;
+    }
+    (from..)
+        .map(|suffix| format!("{label}#{suffix}"))
+        .find(|candidate| taken.insert(candidate.clone()))
+        .unwrap_or(label)
+}
+
 pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Value {
     let digest_of = |entry: &serde_json::Value| {
         entry
@@ -3083,17 +3112,7 @@ impl FramaCMcpServer {
             // passes "a#1" would otherwise get two variants called "a#1", and
             // duplicate_ast names a label, so it would point at whichever of
             // them landed first.
-            if !labels_seen.insert(label.clone()) {
-                let base = label.clone();
-                let mut suffix = index;
-                loop {
-                    label = format!("{base}#{suffix}");
-                    if labels_seen.insert(label.clone()) {
-                        break;
-                    }
-                    suffix += 1;
-                }
-            }
+            label = claim_label(&mut labels_seen, label, index);
 
             // params starts as base, so Option::or is the override: the
             // variant's value when it set one, the base's otherwise. One

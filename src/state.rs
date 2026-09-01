@@ -133,19 +133,30 @@ pub fn sha256_hex_of_reader(mut reader: impl std::io::Read) -> std::io::Result<(
             break;
         }
         if !may_be_a_directive {
-            for &byte in &buffer[..read] {
-                may_be_a_directive |= byte == b'#'
-                    || (byte == b':' && previous[1] == b'%')
-                    || (byte == b'=' && previous[1] == b'?' && previous[0] == b'?');
-                if may_be_a_directive {
-                    break;
-                }
-                previous = [previous[1], byte];
-            }
+            may_be_a_directive = starts_a_directive(&buffer[..read], &mut previous);
         }
         hasher.update(&buffer[..read]);
     }
     Ok((hex_digest(hasher.finalize()), may_be_a_directive))
+}
+
+/// Whether this chunk holds the first byte of something the preprocessor acts
+/// on: a directive, a trigraph, or a digraph.
+///
+/// "previous" carries the two bytes before the chunk, because all three
+/// patterns can straddle a read boundary and a scan that restarts at every
+/// chunk would miss exactly the files large enough to need two reads.
+fn starts_a_directive(chunk: &[u8], previous: &mut [u8; 2]) -> bool {
+    for &byte in chunk {
+        if byte == b'#'
+            || (byte == b':' && previous[1] == b'%')
+            || (byte == b'=' && previous[1] == b'?' && previous[0] == b'?')
+        {
+            return true;
+        }
+        *previous = [previous[1], byte];
+    }
+    false
 }
 
 fn hex_digest(digest: impl AsRef<[u8]>) -> String {
