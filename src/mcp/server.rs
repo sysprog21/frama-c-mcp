@@ -1278,16 +1278,13 @@ pub fn wp_run_response(
     proofread_report: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let model = params.model.as_deref().unwrap_or(default_wp_model());
-    let requested_provers = params
-        .provers
-        .as_ref()
-        .map(|provers| json!(provers))
-        .or_else(|| params.prover.as_deref().map(|prover| json!(prover)));
+    // Reported as the list it names, in either spelling. Echoing the singular
+    // argument verbatim would print "alt-ergo,z3" beside an effective list of
+    // two, and every sibling block here pairs requested with effective in one
+    // type, which is what a reader diffing two runs' configs relies on.
+    let requested_provers = requested_wp_provers(params).ok().flatten();
     let env_provers = env_wp_provers().ok().flatten();
-    let provers = requested_wp_provers(params)
-        .ok()
-        .flatten()
-        .or_else(|| env_provers.clone());
+    let provers = requested_provers.clone().or_else(|| env_provers.clone());
     let timeout = params.timeout.or_else(|| env_wp_u32("FRAMAC_TIMEOUT").ok().flatten());
     let par = params.par.or_else(|| env_wp_u32("FRAMAC_PAR").ok().flatten());
     let provers_known = provers.is_some();
@@ -1399,10 +1396,22 @@ fn requested_wp_provers(params: &RunWpParams) -> Result<Option<Vec<String>>, Mcp
             None,
         ));
     }
-    let provers = params
-        .provers
-        .clone()
-        .or_else(|| params.prover.as_ref().map(|prover| vec![prover.clone()]));
+    // The singular argument is comma-separated, which is what -wp-prover and
+    // FRAMAC_PROVERS both accept and what parse_wp_provers already does with
+    // the environment. Wrapping it whole in a one-element list made
+    // "alt-ergo,z3" a single prover name, which matches no identifier the
+    // server offers, so apply_prover_selection refused the run outright on a
+    // spelling this tree accepts everywhere else.
+    let provers = params.provers.clone().or_else(|| {
+        params.prover.as_ref().map(|prover| {
+            prover
+                .split(',')
+                .map(str::trim)
+                .filter(|prover| !prover.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    });
     match provers {
         Some(provers) => {
             let provers = provers

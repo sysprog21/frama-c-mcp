@@ -2105,3 +2105,43 @@ fn timed_out_non_rte_goal_keeps_the_generic_advice() {
     assert!(fix.contains("retry_unproved"));
     assert!(!fix.contains("rte_obligations"));
 }
+
+/// A comma-separated prover argument names several provers, not one.
+///
+/// FRAMAC_PROVERS is comma-split and so is Frama-C's own -wp-prover, so that
+/// spelling is what a caller reaches for. Wrapping it whole in a one-element
+/// list made "alt-ergo,z3" a single prover name, which matches no identifier
+/// the server offers, so apply_prover_selection refused the run outright. That
+/// is how a profile declaring two provers could not be mirrored at all.
+#[test]
+fn a_comma_separated_prover_argument_names_each_of_them() {
+    let params = RunWpParams {
+        prover: Some("alt-ergo,z3".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&params, None).unwrap(),
+        Some(vec!["alt-ergo".to_string(), "z3".to_string()])
+    );
+
+    // Spacing is the caller's, not a second syntax.
+    let spaced = RunWpParams {
+        prover: Some(" alt-ergo , z3 ".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&spaced, None).unwrap(),
+        Some(vec!["alt-ergo".to_string(), "z3".to_string()])
+    );
+
+    // One name still means one prover, and the singular argument still does
+    // not select the isolated per-prover path.
+    let single = RunWpParams {
+        prover: Some("z3".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&single, None).unwrap(),
+        Some(vec!["z3".to_string()])
+    );
+}
