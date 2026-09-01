@@ -1586,10 +1586,8 @@ fn collect_json_string_fields_impl(
     match value {
         serde_json::Value::Object(map) => {
             for (key, value) in map {
-                if keys.contains(&key.as_str()) {
-                    if let Some(text) = value.as_str() {
-                        out.push(text.to_string());
-                    }
+                if let Some(text) = value.as_str().filter(|_| keys.contains(&key.as_str())) {
+                    out.push(text.to_string());
                 }
                 collect_json_string_fields_impl(value, keys, out);
             }
@@ -1677,6 +1675,50 @@ impl WpModelSupport {
     }
 }
 
+/// Every single-quoted run on one line of help text, in order.
+///
+/// Frama-C writes the model selectors quoted, several to a line, and pulling
+/// them out is a different question from deciding what each one is. Kept apart
+/// so the caller reads as find-then-classify rather than as a string walk with
+/// the classification buried four levels inside it. An unterminated quote ends
+/// the line rather than consuming the rest of it.
+fn quoted_selectors(line: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('\'') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('\'') else {
+            break;
+        };
+        found.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+    found
+}
+
+/// File one quoted selector under bases or modifiers.
+///
+/// A modifier selector is written with a leading "+" and may name several at
+/// once, as "+raw/+ref"; anything else is a base.
+fn record_selector(selector: &str, bases: &mut Vec<String>, modifiers: &mut Vec<String>) {
+    match selector.strip_prefix('+') {
+        Some(names) => {
+            for name in names.split('/') {
+                push_new(modifiers, name.trim_start_matches('+'));
+            }
+        }
+        None => push_new(bases, selector),
+    }
+}
+
+/// Append a name unless it is empty or already known. Order is the order the
+/// help text lists them in, which is the order they are offered back.
+fn push_new(known: &mut Vec<String>, name: &str) {
+    if !name.is_empty() && !known.iter().any(|seen| seen == name) {
+        known.push(name.to_string());
+    }
+}
+
 pub fn parse_wp_model_support(help: &str) -> WpModelSupport {
     let mut bases = Vec::new();
     let mut modifiers = Vec::new();
@@ -1693,24 +1735,8 @@ pub fn parse_wp_model_support(help: &str) -> WpModelSupport {
             continue;
         }
 
-        let mut rest = line;
-        while let Some(start) = rest.find('\'') {
-            rest = &rest[start + 1..];
-            let Some(end) = rest.find('\'') else {
-                break;
-            };
-            let selector = &rest[..end];
-            if selector.starts_with('+') {
-                for modifier in selector.split('/') {
-                    let modifier = modifier.trim_start_matches('+');
-                    if !modifier.is_empty() && !modifiers.iter().any(|known| known == modifier) {
-                        modifiers.push(modifier.to_string());
-                    }
-                }
-            } else if !selector.is_empty() && !bases.iter().any(|known| known == selector) {
-                bases.push(selector.to_string());
-            }
-            rest = &rest[end + 1..];
+        for selector in quoted_selectors(line) {
+            record_selector(selector, &mut bases, &mut modifiers);
         }
     }
 
@@ -1864,6 +1890,7 @@ fn spawn_frama_c(
     }
     cmd.stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
+
         // Its own process group, for the same reason the sandbox spawn takes
         // one: Frama-C starts why3server and the provers as its own children,
         // and kill_on_drop SIGKILLs only Frama-C itself. Without a group there
@@ -3153,14 +3180,19 @@ impl FramaCMcpServer {
                 // process twice is harmless.
                 kill_sandbox(experiment_id, state.sandbox_pid, Some(state.sandbox_pid));
 
-                if let Err(e) = child.start_kill() {
-                    // ESRCH = process is dead; other errors will only warn
-                    if e.kind() != std::io::ErrorKind::InvalidInput {
-                        tracing::warn!(
-                            experiment_id, pid = state.sandbox_pid,
-                            "cleanup_sandbox: start_kill failed: {}", e
-                        );
-                    }
+                // InvalidInput is tokio's ESRCH here, meaning the process is
+                // already dead, which is the outcome being asked for. Anything
+                // else warns.
+                if let Err(e) = child
+                    .start_kill()
+                    .err()
+                    .filter(|e| e.kind() != std::io::ErrorKind::InvalidInput)
+                    .map_or(Ok(()), Err)
+                {
+                    tracing::warn!(
+                        experiment_id, pid = state.sandbox_pid,
+                        "cleanup_sandbox: start_kill failed: {}", e
+                    );
                 }
                 if let Err(e) = child.wait().await {
                     tracing::warn!(
@@ -3353,13 +3385,14 @@ impl FramaCMcpServer {
                     // parse_record_survives read those bytes before the
                     // reparse, so a write that landed in between built an AST
                     // the boot-parse record does not describe. Reading them
-                    // again is what closes that window: unchanged and the record
-                    // still answers for what Frama-C is holding, changed and it
-                    // answers for nothing, so it is replaced by the absence
-                    // rather than left to be read as a parse that dropped what
-                    // the previous bytes dropped. The process is poisoned with
-                    // it, since the next call cannot recover a record for an AST
-                    // whose boot parse never happened; only a new process can.
+                    // again is what closes that window: unchanged and the
+                    // record still answers for what Frama-C is holding, changed
+                    // and it answers for nothing, so it is replaced by the
+                    // absence rather than left to be read as a parse that
+                    // dropped what the previous bytes dropped. The process is
+                    // poisoned with it, since the next call cannot recover a
+                    // record for an AST whose boot parse never happened; only a
+                    // new process can.
                     //
                     // Before the lock, like the read that started this call.
                     let reparsed =
@@ -3367,15 +3400,17 @@ impl FramaCMcpServer {
                             .await;
 
                     let mut main_lock = self.main_frama_c_state.lock().await;
+                    if let Some(s) =
+                        main_lock.as_mut().filter(|s| reparsed.0 != s.ast_parse_source_digest)
+                    {
+                        s.ast_reload_diagnostics = Some(project::parse_log_unavailable(
+                            "the sources changed while Frama-C was rebuilding the AST, so no \
+                             parse record describes it"
+                                .to_string(),
+                        ));
+                        s.poisoned = true;
+                    }
                     if let Some(s) = main_lock.as_mut() {
-                        if reparsed.0 != s.ast_parse_source_digest {
-                            s.ast_reload_diagnostics = Some(project::parse_log_unavailable(
-                                "the sources changed while Frama-C was rebuilding the AST, so no \
-                                 parse record describes it"
-                                    .to_string(),
-                            ));
-                            s.poisoned = true;
-                        }
                         s.files = new_files;
                     }
                     self.state.write().await.project_loaded = true;
@@ -3469,6 +3504,7 @@ impl FramaCMcpServer {
             Err(reason) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+
                 // After the tail is read, which is the last thing that wants
                 // them.
                 let tail = startup_failure_tail(&stdout_log_path, &stderr_log_path, 20);
@@ -4220,10 +4256,9 @@ pub mod sandbox;
 pub fn collect_loop_sids(node: &serde_json::Value, out: &mut Vec<i64>) {
     match node {
         serde_json::Value::Object(map) => {
-            if map.get("kind").and_then(|k| k.as_str()) == Some("loop") {
-                if let Some(sid) = map.get("sid").and_then(|s| s.as_i64()) {
-                    out.push(sid);
-                }
+            let is_loop = map.get("kind").and_then(|k| k.as_str()) == Some("loop");
+            if let Some(sid) = map.get("sid").and_then(|s| s.as_i64()).filter(|_| is_loop) {
+                out.push(sid);
             }
 
             // `if` node: recurse cond → then_body → else_body in explicit
@@ -4231,15 +4266,14 @@ pub fn collect_loop_sids(node: &serde_json::Value, out: &mut Vec<i64>) {
             // iteration (arrays preserve order; non-if objects have no
             // order-sensitive children).
             if map.contains_key("then_body") && map.contains_key("else_body") {
-                for k in ["cond", "then_body", "else_body"] {
-                    if let Some(v) = map.get(k) {
-                        collect_loop_sids(v, out);
-                    }
-                }
-                for (k, v) in map {
-                    if !matches!(k.as_str(), "cond" | "then_body" | "else_body") {
-                        collect_loop_sids(v, out);
-                    }
+                const ORDERED: [&str; 3] = ["cond", "then_body", "else_body"];
+                let ordered = ORDERED.iter().filter_map(|k| map.get(*k));
+                let rest = map
+                    .iter()
+                    .filter(|(k, _)| !ORDERED.contains(&k.as_str()))
+                    .map(|(_, v)| v);
+                for child in ordered.chain(rest) {
+                    collect_loop_sids(child, out);
                 }
             } else {
                 for (_, v) in map {

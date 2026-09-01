@@ -176,6 +176,219 @@ fn classify_wp_failure_includes_proofread_report_shape() {
     assert_eq!(finding["clause_or_goal_kind"], "rte_division");
 }
 
+/// A receipt is accepted only when its bytes hash to what the server wrote, so
+/// the object cannot practically be echoed back by an MCP client: one
+/// function's receipt is 8 KB whose bulk is the goal array, and a single slip
+/// is rejected with no indication of which field moved. The session therefore
+/// keeps the body, and the hash resolves to it.
+#[test]
+fn session_remembers_receipt_body_for_lookup_by_hash() {
+    use frama_c_mcp::state::SessionState;
+
+    let mut state = SessionState::default();
+    let receipt = json!({
+        "schema": "frama-c-mcp.proof-receipt",
+        "sha256": "abc123",
+        "goals": [{"stable_goal_id": "sg_1", "status": "valid"}],
+    });
+
+    state.remember_receipt("abc123", receipt.clone());
+
+    assert_eq!(state.receipt_body("abc123"), Some(&receipt));
+    assert!(
+        state.receipt_body("never-produced").is_none(),
+        "an unknown hash must not resolve: it is an error, not an empty receipt"
+    );
+}
+
+/// The goals a run is diffed against come out of the stored body rather than a
+/// second copy beside it, so a since diff is against the array the hash was
+/// computed over and the two cannot drift apart.
+#[test]
+fn remembered_goals_are_read_out_of_the_stored_body() {
+    use frama_c_mcp::state::SessionState;
+
+    let mut state = SessionState::default();
+    state.remember_receipt(
+        "abc123",
+        json!({
+            "schema": "frama-c-mcp.proof-receipt",
+            "goals": [{"stable_goal_id": "sg_1", "status": "valid"}],
+        }),
+    );
+    assert_eq!(state.receipt_goals("abc123").map(<[_]>::len), Some(1));
+    assert_eq!(
+        state
+            .receipt_goals("abc123")
+            .and_then(|goals| goals[0]["stable_goal_id"].as_str()),
+        Some("sg_1")
+    );
+
+    // A body with no goal array resolves as a body and not as goals, rather
+    // than as an empty diff.
+    state.remember_receipt("def456", json!({"schema": "frama-c-mcp.proof-receipt"}));
+    assert!(state.receipt_body("def456").is_some());
+    assert_eq!(state.receipt_goals("def456"), None);
+}
+
+/// Advice is a function of category and goal kind, so it belongs once per pair
+/// and not once per goal. This is the property that keeps a legitimately-stuck
+/// function readable: measured before the split, 21 unproved goals carried
+/// 106 KB of duplicated advice between them and shared two categories.
+#[test]
+fn splitting_a_classification_keeps_the_goal_half_small() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let (per_goal, key, advice) = split_goal_classification(&classification);
+
+    // The verdict stays on the goal: callers key on it, the stdio suite
+    // included.
+    assert_eq!(per_goal["category"], "timeout");
+    assert_eq!(per_goal["goal_kind"], "rte_mem_access");
+    assert!(per_goal["evidence"].is_array());
+    assert_eq!(per_goal["advice_key"], key);
+
+    // The rendered one-finding report does not: its fields are already on the
+    // goal and the rest is a markdown rendering of them. Nor does the E-ACSL
+    // advice, which appeared three times in one goal before this.
+    assert!(
+        per_goal.get("proofread_report").is_none(),
+        "the per-goal half must not carry the report: {per_goal}"
+    );
+    assert!(
+        per_goal.get("runtime_check_suggestion").is_none(),
+        "the E-ACSL advice is identical everywhere and belongs in the shared half"
+    );
+    assert!(
+        per_goal["next_action"]
+            .get("runtime_check_suggestion")
+            .is_none(),
+        "and its copy nested inside next_action goes with it"
+    );
+
+    // What the stdio suite reads per goal stays per goal.
+    assert!(per_goal["next_action"]["tool"].as_str().is_some());
+    assert!(
+        per_goal["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
+            .as_bool()
+            .is_some()
+    );
+
+    // Measured rather than aspired to: 2015 bytes against 5706 on this goal, so
+    // a little over a third. The rest is what the shared half now carries once.
+    // A tighter ratio is not available without moving next_action or
+    // wp_timeout_triage, and the stdio suite reads both per goal.
+    let goal_bytes = serde_json::to_string(&per_goal).unwrap().len();
+    let whole_bytes = serde_json::to_string(&classification).unwrap().len();
+    assert!(
+        goal_bytes * 2 < whole_bytes,
+        "the per-goal half should be well under half the whole: {goal_bytes} \
+         against {whole_bytes}. A bare goal_bytes < whole_bytes would hold by \
+         construction, since the per-goal half is the whole with keys removed, \
+         so the factor is what makes this an assertion. If it trips, read the \
+         two numbers before changing it: a per-goal half that grew is the \
+         regression this guards, while a shared half that shrank means the \
+         split has stopped paying and the factor is what should move."
+    );
+
+    // The advice keeps what a caller acts on.
+    assert!(advice["suggested_fix"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert!(advice["why_problem"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+/// Two goals of one category and kind share an advice key, and two of
+/// different kinds do not: a timed-out rte obligation and a timed-out
+/// postcondition are told different things.
+#[test]
+fn advice_key_groups_by_category_and_kind() {
+    let of = |kind: &str| {
+        let c = classify_wp_failure_from_goal(
+            &json!({
+                "name": "g",
+                "goal_kind": kind,
+                "normalized_status": "timeout",
+                "source_location": {"file": "src.c", "line": 1, "column": 1}
+            }),
+            Some("f"),
+        );
+        split_goal_classification(&c).1
+    };
+    assert_eq!(of("rte_mem_access"), of("rte_mem_access"));
+    assert_ne!(of("rte_mem_access"), of("ensures"));
+}
+
+/// A classification quoted on its own has to bring its advice with it.
+///
+/// The split sends each advice once, on the first classified goal of its key,
+/// which is right for an array read whole and wrong for a single goal lifted
+/// out of one. check embeds exactly one: recommended_next_call.classification
+/// is the first non-valid goal, which is the carrier only by luck. Before this
+/// resolved the key, that field was status plumbing with no why_problem, no
+/// suggested_fix and no semantic_verdict, and nothing asserted its contents.
+#[test]
+fn a_quoted_classification_resolves_its_advice_key() {
+    use frama_c_mcp::mcp::server::analysis::classification_with_advice;
+
+    let classify = |kind: &str| {
+        classify_wp_failure_from_goal(
+            &json!({
+                "name": "mem_access",
+                "goal_kind": kind,
+                "normalized_status": "timeout",
+                "source_location": {"file": "src.c", "line": 40, "column": 8}
+            }),
+            Some("collect"),
+        )
+    };
+    let (carrier_half, key, advice) = split_goal_classification(&classify("rte_mem_access"));
+    let (follower_half, follower_key, _) = split_goal_classification(&classify("rte_mem_access"));
+    assert_eq!(key, follower_key, "the fixture needs both goals on one key");
+
+    let mut carrier_half = carrier_half;
+    carrier_half
+        .as_object_mut()
+        .unwrap()
+        .insert("advice".to_string(), advice.clone());
+    let goals = vec![
+        json!({"stable_goal_id": "sg-carrier", "failure_classification": carrier_half}),
+        json!({"stable_goal_id": "sg-follower", "failure_classification": follower_half}),
+    ];
+
+    // The follower is the one check would quote, and it holds no advice.
+    assert!(
+        goals[1]["failure_classification"].get("advice").is_none(),
+        "the fixture is pointless unless the second goal is a follower"
+    );
+    let resolved = classification_with_advice(&goals[1], &goals);
+    assert_eq!(
+        resolved["advice"], advice,
+        "a follower's key must resolve to its carrier's advice: {resolved}"
+    );
+    assert!(resolved["advice"]["suggested_fix"]
+        .as_str()
+        .is_some_and(|fix| !fix.is_empty()));
+
+    // The carrier is returned untouched rather than given a second copy.
+    assert_eq!(classification_with_advice(&goals[0], &goals)["advice"], advice);
+
+    // A key no sibling carries leaves the classification as it was, rather than
+    // inventing an empty advice block.
+    let orphan = json!({"failure_classification": {"advice_key": "timeout:nothing"}});
+    let resolved = classification_with_advice(&orphan, &goals);
+    assert!(resolved.get("advice").is_none(), "{resolved}");
+}
+
 #[test]
 fn proofread_report_sorts_by_severity_then_file_line() {
     let report = proofread_report(vec![
@@ -1082,8 +1295,8 @@ fn classify_wp_failure_unknown_fallback() {
     assert_eq!(classification["category"], "prover_unknown");
     assert_eq!(classification["failure_kind"], "proof_obligation");
     assert!(!classification["evidence"].as_array().unwrap().is_empty());
-    assert_eq!(classification["suggested_next_tool"]["tool"], "get_wp_goals");
-    assert_eq!(classification["suggested_next_tool"]["args"]["want"], serde_json::json!(["vc"]));
+    assert_eq!(classification["next_action"]["tool"], "get_wp_goals");
+    assert_eq!(classification["next_action"]["args"]["want"], serde_json::json!(["vc"]));
     assert_eq!(classification["semantic_verdict"]["kind"], "specification_too_weak");
     assert!(classification["semantic_verdict"]["plain_language"]
         .as_str()
@@ -1801,4 +2014,94 @@ fn ast_digest_separates_runs_that_goal_counts_cannot() {
     let unknown_b = build(serde_json::Value::Null);
     assert!(unknown_a["subject"]["ast_digest"].is_null());
     assert_ne!(unknown_a["sha256"], unknown_b["sha256"]);
+}
+
+/// An open runtime-error check has to name the tool that says which check it
+/// is. The goal name does not: mem_access_7 counts siblings generated from one
+/// statement, so a function holding several open checks on one line is
+/// indistinguishable from the goal list alone, and the next step without this
+/// pointer is to guess an invariant and re-prove, which costs a run per guess
+/// and does not converge.
+#[test]
+fn rte_finding_points_at_the_obligation_reader() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "unknown",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let finding = &classification["proofread_report"]["findings"][0];
+    assert_eq!(finding["category"], "rte");
+
+    // The predicate is on the goal already: measured, 21 of 21 goals from
+    // get_wp_goals carried one. Guidance that sends a caller elsewhere to find
+    // it is wrong about its own payload, which is what the first version of
+    // this advice got wrong.
+    let fix = finding["suggested_fix"].as_str().unwrap();
+    assert!(
+        fix.contains("predicate"),
+        "rte guidance must point at the goal's own predicate: {fix}"
+    );
+    assert!(
+        !fix.contains("returns the open predicate"),
+        "rte_obligations must not be described as the way to see the predicate: {fix}"
+    );
+    let why = finding["why_problem"].as_str().unwrap();
+    assert!(
+        why.contains("predicate"),
+        "the short form must say so too, since a caller may render only that: {why}"
+    );
+}
+
+/// A runtime-error check that times out is classified as a timeout, not as an
+/// rte, so it would otherwise get only the generic "retry, then read the VC".
+/// That is the shape most likely to strand a caller: retried at six times the
+/// budget it does not move, and the goal name alone cannot say which access is
+/// open, so the next thing tried is a guessed invariant.
+#[test]
+fn timed_out_rte_goal_still_names_the_obligation_reader() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "mem_access",
+            "goal_kind": "rte_mem_access",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 40, "column": 8}
+        }),
+        Some("collect"),
+    );
+    let finding = &classification["proofread_report"]["findings"][0];
+    assert_eq!(finding["category"], "timeout");
+
+    let fix = finding["suggested_fix"].as_str().unwrap();
+    assert!(
+        fix.contains("retry_unproved"),
+        "the retry-first instruction must survive: {fix}"
+    );
+    assert!(
+        fix.contains("predicate"),
+        "a timed-out rte goal must still say where the predicate is: {fix}"
+    );
+}
+
+/// The non-rte timeout keeps the generic wording: there is no obligation
+/// reader for a postcondition, so pointing at one would be wrong.
+#[test]
+fn timed_out_non_rte_goal_keeps_the_generic_advice() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "post_condition",
+            "goal_kind": "ensures",
+            "normalized_status": "timeout",
+            "source_location": {"file": "src.c", "line": 7, "column": 1}
+        }),
+        Some("f"),
+    );
+    let fix = classification["proofread_report"]["findings"][0]["suggested_fix"]
+        .as_str()
+        .unwrap();
+    assert!(fix.contains("retry_unproved"));
+    assert!(!fix.contains("rte_obligations"));
 }

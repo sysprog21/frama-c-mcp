@@ -85,7 +85,20 @@ fn classify_failure_reason(
             // set is what tells them apart, and run_wp does exactly that when
             // retry_unproved is set. Reach for a bigger budget only if that
             // diff is non-empty; otherwise the budget is not what is missing.
-            "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix -- read the VC and supply the missing fact.",
+            if goal_kind.starts_with("rte_") {
+                // The same advice, ending somewhere concrete. "Read the VC" is
+                // the right instruction and the wrong altitude for a
+                // runtime-error check: the VC is a sequent, while
+                // rte_obligations hands back the one predicate that is open and
+                // a drafted requires for it. Without this the branch reads as
+                // "raise the budget", which is the loop a stuck RTE goal
+                // invites: retried at six times the budget it does not move,
+                // and the next thing tried is an invariant guessed from the
+                // goal name.
+                "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix. This one is a runtime-error check, so read the goal's own predicate rather than its name: the name's trailing number counts siblings from one statement and names none of them, while the predicate says which access is open. context {want: [\"rte_obligations\"]} adds the drafted requires, which no goal carries, and is the fallback when this goal carries no predicate either."
+            } else {
+                "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix -- read the VC and supply the missing fact."
+            },
         )
     } else if text.contains("prover")
         && (text.contains("not found")
@@ -144,7 +157,15 @@ fn classify_failure_reason(
             "The obligation is a runtime-error check, so the fix is a fact the caller must \
              guarantee or the code must establish: the requires that rules the value out, an \
              assert that carries the fact to this point, or a loop invariant that keeps the index \
-             in range. Strengthening the postcondition will not close it.",
+             in range. Strengthening the postcondition will not close it. \
+             Read the goal's own predicate to choose which: the goal usually carries one, \
+             and the open access then reads as \\valid(p + i) directly. Do not work from the \
+             goal name, which cannot distinguish siblings: the trailing number in mem_access_7 \
+             counts checks generated from one statement and names none of them. Guessing an \
+             invariant from the name costs a proof run per guess and does not converge. \
+             context {want: [\"rte_obligations\"]} covers both gaps: it drafts the requires, \
+             which no goal carries, and it is the fallback for the goals whose property row \
+             supplied no predicate to copy.",
         )
     } else if ["unsupported", "unbound", "unknown predicate", "unknown logic"]
         .iter()
@@ -368,7 +389,11 @@ pub fn classify_wp_failure_from_goal(
         "normalized_status": normalized_status,
         "goal_kind": goal_kind,
         "evidence": evidence,
-        "suggested_next_tool": next_action,
+
+        // One name, not two. This carried the same object under both for a
+        // while, which cost over 6 KB across a 16-goal reply for nothing: the
+        // values were byte-identical, so a caller reading either got the same
+        // answer and every caller paid for both.
         "next_action": next_action,
         "wp_timeout_triage": timeout_triage,
         "proofread_report": report,
@@ -742,9 +767,111 @@ fn proofread_finding_from_wp_failure(
     })
 }
 
+/// The classification's per-goal half, and the key naming the half it shares
+/// with every other goal of its kind.
+///
+/// Two different duplications live in a classification and only one of them is
+/// across goals. Within a single goal, "runtime_check_suggestion" appears
+/// three times: standalone, nested inside "next_action", and again inside
+/// "semantic_verdict". Across goals, the rendered "proofread_report" and the
+/// E-ACSL advice are byte-identical for everything sharing a category and goal
+/// kind. Measured on one function whose goals were legitimately all unproved,
+/// the two together came to 106 KB across 21 goals, against 1.7 KB of the
+/// fields a caller triages from.
+///
+/// What stays on the goal is what varies with it or what a caller reads per
+/// goal: the verdict fields, its own evidence, "next_action" (whose reason
+/// carries this goal's file and line) and "wp_timeout_triage". The
+/// stdio suite asserts the last two per goal, which is the contract and not an
+/// accident.
+pub fn split_goal_classification(
+    classification: &serde_json::Value,
+) -> (serde_json::Value, String, serde_json::Value) {
+    let get = |key: &str| {
+        classification
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let category = classification
+        .get("category")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let goal_kind = classification
+        .get("goal_kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    // Keyed on both, because the advice differs on each: a timed-out rte
+    // obligation and a timed-out postcondition share a category and are told
+    // different things.
+    let key = format!("{category}:{goal_kind}");
+
+    // The nested copy inside next_action goes; the standalone one is hoisted.
+    // Dropping it here is what makes the per-goal half small, and it is the
+    // same object either way.
+    let mut next_action = get("next_action");
+    if let Some(obj) = next_action.as_object_mut() {
+        obj.remove("runtime_check_suggestion");
+    }
+
+    let per_goal = json!({
+        "category": get("category"),
+        "failure_kind": get("failure_kind"),
+        "confidence": get("confidence"),
+        "status": get("status"),
+        "normalized_status": get("normalized_status"),
+        "goal_kind": get("goal_kind"),
+        "evidence": get("evidence"),
+        "next_action": next_action,
+        "wp_timeout_triage": get("wp_timeout_triage"),
+        "advice_key": key.clone(),
+    });
+
+    let advice = json!({
+        "category": get("category"),
+        "goal_kind": get("goal_kind"),
+        "why_problem": proofread_why_problem(category, goal_kind),
+        "suggested_fix": classification
+            .get("proofread_report")
+            .and_then(|report| report.get("findings"))
+            .and_then(|findings| findings.get(0))
+            .and_then(|finding| finding.get("suggested_fix"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_check_suggestion": get("runtime_check_suggestion"),
+        "semantic_verdict": get("semantic_verdict"),
+    });
+
+    (per_goal, key, advice)
+}
+
+/// One goal's classification with its own advice attached rather than shared.
+///
+/// The goal-list path hoists each advice onto the first goal of its key,
+/// because a caller reads that array whole and can follow advice_key to a
+/// sibling. A goal handed over on its own has no sibling to follow the key to,
+/// so it carries the block itself. Both single-goal paths call this, so the two
+/// cannot drift into answering with different shapes.
+pub fn goal_classification_with_own_advice(
+    goal: &serde_json::Value,
+    function: Option<&str>,
+) -> serde_json::Value {
+    let (mut per_goal, _key, advice) =
+        split_goal_classification(&classify_wp_failure_from_goal(goal, function));
+    if let Some(object) = per_goal.as_object_mut() {
+        object.insert("advice".to_string(), advice);
+    }
+    per_goal
+}
+
 fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
     match category {
-        "rte" => "The runtime-error obligation is still open.",
+        "rte" => {
+            "The runtime-error obligation is still open. When the goal carries a \
+             predicate, that names which check it is; when it carries none, \
+             context {want: [\"rte_obligations\"]} is where to look."
+        }
         "timeout" => "The prover timed out before proving this obligation.",
         "internal_error" => "Frama-C or WP reported an internal failure for this obligation.",
         "unsupported_predicate" => "The proof uses logic that WP could not handle.",
@@ -1204,10 +1331,11 @@ pub fn wp_backend_diagnosis(
             // second. The routing decision only asks whether the list is
             // non-empty, which is unaffected; a reader chasing every cast wants
             // the source, not this field.
-            if let Some(line) = message.pointer("/source/line") {
-                if !cast_lines.contains(line) {
-                    cast_lines.push(line.clone());
-                }
+            if let Some(line) = message
+                .pointer("/source/line")
+                .filter(|line| !cast_lines.contains(*line))
+            {
+                cast_lines.push(line.clone());
             }
         }
     }

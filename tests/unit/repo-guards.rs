@@ -437,6 +437,116 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
 /// Deliberately blind to a declaration inside a string or a comment: those do
 /// not reach an opening brace at their own indentation, so they find no closing
 /// line and are skipped by the caller rather than needing to be excluded here.
+/// Three levels of control flow, and this is what counts them.
+///
+/// CLAUDE.md has stated the rule for a long time and said in the same breath
+/// that it could not be checked, because telling a deep branch from a deep
+/// JSON literal needs a parser rather than a column count. That is true of a
+/// column count and false of this: a level is opened only by a line whose
+/// first token is if, for, while, match or loop and which ends in an opening
+/// brace, so the payload assembly the rule deliberately exempts is invisible
+/// to it. Measured when it was written, 508 lines in src sit at indentation
+/// depth six or more and none of them are branches.
+///
+/// Depth is popped by indentation before it is pushed, which is what makes
+/// "} else if cond {" a continuation rather than a fourth level: it closes the
+/// block it is chained to before opening its own.
+///
+/// It under-reports, on purpose, in the two cases worth naming. A construct
+/// written across several lines, with the brace not on the first of them, is
+/// not counted, and neither is a branch inside a closure passed to something.
+/// Both would need the parser the old note was talking about. What is left
+/// still caught seventeen functions the day it was added.
+///
+/// It reads only line comments, so it would over-report in one direction the
+/// paragraph above does not cover: a branch-shaped line ending in a brace,
+/// written inside a block comment or a multi-line string literal, counts as a
+/// real level and could fail a compliant function. Telling those apart needs
+/// the same parser, and src carries no instance of either, its two "/*" both
+/// sitting inside line comments and its files holding no raw strings. Measured
+/// rather than assumed, and worth re-measuring before that changes.
+#[test]
+fn no_function_in_src_nests_control_flow_past_three() {
+    const LEVELS: usize = 3;
+
+    let mut files = Vec::new();
+    source_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        "rs",
+        &mut files,
+    );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut function = "";
+        let mut open: Vec<usize> = Vec::new();
+        let mut worst = 0usize;
+        let mut worst_line = 0usize;
+        let mut report = |function: &str, worst: usize, worst_line: usize| {
+            if worst > LEVELS && !function.is_empty() {
+                offenders.push(format!(
+                    "{}:{worst_line} {function} nests {worst} deep",
+                    path.display()
+                ));
+            }
+        };
+        for (number, line) in text.lines().enumerate() {
+            if let Some(name) = function_name(line) {
+                report(function, worst, worst_line);
+                function = name;
+                open.clear();
+                worst = 0;
+                worst_line = 0;
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            while open.last().is_some_and(|&outer| indent <= outer) {
+                open.pop();
+            }
+            if !opens_a_branch(trimmed) || !line.trim_end().ends_with('{') {
+                continue;
+            }
+            open.push(indent);
+            if open.len() > worst {
+                worst = open.len();
+                worst_line = number + 1;
+            }
+        }
+        report(function, worst, worst_line);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "control flow nested past {LEVELS} levels:\n{}\n\nA fourth live \
+         branch inside three others is a function doing too much. Extract the \
+         inner work, or invert a condition to return early. Raising LEVELS is \
+         not the fix: the number is the rule.",
+        offenders.join("\n")
+    );
+}
+
+/// Whether a line's first token opens a control-flow block.
+///
+/// The leading brace of "} else if" and "} while" is skipped, so a chained
+/// branch is recognised as the construct it is. "else {" alone opens no new
+/// level: it is the other half of an if that was already counted.
+fn opens_a_branch(trimmed: &str) -> bool {
+    let rest = trimmed.strip_prefix('}').unwrap_or(trimmed).trim_start();
+    let rest = rest.strip_prefix("else ").unwrap_or(rest);
+
+    // The trailing space is what keeps "if_" style identifiers out: a keyword
+    // is only a keyword when something follows it, and "loop {" satisfies that
+    // as much as "loop while_ready" does.
+    ["if ", "for ", "while ", "match ", "loop "]
+        .iter()
+        .any(|keyword| rest.starts_with(keyword))
+}
+
 fn function_name(line: &str) -> Option<&str> {
     let rest = line.trim_start();
     let mut rest = rest

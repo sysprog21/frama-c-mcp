@@ -71,9 +71,21 @@ impl Transport {
             return Err(poisoned_transport());
         }
         loop {
-            if let Some((payload, consumed)) = codec::decode_frame(&self.read_buf)? {
-                self.read_buf.advance(consumed);
-                return Ok(Some(payload));
+            // A decode failure is as final as an EOF and has to poison for the
+            // same reason. The bytes that would not decode stay in read_buf,
+            // and nothing here resynchronizes, so every later call re-reads the
+            // same header and returns the same error while is_poisoned goes on
+            // answering "healthy" and reload_project therefore never respawns.
+            // That turns a desynchronized stream, which is exactly what an
+            // over-long declared length means, into a session that reports a
+            // protocol error forever instead of getting a new process.
+            match codec::decode_frame(&self.read_buf) {
+                Ok(Some((payload, consumed))) => {
+                    self.read_buf.advance(consumed);
+                    return Ok(Some(payload));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(self.poison(e).await),
             }
             let mut tmp = [0u8; 4096];
             match tokio::time::timeout(timeout, self.stream.read(&mut tmp)).await {

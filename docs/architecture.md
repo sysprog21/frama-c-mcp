@@ -77,7 +77,7 @@ hands back subtly wrong C is the failure mode with the highest cost.
 
 ### 4. Bottom-up full program orchestration
 
-`verify_program_step` computes the callee-before-caller verification order, persists orchestration state, and can lock `reload_project` plus main-instance `run_wp` during batch work. It answers with one `next_action` rather than a batch, plus the unverified `frontier` and any `blocked_functions`, all under a hard `payload_budget` cap that truncates lists and reports the dropped count instead of omitting them silently. Ready functions are verified through the public sandbox tools: `create_sandbox`, `inject_all_annotations {dry_run: true}`, `inject_all_annotations`, `run_wp`, and `get_wp_goals`.
+`verify_program_step` computes the callee-before-caller verification order, persists orchestration state, and can lock `reload_project` plus main-instance `run_wp` during batch work. It answers with one `next_action` rather than a batch, plus the unverified `frontier` and any `blocked_functions`, all under a hard `payload_budget` cap that truncates lists and reports the dropped count instead of omitting them silently. When truncation is not enough it drops the action itself, and in the last resort replaces the body with `status: "payload_truncated"`; both cases arrive as `next_action.tool: null`. Ready functions are verified through the public sandbox tools: `create_sandbox`, `inject_all_annotations {dry_run: true}`, `inject_all_annotations`, `run_wp`, and `get_wp_goals`.
 
 ### 5. Fail-closed accounting
 

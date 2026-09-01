@@ -37,6 +37,14 @@ fn request_matrix_marks_rejected_request_missing() {
     assert_eq!(status["status"], "missing");
 }
 
+/// Every budget test asserts the same two things: the response fits the cap,
+/// and it reports the size it is actually sent at.
+fn assert_step_payload_fits(payload: &serde_json::Value) {
+    let bytes = serde_json::to_string_pretty(payload).unwrap().len();
+    assert!(bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES, "{bytes}");
+    assert_eq!(payload["payload_budget"]["bytes"], bytes);
+}
+
 #[test]
 fn verify_program_step_response_budget_records_sent_size() {
     let payload = finish_verify_program_step_response(json!({
@@ -66,13 +74,90 @@ fn verify_program_step_response_budget_records_sent_size() {
         "project_state_persisted": {"stored": true},
         "next_action": {"tool": "create_sandbox", "args": {"function": "f0"}}
     }));
-    let bytes = serde_json::to_string_pretty(&payload).unwrap().len();
-    assert!(bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES, "{bytes}");
+    assert_step_payload_fits(&payload);
     assert!(payload["ready_functions"].as_array().unwrap().len() <= 1);
     assert!(payload["ready_functions_omitted"].as_u64().unwrap() >= 999);
     assert!(payload["frontier"].as_array().unwrap().len() <= 1);
     assert!(payload["frontier_omitted"].as_u64().unwrap() >= 999);
     assert_eq!(payload["next_action"]["tool"], "create_sandbox");
+}
+
+#[test]
+fn verify_program_step_response_budget_drops_an_oversized_preview() {
+    let oversized_function = "f".repeat(VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES);
+    let payload = finish_verify_program_step_response(json!({
+        "frontier": [],
+        "frontier_omitted": 0,
+        "ready_functions": [{"function": oversized_function}],
+        "ready_functions_omitted": 0,
+        "next_action": {"tool": "create_sandbox", "args": {"function": oversized_function}},
+    }));
+    assert_step_payload_fits(&payload);
+    // Not the constant-size fallback: this response still carries its fields.
+    assert!(payload.get("status").is_none());
+    assert!(payload["ready_functions"].as_array().unwrap().is_empty());
+    assert_eq!(payload["ready_functions_omitted"], 1);
+    assert_eq!(payload["next_action"]["tool"], serde_json::Value::Null);
+    assert!(payload["next_action"]["args"].get("function").is_none());
+    assert_eq!(payload["next_action"]["blockers"][0], "oversized_function_name");
+}
+
+#[test]
+fn verify_program_step_response_budget_keeps_an_omitted_count_with_no_rows_left() {
+    // The caller can hand over a count with an empty preview. Charging a
+    // retained row here would report one fewer function than went missing.
+    // ready_functions is what puts this over the cap, so the truncation stage
+    // runs and reaches an already empty frontier on its way past.
+    let payload = finish_verify_program_step_response(json!({
+        "frontier": [],
+        "frontier_omitted": 5,
+        "ready_functions": (0..1000).map(|i| json!({"function": format!("f{i}")})).collect::<Vec<_>>(),
+        "ready_functions_omitted": 0,
+        "next_action": {"tool": "create_sandbox", "args": {"function": "f0"}},
+    }));
+    assert_step_payload_fits(&payload);
+    assert!(payload["frontier"].as_array().unwrap().is_empty());
+    assert_eq!(payload["frontier_omitted"], 5);
+}
+
+#[test]
+fn verify_program_step_response_budget_trims_the_blocked_list_in_next_action() {
+    let blocked = (0..2000).map(|i| format!("blocked_function_{i}")).collect::<Vec<_>>();
+    let payload = finish_verify_program_step_response(json!({
+        "frontier": [],
+        "frontier_omitted": 0,
+        "ready_functions": [],
+        "ready_functions_omitted": 0,
+        "next_action": {
+            "tool": "verify_program_step",
+            "args": {},
+            "blockers": ["blocked_functions"],
+            "blocked_functions": blocked,
+        },
+    }));
+    assert_step_payload_fits(&payload);
+    assert!(payload.get("status").is_none());
+    // The action stays callable; only its list is replaced by a count.
+    assert_eq!(payload["next_action"]["tool"], "verify_program_step");
+    assert!(payload["next_action"]["blocked_functions"].as_array().unwrap().is_empty());
+    assert_eq!(payload["next_action"]["blocked_functions_omitted"], 2000);
+}
+
+#[test]
+fn verify_program_step_response_budget_falls_back_when_nothing_else_can_go() {
+    // project_state_persisted is not one of the fields any stage can drop.
+    let payload = finish_verify_program_step_response(json!({
+        "frontier": [],
+        "frontier_omitted": 0,
+        "ready_functions": [],
+        "ready_functions_omitted": 0,
+        "project_state_persisted": {"error": "e".repeat(VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES)},
+        "next_action": {"tool": "verify_program_step", "args": {}},
+    }));
+    assert_step_payload_fits(&payload);
+    assert_eq!(payload["status"], "payload_truncated");
+    // Nothing to call again: repeating the step returns this same answer.
+    assert_eq!(payload["next_action"]["tool"], serde_json::Value::Null);
 }
 
 #[test]

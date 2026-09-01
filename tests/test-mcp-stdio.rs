@@ -1806,7 +1806,7 @@ fn assert_wp_goal_shape(goal: &Value) {
     assert!(goal["vacuous"].as_bool().is_some(), "{:?}", goal);
     if goal["failure_classification"].is_object() {
         assert!(goal["failure_classification"]["category"].as_str().is_some(), "{:?}", goal);
-        assert!(goal["failure_classification"]["suggested_next_tool"]["tool"].as_str().is_some(),
+        assert!(goal["failure_classification"]["next_action"]["tool"].as_str().is_some(),
             "{:?}", goal);
         assert!(goal["failure_classification"]["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
             .as_bool().is_some(), "{:?}", goal);
@@ -3412,7 +3412,7 @@ async fn wp_goals_surface_vacuous_call_precondition_status() {
         later_precondition
     );
     assert!(
-        later_precondition["failure_classification"]["suggested_next_tool"]["tool"]
+        later_precondition["failure_classification"]["next_action"]["tool"]
             .as_str()
             .is_some(),
         "classification should suggest a next tool: {:?}",
@@ -4425,6 +4425,112 @@ async fn check_receipts_distinguish_eva_entry_points() {
     let _ = client.cancel().await;
 }
 
+/// The receipt a real run produced, named by its hash, is accepted as evidence.
+///
+/// The unit test for this covers SessionState alone. What it cannot show is the
+/// path a caller actually takes: run_wp, read sha256 off the receipt, hand that
+/// string back. Every other conclusion test here builds a synthetic receipt
+/// with fixture_receipt, so the real run_wp-to-store path had no coverage in
+/// either direction.
+///
+/// The hash exists because the object cannot practically be echoed: acceptance
+/// recomputes the digest over the receipt's serialized bytes, and one
+/// function's receipt is roughly 8 KB whose bulk is a goal array. Resolving the
+/// hash checks the same bytes, since they are the ones this process wrote.
+#[tokio::test]
+async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
+    // A fixture that proves clean, because a verified conclusion is also
+    // checked against its summary: storing one whose goals are not all valid is
+    // refused on that ground before the receipt is ever consulted, which would
+    // leave the path under test unexercised.
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let run = call_tool_json(&client, "run_wp", json!({"timeout": 5}))
+        .await
+        .unwrap();
+    let sha = run["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("run_wp returns a receipt with a sha256")
+        .to_string();
+
+    // Derived from the run, not invented: storing a conclusion also checks the
+    // summary against the receipt's goal count, so a made-up total is refused
+    // even when the receipt itself is genuine. That check is the reason this
+    // test reads the goals rather than asserting a convenient number.
+    let goals = run["proof_receipt"]["goals"]
+        .as_array()
+        .expect("a receipt carries its goals");
+    let total = goals.len();
+    let valid = goals.iter().filter(|g| g["status"] == "valid").count();
+
+    let stored = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {
+                "total": total, "valid": valid,
+                "unknown": total - valid, "timeout": 0, "failed": 0
+            },
+            "proof_receipt_sha256": sha,
+        }),
+    )
+    .await;
+    assert!(
+        stored.is_ok(),
+        "a hash this session produced must be accepted: {stored:?}"
+    );
+
+    // And it must read back as the receipt, not as the string it arrived as.
+    let listed = call_tool_json(
+        &client,
+        "list",
+        json!({"kind": "conclusions", "function": "abs_int"}),
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&listed).unwrap();
+    assert!(
+        text.contains(&sha),
+        "the stored conclusion must carry the receipt the hash named: {text}"
+    );
+    assert!(
+        text.contains("frama-c-mcp.proof-receipt"),
+        "and it must be the receipt object, not the bare hash: {text}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A hash this session never produced is refused, and says so. An unknown run
+/// and an empty one are different answers, the same rule get_wp_goals {since}
+/// already follows.
+#[tokio::test]
+async fn an_unknown_receipt_hash_is_refused() {
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let stored = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
+            "proof_receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }),
+    )
+    .await;
+    assert!(
+        stored.is_err(),
+        "an unknown hash must not stand in for evidence: {stored:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
 #[tokio::test]
 async fn two_identical_runs_produce_one_receipt() {
     // The claim this server rests on is that two runs are comparable exactly
@@ -4472,10 +4578,65 @@ async fn two_identical_runs_produce_one_receipt() {
         first_receipt["reported"]["incomplete"], second_receipt["reported"]["incomplete"],
         "the incomplete digest moved between identical runs"
     );
-    assert_eq!(
-        first_receipt["sha256"], second_receipt["sha256"],
-        "identical runs produced different receipts: {first_receipt:?} vs {second_receipt:?}"
-    );
+
+    // A hash mismatch has two causes and they need different answers. Real
+    // nondeterminism is the bug this test exists for. A prover that reached its
+    // budget in one run and not the other is a loaded host, and reporting that
+    // as nondeterminism sends the reader to look for an ordering bug that is
+    // not there. Both were observed on one machine: three full-suite runs, each
+    // failing a different test, all passing alone.
+    //
+    // So the statuses are compared before the hash, and a difference that
+    // involves a timeout is named as what it is. It still fails, because a
+    // silent pass would hide a real divergence behind the same excuse, but it
+    // fails saying which of the two happened.
+    if first_receipt["sha256"] != second_receipt["sha256"] {
+        let statuses = |receipt: &serde_json::Value| {
+            receipt["goals"]
+                .as_array()
+                .map(|goals| {
+                    goals
+                        .iter()
+                        .map(|goal| {
+                            (
+                                goal["stable_goal_id"].as_str().unwrap_or("").to_string(),
+                                goal["status"].as_str().unwrap_or("").to_string(),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default()
+        };
+        let (before, after) = (statuses(first_receipt), statuses(second_receipt));
+        let moved: Vec<String> = before
+            .iter()
+            .filter(|(id, status)| after.get(*id).is_some_and(|now| now != *status))
+            .map(|(id, status)| format!("{id}: {status} -> {}", after[id]))
+            .collect();
+        assert!(
+            !moved.iter().any(|m| m.contains("timeout")),
+            "a goal changed status between identical runs and the change involves \
+             a timeout, so this is a prover that reached its budget on a loaded \
+             host rather than a nondeterministic server. Re-run it alone before \
+             reading it as an ordering bug. Moved: {moved:?}"
+        );
+        // Statuses moved with no timeout among them. This is the divergence the
+        // test exists for, and it has to say so: falling through to the message
+        // below would send the reader to the receipt's own fields while the
+        // moved list on screen shows WP concluding something different.
+        assert!(
+            moved.is_empty(),
+            "identical runs disagreed about goal statuses and no timeout is \
+             involved, so this is the nondeterministic server rather than a \
+             loaded host. Moved: {moved:?}"
+        );
+        panic!(
+            "identical runs produced different receipts with every goal status \
+             equal, so the difference is in the receipt's own fields rather than \
+             in what WP concluded. \
+             First: {first_receipt:?} Second: {second_receipt:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4732,7 +4893,7 @@ async fn property_identity_is_preserved_across_analysis_tools() {
         })
         .unwrap_or_else(|| panic!("VC with failure classification missing: {:?}", details));
     assert!(
-        classified_vc["failure_classification"]["suggested_next_tool"]["tool"]
+        classified_vc["failure_classification"]["next_action"]["tool"]
             .as_str()
             .is_some(),
         "{:?}",
@@ -8722,5 +8883,341 @@ async fn a_respawn_reports_the_new_process_parse() {
         "a new process has spent no warn-once category: {respawned}"
     );
     assert_eq!(category_count(&respawned, "kernel:asm:clobber"), 2, "{respawned}");
+    let _ = client.cancel().await;
+}
+
+/// The advice block rides one goal per category, over the wire.
+///
+/// The split was unit-tested on split_goal_classification alone, which is the
+/// same shape of evidence that let an earlier round of this work ship a
+/// regression: a change reasoned about from the outside, confirmed against a
+/// function rather than against the server. So this measures the assembled
+/// payload a client actually receives.
+///
+/// Writing it found two things a unit test could not. The split does hold end
+/// to end. And it saves less than it looks, because next_action.reason still
+/// carries the advice text on every goal, and it stays per-goal on purpose: a
+/// caller reading one goal needs the reason in hand. The second assertion below
+/// pins that number so the gap is a measurement rather than a belief.
+///
+/// The figures moved once since they were first recorded, and downward: the
+/// classification used to carry this same object twice, as next_action and as
+/// suggested_next_tool, so every number here counted it twice.
+#[tokio::test]
+async fn advice_is_carried_once_per_category_over_the_wire() {
+    // 16 classified goals collapsing to 4 keys when this was written, which is
+    // what makes the duplication visible; a fixture with one failure would pass
+    // either way.
+    let c_file = workspace_path("tests/fixtures/bubble_sort.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    call_tool_json(&client, "run_wp", json!({"timeout": 5}))
+        .await
+        .unwrap();
+
+    // The receipt's goal array is ids and statuses only, by design: it is what
+    // two runs are compared on. The classification the split is about rides
+    // get_wp_goals, so that is what a client sees and what this measures.
+    let listed = call_tool_json(&client, "get_wp_goals", json!({"function": "bubble_sort"}))
+        .await
+        .unwrap();
+    let goals = listed
+        .as_array()
+        .expect("get_wp_goals returns a goal array");
+
+    let classified: Vec<&serde_json::Value> = goals
+        .iter()
+        .filter_map(|g| g.get("failure_classification"))
+        .collect();
+    assert!(
+        classified.len() >= 8,
+        "this fixture is here for its several failures, and it has {}",
+        classified.len()
+    );
+
+    // The fact the rte guidance rests on, pinned where it can be checked. The
+    // advice tells a caller to read the goal's own predicate rather than fetch
+    // it with context {want: ["rte_obligations"]}, which is only worth saying
+    // while the field is nearly always there. An earlier round of this work got
+    // it backwards, and nothing end to end would have caught it.
+    //
+    // A ratio and not an emptiness check, deliberately. This assertion asserted
+    // "every goal carries one" and passed, on this fixture, while the guidance
+    // it protects said the same thing and was false: predicate is copied from
+    // the property row a goal discharges, so a goal matching no row, or a row
+    // without one, has no such key, and 2 of 79 goals on test_comprehensive.c
+    // do not. An emptiness check here pins bubble_sort.c rather than the claim,
+    // which is the failure mode the guidance itself had.
+    let without: Vec<&str> = goals
+        .iter()
+        .filter(|g| g.get("predicate").and_then(|p| p.as_str()).is_none())
+        .filter_map(|g| g["wpo"].as_str())
+        .collect();
+    assert!(
+        without.len() * 4 < goals.len(),
+        "the rte advice says to read the goal's predicate, and {} of {} carry \
+         none: {without:?}. Below three in four the advice is no longer worth \
+         giving: either restore the field or point at rte_obligations first.",
+        without.len(),
+        goals.len()
+    );
+    eprintln!(
+        "predicate coverage: {} of {} goals carry one",
+        goals.len() - without.len(),
+        goals.len()
+    );
+
+    let mut keys = std::collections::BTreeSet::new();
+    let mut carriers = 0usize;
+    for c in &classified {
+        keys.insert(
+            c["advice_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every classified goal names its advice: {c}"))
+                .to_string(),
+        );
+        if c.get("advice").is_some() {
+            carriers += 1;
+        }
+    }
+    assert!(
+        keys.len() < classified.len(),
+        "with {} goals collapsing to {} keys there is nothing to demonstrate",
+        classified.len(),
+        keys.len()
+    );
+    assert_eq!(
+        carriers,
+        keys.len(),
+        "one carrier per key, not {carriers} across {} keys",
+        keys.len()
+    );
+
+    // What it saves, against the shape it replaced: the same advice on every
+    // goal. Compared rather than asserted as a byte count, so a fixture or a
+    // wording change moves both sides together.
+    let advice: std::collections::BTreeMap<&str, &serde_json::Value> = classified
+        .iter()
+        .filter(|c| c.get("advice").is_some())
+        .map(|c| (c["advice_key"].as_str().unwrap(), &c["advice"]))
+        .collect();
+    let actual = serde_json::to_string(&classified).unwrap().len();
+
+    // Every goal would carry its key's advice, so the counterfactual is what is
+    // sent now plus one copy for each goal that does not hold one.
+    let unsplit = actual
+        + classified
+            .iter()
+            .filter(|c| c.get("advice").is_none())
+            .map(|c| {
+                let key = c["advice_key"].as_str().unwrap();
+                serde_json::to_string(advice[key]).unwrap().len()
+            })
+            .sum::<usize>();
+    assert!(
+        actual * 4 < unsplit * 3,
+        "the split must cut at least a quarter here: {actual} against {unsplit} unsplit"
+    );
+
+    // And the part it does not save. next_action.reason restates the advice per
+    // goal, and it is pinned per-goal by an older test, so this is the ceiling
+    // on what the split can do rather than a defect to fix here.
+    let reasons: usize = classified
+        .iter()
+        .map(|c| c["next_action"]["reason"].as_str().unwrap_or("").len())
+        .sum();
+    assert!(
+        reasons > (unsplit - actual) / 4,
+        "the per-goal reasons are the remaining duplication, and they are \
+         {reasons} bytes against {} hoisted; if that has changed, \
+         re-read whether the split is still where the payload goes",
+        unsplit - actual
+    );
+    eprintln!(
+        "advice split: {} goals, {} keys, {actual} bytes assembled against \
+         {unsplit} unsplit, {reasons} still repeated in next_action.reason",
+        classified.len(),
+        keys.len()
+    );
+
+    // What truncating the reason to its first sentence would save. Reported
+    // rather than acted on, because the saving was measured and the change was
+    // then rejected on the text: for several categories the first sentence is a
+    // diagnosis rather than an action. "Two different faults share this
+    // branch." and "The callee's requires is not established at this call."
+    // both put the thing to do in the second sentence, so a caller reading one
+    // goal would be left with a finding and no next step. The number is kept so
+    // the next person weighing this starts from it instead of re-measuring.
+    let first_sentence_bytes: usize = classified
+        .iter()
+        .map(|c| {
+            let text = c["next_action"]["reason"].as_str().unwrap_or("");
+            text.find(". ").map_or(text.len(), |end| end + 1)
+        })
+        .sum();
+    eprintln!(
+        "reason ceiling: {reasons} bytes now, {first_sentence_bytes} if each \
+         reason stopped at its first sentence"
+    );
+
+    // The budget this whole split exists to defend. A classified goal costs
+    // what it costs; what broke before was guidance text growing inside
+    // failure_classification with nothing measuring it, so the growth reached a
+    // real function as an unreadable reply rather than as a failing test.
+    //
+    // Calibrated against the regression it exists to catch, not just against
+    // today's figure. 37431 bytes over 16 goals is 2340 per goal. The round of
+    // guidance edits that caused this added 641 bytes per goal, which lands at
+    // 2981, so a ceiling of 3000 would have let through the very thing it was
+    // written for. 2600 keeps about 11 percent of headroom and still fails on
+    // an addition that size. Rerun this test to see the current figure in the
+    // line above. Raising the ceiling is a legitimate change; doing it without
+    // noticing is the one this stops.
+    //
+    // The mix is pinned first, because the average is a function of it and 11
+    // percent is not much room. The categories carry reason strings of very
+    // different lengths, the rte-timeout one running about two and a half times
+    // the generic, and each goal carries its reason twice. So a slower runner
+    // that times out more goals, or a faster one that closes some, moves this
+    // average without anything having been added to the payload, and the
+    // ceiling failure would then name a text growth that did not happen.
+    let mut by_category: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for c in &classified {
+        *by_category
+            .entry(c["category"].as_str().unwrap_or("?"))
+            .or_default() += 1;
+    }
+    assert_eq!(
+        by_category.get("timeout").copied().unwrap_or(0),
+        classified.len(),
+        "the ceiling below is calibrated on an all-timeout mix and this run is \
+         {by_category:?}. The prover or the budget moved, so re-measure the \
+         per-goal figure before reading a ceiling failure as added text."
+    );
+
+    // Two-sided on purpose, and the lower bound is the part that matters.
+    //
+    // A one-sided ceiling goes slack on its own. This one was set at 2600
+    // against a measured 2340, sized so the 641-bytes-per-goal round that
+    // caused all this would fail it. Then next_action and suggested_next_tool
+    // stopped being sent twice, the figure fell to 1654, and the ceiling did
+    // not follow: 1654 plus that same 641 is 2295, under 2600, so the gate
+    // quietly stopped catching the regression it exists for. Nothing was wrong
+    // with the payload; the gate had drifted away from it.
+    //
+    // So the baseline is recorded and the payload has to stay near it in both
+    // directions. TOLERANCE is under the regression size, which is what makes
+    // the upper bound bite. A legitimate shrink trips the lower bound, and the
+    // fix is to update BASELINE, which drags the ceiling down with it. That is
+    // the step that did not happen last time.
+    const BASELINE: usize = 1654;
+    const TOLERANCE: usize = 400;
+    let per_goal = actual / classified.len();
+    assert!(
+        per_goal < BASELINE + TOLERANCE,
+        "a classified goal costs {per_goal} bytes against a recorded {BASELINE}. \
+         Something added text to failure_classification: either hoist it into \
+         the advice block, which is sent once per category, or raise BASELINE \
+         deliberately and say in the commit message what a caller gets for the \
+         extra bytes."
+    );
+    assert!(
+        per_goal + TOLERANCE > BASELINE,
+        "a classified goal costs {per_goal} bytes against a recorded {BASELINE}, \
+         so the payload shrank and this gate is now looser than it reads. That \
+         is good news and an edit: set BASELINE to {per_goal} so the ceiling \
+         follows it down and keeps catching an addition of {TOLERANCE} bytes."
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// An advice_key a caller is handed has to resolve in the payload it was
+/// handed, not in the array the server happened to build.
+///
+/// This is the failure the split shipped with and no test could see. check
+/// summarizes wp_goals through summarize_entries, which keeps the first few
+/// goals passing goal_needs_failure_classification and reports the rest as a
+/// count. The carrier was elected by smallest stable_goal_id, a digest with no
+/// relation to position, so a shown goal routinely named a carrier that was
+/// among the omitted entries and its advice was in no part of the reply, while
+/// the playbook promised the opposite. Electing the first classified goal of
+/// each key instead makes the two agree by construction: check keeps goals on
+/// the same predicate that classifies them, so the carrier of a key is scanned
+/// before every other goal of that key and survives whenever any of them does.
+///
+/// Both halves are asserted, because they fail apart. The truncated payload is
+/// the election; recommended_next_call is a single classification lifted out
+/// of the array, which loses its advice however the election works.
+#[tokio::test]
+async fn a_truncated_check_still_resolves_every_advice_key() {
+    // Several failing goals over more than one category, and comfortably more
+    // than the five a summarized check shows. bubble_sort.c is the wrong
+    // fixture for this and was tried first: it truncates, but its four
+    // smallest-id carriers all landed inside the shown five, so the test passed
+    // against the very code it was written to fail.
+    let c_file = workspace_path("tests/fixtures/tutorial/linked-n.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let checked = call_tool_json(
+        &client,
+        "check",
+        json!({"function": "isolated_loop_1", "want": ["wp"], "wp": {"timeout": 5}}),
+    )
+    .await
+    .unwrap();
+
+    let shown = checked["wp_goals"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a summarized check reports goals under entries: {checked}"));
+    assert!(
+        checked["wp_goals"]["omitted"].as_u64().unwrap_or(0) > 0,
+        "this fixture is here because check truncates it, and it did not: {}",
+        checked["wp_goals"]
+    );
+
+    let classified: Vec<&serde_json::Value> = shown
+        .iter()
+        .filter_map(|goal| goal.get("failure_classification"))
+        .collect();
+    assert!(
+        classified.len() >= 2,
+        "nothing to demonstrate with {} classified goals shown",
+        classified.len()
+    );
+
+    // Every key named in the truncated view is carried in the truncated view.
+    let carried: std::collections::BTreeSet<&str> = classified
+        .iter()
+        .filter(|c| c.get("advice").is_some())
+        .filter_map(|c| c["advice_key"].as_str())
+        .collect();
+    let named: std::collections::BTreeSet<&str> = classified
+        .iter()
+        .filter_map(|c| c["advice_key"].as_str())
+        .collect();
+    let dangling: Vec<&&str> = named.difference(&carried).collect();
+    assert!(
+        dangling.is_empty(),
+        "{} of {} shown keys resolve to a carrier check did not send: {dangling:?}. \
+         The advice for those categories is in no part of this reply.",
+        dangling.len(),
+        named.len()
+    );
+
+    // And the one classification check quotes on its own carries its advice,
+    // rather than an advice_key pointing at a goal the caller never received.
+    let quoted = &checked["recommended_next_call"]["classification"];
+    if !quoted.is_null() {
+        assert!(
+            quoted["advice"]["suggested_fix"]
+                .as_str()
+                .is_some_and(|fix| !fix.is_empty()),
+            "the recommended call quotes one goal to explain itself, and it \
+             explains nothing without the advice its key names: {quoted}"
+        );
+    }
+
     let _ = client.cancel().await;
 }

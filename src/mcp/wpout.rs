@@ -247,17 +247,16 @@ pub fn parse_wp_print_blocks(output: &str) -> Vec<serde_json::Value> {
             // calls that used to sit inside it could not fire, since as_mut had
             // already proved the Some, but they left the reader deriving that
             // before ruling out a panic.
-            if title_ends_here {
-                if let Some((title_function, title)) = pending_title.take() {
-                    current = Some((title_function, title, Vec::new()));
-                }
+            if let Some((title_function, title)) =
+                pending_title.take_if(|_| title_ends_here)
+            {
+                current = Some((title_function, title, Vec::new()));
             }
             continue;
         }
-        if let Some((_, _, body)) = current.as_mut() {
-            if trimmed == ":" || trimmed.chars().all(|ch| ch == '-') {
-                continue;
-            }
+        // A bare ":" or a rule of dashes is separator rather than body.
+        let separator = trimmed == ":" || trimmed.chars().all(|ch| ch == '-');
+        if let Some((_, _, body)) = current.as_mut().filter(|_| !separator) {
             body.push(line.to_string());
         }
     }

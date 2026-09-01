@@ -27,55 +27,170 @@ const VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS: usize = 16;
 /// ones, cannot dominate the response.
 const CHECK_SUMMARY_PREVIEW_ITEMS: usize = 5;
 
+/// Hold the response to the advertised byte cap, shedding the cheapest thing
+/// first: preview rows, then the blocked list inside next_action, then the
+/// action itself, and only then the whole body.
+///
+/// next_action.args is never shed. It is a call for the caller to make, and a
+/// shortened argument would quietly change what that call asks for.
 pub fn finish_verify_program_step_response(mut response: serde_json::Value) -> serde_json::Value {
-    let mut bytes = verify_program_step_payload_bytes(&response);
     if let Some(obj) = response.as_object_mut() {
         obj.insert(
             "payload_budget".into(),
             json!({
                 "cap_bytes": VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
-                "bytes": bytes,
+                "bytes": 0,
                 "omitted_fields": ["order", "verification_order", "scc_groups", "conclusions", "project_state"],
             }),
         );
     }
-    bytes = verify_program_step_payload_bytes(&response);
-    if let Some(obj) = response.as_object_mut().and_then(|obj| obj.get_mut("payload_budget")).and_then(|value| value.as_object_mut()) {
-        obj.insert("bytes".into(), json!(bytes));
-    }
-    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+    let mut bytes = record_verify_program_step_payload_bytes(&mut response);
+
+    // Keep one row of each preview first, which is enough to show the caller
+    // what shape the omitted rows had. One retained row can itself be larger
+    // than the budget, for example a generated function name or a cyclic SCC,
+    // so the second pass keeps none.
+    for keep in [1, 0] {
+        if bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+            break;
+        }
+        let mut shed = false;
         if let Some(obj) = response.as_object_mut() {
-            let already_omitted = obj
-                .get("ready_functions_omitted")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as usize;
-            if let Some(ready) = obj.get_mut("ready_functions").and_then(|value| value.as_array_mut()) {
-                let total = ready.len() + already_omitted;
-                ready.truncate(1);
-                obj.insert("ready_functions_omitted".into(), json!(total.saturating_sub(1)));
-            }
-            let frontier_already_omitted = obj
-                .get("frontier_omitted")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as usize;
-            if let Some(frontier) = obj.get_mut("frontier").and_then(|value| value.as_array_mut()) {
-                let total = frontier.len() + frontier_already_omitted;
-                frontier.truncate(1);
-                obj.insert("frontier_omitted".into(), json!(total.saturating_sub(1)));
-            }
+            shed |= omit_preview_rows(obj, "ready_functions", "ready_functions_omitted", keep);
+            shed |= omit_preview_rows(obj, "frontier", "frontier_omitted", keep);
         }
-        bytes = verify_program_step_payload_bytes(&response);
-        if let Some(obj) = response.as_object_mut().and_then(|obj| obj.get_mut("payload_budget")).and_then(|value| value.as_object_mut()) {
-            obj.insert("bytes".into(), json!(bytes));
+        if shed {
+            bytes = record_verify_program_step_payload_bytes(&mut response);
         }
+    }
+
+    // The blocked list rides inside next_action, so the passes above cannot
+    // reach it. It arrives already previewed, so reaching here means even the
+    // preview does not fit and no row of it can be kept.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        let shed = response
+            .get_mut("next_action")
+            .and_then(|value| value.as_object_mut())
+            .is_some_and(|action| {
+                omit_preview_rows(action, "blocked_functions", "blocked_functions_omitted", 0)
+            });
+        if shed {
+            bytes = record_verify_program_step_payload_bytes(&mut response);
+        }
+    }
+
+    // The ready function's name also sits in next_action.args, which is not
+    // shed. Drop the whole action instead, and only when that name is what put
+    // the response over: the gate is the measurement, so the reason below is
+    // true whenever it is printed.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        let name_bytes = response
+            .pointer("/next_action/args/function")
+            .and_then(|value| value.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        if name_bytes > 0 && bytes - name_bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("next_action".into(), json!({
+                    "tool": null,
+                    "args": {},
+                    "reason": "The ready function's name does not fit the response budget, so no call naming it can be sent; read the frontier with list.",
+                    "blockers": ["oversized_function_name"],
+                    "confidence": "high",
+                }));
+            }
+            bytes = record_verify_program_step_payload_bytes(&mut response);
+        }
+    }
+
+    // Two fields are still bounded only by the project: the in_progress names
+    // echoed in args, which the passes above deliberately do not touch, and a
+    // persist error carrying a path. Neither is reachable at this size in
+    // practice, and this keeps the cap true rather than assuming so.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        response = json!({
+            "status": "payload_truncated",
+            "next_action": {
+                "tool": null,
+                "args": {},
+                "reason": "The response did not fit the payload budget with every omittable field already dropped; repeating the call returns this same answer.",
+                "blockers": ["payload_budget"],
+                "confidence": "high",
+            },
+            "payload_budget": {
+                "cap_bytes": VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
+                "bytes": 0,
+                "omitted_fields": ["response"],
+            },
+        });
+        record_verify_program_step_payload_bytes(&mut response);
     }
     response
 }
 
+/// Shrink an array field to keep rows, and add the dropped ones to the count
+/// named beside it. The count is cumulative: an earlier pass may already have
+/// previewed the array, and those rows were never here to drop.
+///
+/// Answers whether any row went, so a caller measuring the result can skip the
+/// measurement when nothing changed.
+fn omit_preview_rows(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    omitted: &str,
+    keep: usize,
+) -> bool {
+    let already_omitted = obj
+        .get(omitted)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let Some(items) = obj.get_mut(field).and_then(|value| value.as_array_mut()) else {
+        return false;
+    };
+    let before = items.len();
+    let total = before + already_omitted;
+    items.truncate(keep);
+
+    // Charge the rows that actually went, not an assumed one: truncate keeps
+    // nothing when the array was already empty.
+    let retained = items.len();
+    obj.insert(omitted.into(), json!(total.saturating_sub(retained)));
+    retained < before
+}
+
+/// The size of what is about to be sent. A payload that cannot be serialized
+/// is reported as too large rather than as empty, so it trips the budget guard
+/// instead of sailing past every check.
 fn verify_program_step_payload_bytes(response: &serde_json::Value) -> usize {
     serde_json::to_string_pretty(response)
         .map(|text| text.len())
-        .unwrap_or(0)
+        .unwrap_or(usize::MAX)
+}
+
+/// Record the serialized size. Writing the number can change its digit count,
+/// so measure again until the recorded value is the value being sent.
+///
+/// This terminates. Once payload_budget.bytes exists, the length is
+/// constant + digits(recorded), which is non-decreasing in recorded, so the
+/// iteration is monotone; it is bounded, since a usize has at most 20 digits;
+/// and a bounded monotone integer sequence is eventually constant.
+fn record_verify_program_step_payload_bytes(response: &mut serde_json::Value) -> usize {
+    let mut recorded = 0;
+    loop {
+        let bytes = verify_program_step_payload_bytes(response);
+        if bytes == recorded {
+            return bytes;
+        }
+        recorded = bytes;
+        if let Some(obj) = response
+            .pointer_mut("/payload_budget")
+            .and_then(|value| value.as_object_mut())
+        {
+            obj.insert("bytes".into(), json!(recorded));
+        } else {
+            return bytes;
+        }
+    }
 }
 
 async fn exec_eva_compute(client: &FramaCClient) -> Result<Vec<serde_json::Value>, FramaCError> {
@@ -1233,6 +1348,47 @@ pub fn incomplete_guidance(incomplete: &[serde_json::Value]) -> serde_json::Valu
 /// Returns the goals this pass judged, keyed by WP's obligation id, because
 /// the proofread findings below can only be attributed to a goal that was
 /// judged here.
+/// The gap a goal WP proved can still leave, or None when it leaves none.
+///
+/// Reaching this at all means the property verdict disagreed with the goal,
+/// since a property that consolidated to valid was skipped before the call.
+/// Dead code is one way; resting on an unestablished hypothesis is the other,
+/// and a goal in that second arm used to match neither test and go unreported
+/// with the verdict reading proved over it.
+fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json::Value> {
+    let field = |name: &str| goal.get(name).cloned().unwrap_or_else(|| json!(null));
+    if property_is_dead(goal) {
+        return Some(json!({
+            "code": incomplete_code::PROPERTY_DEAD,
+            "reason": "WP proved this goal, but its property sits in code EVA proved unreachable.",
+            "stable_goal_id": field("stable_goal_id"),
+            "frama_c_goal_name": field("frama_c_goal_name"),
+            "goal_kind": field("goal_kind"),
+            "normalized_status": status,
+            "property_status": field("normalized_property_status"),
+        }));
+    }
+    if goal_is_valid_under_hypotheses(goal) {
+        return Some(json!({
+            "code": incomplete_code::VALID_UNDER_HYP,
+            "reason": "WP proved this goal, but Frama-C consolidated its property as valid only under hypotheses that are not themselves established.",
+            "stable_goal_id": field("stable_goal_id"),
+            "frama_c_goal_name": field("frama_c_goal_name"),
+            "goal_kind": field("goal_kind"),
+            "normalized_status": status,
+            "property_status": field("normalized_property_status"),
+
+            // Which hypotheses, when the goal carries them.
+            // enrich_goal_with_property_status resolves "deps" against the
+            // property table, and naming them is the difference between this
+            // finding and the guess the unproved-assumption finding has to
+            // make.
+            "hypotheses": field("hypotheses"),
+        }));
+    }
+    None
+}
+
 fn wp_goal_gaps<'a>(
     incomplete: &mut Vec<serde_json::Value>,
     eva_alarms: &'a serde_json::Value,
@@ -1310,34 +1466,7 @@ fn wp_goal_gaps<'a>(
             // arm used to match neither test and go unreported, with the
             // verdict reading proved over it.
             if is_proved(status) {
-                if property_is_dead(goal) {
-                    incomplete.push(json!({
-                        "code": incomplete_code::PROPERTY_DEAD,
-                        "reason": "WP proved this goal, but its property sits in code EVA proved unreachable.",
-                        "stable_goal_id": goal.get("stable_goal_id").cloned().unwrap_or_else(|| json!(null)),
-                        "frama_c_goal_name": goal.get("frama_c_goal_name").cloned().unwrap_or_else(|| json!(null)),
-                        "goal_kind": goal.get("goal_kind").cloned().unwrap_or_else(|| json!(null)),
-                        "normalized_status": status,
-                        "property_status": goal.get("normalized_property_status").cloned().unwrap_or_else(|| json!(null)),
-                    }));
-                } else if goal_is_valid_under_hypotheses(goal) {
-                    incomplete.push(json!({
-                        "code": incomplete_code::VALID_UNDER_HYP,
-                        "reason": "WP proved this goal, but Frama-C consolidated its property as valid only under hypotheses that are not themselves established.",
-                        "stable_goal_id": goal.get("stable_goal_id").cloned().unwrap_or_else(|| json!(null)),
-                        "frama_c_goal_name": goal.get("frama_c_goal_name").cloned().unwrap_or_else(|| json!(null)),
-                        "goal_kind": goal.get("goal_kind").cloned().unwrap_or_else(|| json!(null)),
-                        "normalized_status": status,
-                        "property_status": goal.get("normalized_property_status").cloned().unwrap_or_else(|| json!(null)),
-
-                        // Which hypotheses, when the goal carries them.
-                        // enrich_goal_with_property_status resolves "deps"
-                        // against the property table, and naming them is the
-                        // difference between this finding and the guess the
-                        // unproved-assumption finding has to make.
-                        "hypotheses": goal.get("hypotheses").cloned().unwrap_or_else(|| json!(null)),
-                    }));
-                }
+                incomplete.extend(proved_goal_gap(goal, status));
                 continue;
             }
             incomplete.push(json!({
@@ -1473,6 +1602,21 @@ type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
 /// Free-standing so the decision can be tested without a Frama-C instance: the
 /// case that matters most is the one no integration test can stage, a run where
 /// every variant proved and no digest was ever established.
+/// Take "label", or the first "label#n" nobody has taken, and record it.
+///
+/// Looped, not suffixed once: a caller who passes "a" twice and also passes
+/// "a#1" would otherwise get two variants called "a#1", and duplicate_ast
+/// names a label, so it would point at whichever of them landed first.
+fn claim_label(taken: &mut std::collections::HashSet<String>, label: String, from: usize) -> String {
+    if taken.insert(label.clone()) {
+        return label;
+    }
+    (from..)
+        .map(|suffix| format!("{label}#{suffix}"))
+        .find(|candidate| taken.insert(candidate.clone()))
+        .unwrap_or(label)
+}
+
 pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Value {
     let digest_of = |entry: &serde_json::Value| {
         entry
@@ -1607,11 +1751,11 @@ pub fn ast_diagnostic_gaps(
     // which is what lets the zero-count branch below skip a category instead of
     // having to hedge it, and it is what keeps two checks of one session
     // reporting the same codes: an entry that appeared only on the second would
-    // move proof_receipt.sha256, since the receipt digests incomplete.
-    // A record that says why it is empty is a finding rather than silence.
-    // Reading it as a clean parse would let check answer "proved" on the one
-    // shape where nothing established that the analyzed program is the
-    // compiled one, which is the claim these codes exist to make.
+    // move proof_receipt.sha256, since the receipt digests incomplete. A record
+    // that says why it is empty is a finding rather than silence. Reading it as
+    // a clean parse would let check answer "proved" on the one shape where
+    // nothing established that the analyzed program is the compiled one, which
+    // is the claim these codes exist to make.
     if let Some(reason) = diagnostics["unavailable"].as_str() {
         incomplete.push(json!({
             "code": incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE,
@@ -1642,6 +1786,7 @@ pub fn ast_diagnostic_gaps(
             }));
             continue;
         }
+
         // A classified category left the loop above, so the only thing that
         // keeps one out of the aggregate here is a row saying why its silence
         // is deliberate.
@@ -1956,11 +2101,52 @@ fn first_alarm_next_call(alarms: &serde_json::Value) -> Option<serde_json::Value
     })
 }
 
+/// One goal's classification, with the advice its key names folded back in.
+///
+/// get_wp_goals sends each advice once, on the first classified goal of its
+/// key, because repeating it per goal is what made a stuck function
+/// unreadable. That is right for an array a caller reads whole and wrong the
+/// moment a single classification is lifted out of it: quoted on its own, a
+/// non-carrier's classification is status plumbing and an advice_key pointing
+/// at a sibling the caller was never handed. Anything embedding one goal has
+/// to resolve the key first, which is what this does.
+pub fn classification_with_advice(
+    goal: &serde_json::Value,
+    goals: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut classification = goal
+        .get("failure_classification")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if classification.get("advice").is_some() {
+        return classification;
+    }
+    let Some(key) = classification
+        .get("advice_key")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return classification;
+    };
+    let advice = goals.iter().find_map(|sibling| {
+        let sibling = sibling.get("failure_classification")?;
+        if sibling.get("advice_key").and_then(|value| value.as_str()) != Some(key.as_str()) {
+            return None;
+        }
+        sibling.get("advice").cloned()
+    });
+    if let (Some(advice), Some(object)) = (advice, classification.as_object_mut()) {
+        object.insert("advice".to_string(), advice);
+    }
+    classification
+}
+
 fn first_wp_goal_next_call(
     goals: &serde_json::Value,
     function: Option<&str>,
 ) -> Option<serde_json::Value> {
-    goals.as_array()?.iter().find_map(|goal| {
+    let goals = goals.as_array()?;
+    goals.iter().find_map(|goal| {
         let normalized_status = goal
             .get("normalized_status")
             .and_then(|value| value.as_str())
@@ -1975,19 +2161,20 @@ fn first_wp_goal_next_call(
         if normalized_status == Some("valid") || raw_status.as_deref() == Some("valid") {
             return None;
         }
+        let classification = classification_with_advice(goal, goals);
         if let Some(function) = function {
             Some(json!({
                 "tool": "get_wp_goals",
                 "args": {"want": ["vc"], "function": function},
                 "reason": "WP has a non-valid goal; inspect VC details and the attached failure_classification before changing the annotation.",
-                "classification": goal.get("failure_classification").cloned().unwrap_or(serde_json::Value::Null),
+                "classification": classification,
             }))
         } else {
             Some(json!({
                 "tool": "get_wp_goals",
                 "args": {},
                 "reason": "WP has a non-valid goal; inspect its failure_classification before changing the annotation.",
-                "classification": goal.get("failure_classification").cloned().unwrap_or(serde_json::Value::Null),
+                "classification": classification,
             }))
         }
     })
@@ -2208,8 +2395,15 @@ fn enrich_vcs_with_goals(
             }
         } else {
             let prover_result = wp_prover_result(vc);
+
+            // The same shape the goals above carry. A VC that matched no goal
+            // used to get the unsplit classification, so one reply could hand a
+            // caller two different layouts under one field name: siblings with
+            // an advice_key naming a shared block, and this one with the same
+            // content spread across proofread_report, runtime_check_suggestion
+            // and semantic_verdict and no key at all.
             let failure_classification = goal_needs_failure_classification(vc)
-                .then(|| classify_wp_failure_from_goal(vc, Some(function)));
+                .then(|| goal_classification_with_own_advice(vc, Some(function)));
             if let Some(obj) = vc.as_object_mut() {
                 obj.entry("prover_result".to_string())
                     .or_insert(prover_result);
@@ -3082,17 +3276,7 @@ impl FramaCMcpServer {
             // passes "a#1" would otherwise get two variants called "a#1", and
             // duplicate_ast names a label, so it would point at whichever of
             // them landed first.
-            if !labels_seen.insert(label.clone()) {
-                let base = label.clone();
-                let mut suffix = index;
-                loop {
-                    label = format!("{base}#{suffix}");
-                    if labels_seen.insert(label.clone()) {
-                        break;
-                    }
-                    suffix += 1;
-                }
-            }
+            label = claim_label(&mut labels_seen, label, index);
 
             // params starts as base, so Option::or is the override: the
             // variant's value when it set one, the base's otherwise. One
@@ -4220,17 +4404,59 @@ impl FramaCMcpServer {
 
         // Add `goal_kind` and (if any) `hash_label` to each goal, so callers
         // can distinguish spec, source assert, and RTE failures.
+        let mut advice_carried: BTreeSet<String> = BTreeSet::new();
         let augmented: Vec<serde_json::Value> = selected
             .into_iter()
             .map(|mut g| {
                 add_identity_fields(&mut g);
                 enrich_goal_with_property_status(&mut g, &properties_by_marker);
                 finish_goal(&mut g, &goals_by_marker, stable_scope.as_deref());
-                let failure_classification = goal_needs_failure_classification(&g)
-                    .then(|| classify_wp_failure_from_goal(&g, function));
-                if let Some(obj) = g.as_object_mut() {
-                    if let Some(classification) = failure_classification {
-                        obj.insert("failure_classification".to_string(), classification);
+
+                // The goal keeps what is its own. The advice, which is a
+                // function of category and goal kind rather than of the goal,
+                // rides on the first goal of each pair and the rest name it by
+                // key. Attaching the whole classification per goal is what made
+                // a legitimately-stuck function unreadable: 21 goals, 147 KB,
+                // of which the duplicated advice was 106 KB, against 1.7 KB of
+                // triage fields and two distinct categories underneath.
+                //
+                // An earlier attempt capped how many goals carried the block,
+                // which still duplicated up to the cap and dropped advice past
+                // it. A second appended the advice as one extra array element,
+                // which is worse: every element of this array is a goal, and
+                // three stdio tests walk it expecting that. Carrying it on a
+                // real goal keeps the contract and still emits each advice
+                // once.
+                //
+                // The carrier is the first classified goal of its key, in the
+                // order this array is about to be emitted in. That is what
+                // makes the key resolvable in a truncated view, and it is the
+                // whole reason the election is positional: check summarizes
+                // this array with summarize_entries, which keeps the first few
+                // entries passing goal_needs_failure_classification, the same
+                // predicate that decides classification here. So the carrier of
+                // a key is scanned before every other goal of that key and is
+                // kept whenever any of them is. Electing by smallest
+                // stable_goal_id instead, which an earlier version did, picks a
+                // digest uncorrelated with position, and a shown goal's
+                // advice_key then routinely named a carrier that truncation had
+                // dropped, leaving that advice in no part of the reply.
+                if goal_needs_failure_classification(&g) {
+                    let classification = classify_wp_failure_from_goal(&g, function);
+                    let (mut per_goal, key, advice) = split_goal_classification(&classification);
+
+                    // insert answers whether this key has been seen, so first
+                    // wins and nothing later can attach a second copy. Goals
+                    // with no stable_goal_id need no special case any more: the
+                    // carrier is a position rather than a name, so there is
+                    // nothing for a later pass to fail to look up.
+                    if advice_carried.insert(key) {
+                        if let Some(obj) = per_goal.as_object_mut() {
+                            obj.insert("advice".to_string(), advice);
+                        }
+                    }
+                    if let Some(obj) = g.as_object_mut() {
+                        obj.insert("failure_classification".to_string(), per_goal);
                     }
                 }
                 g
@@ -4710,12 +4936,15 @@ impl FramaCMcpServer {
                 .collect::<Vec<_>>();
 
             // Stored conclusions are the only record of per-function progress.
-            // BTreeSet keeps both lists sorted and deduplicated once the
-            // caller's own in_progress names merge in below, so neither needs a
-            // later sort.
+            // BTreeSet keeps all three lists sorted and deduplicated once the
+            // caller's own in_progress names merge in below, so none needs a
+            // later sort. Order is not cosmetic here: conclusions arrive from a
+            // HashMap, and the blocked list is previewed rather than sent
+            // whole, so an unordered one would show a different sample of the
+            // same state on every call.
             let mut done = std::collections::BTreeSet::new();
             let mut in_progress = std::collections::BTreeSet::new();
-            let mut blocked_functions = Vec::new();
+            let mut blocked_functions = std::collections::BTreeSet::new();
             for conclusion in &conclusions {
                 match conclusion.status {
                     crate::state::VerificationStatus::Verified => {
@@ -4727,7 +4956,7 @@ impl FramaCMcpServer {
                     crate::state::VerificationStatus::Failed
                     | crate::state::VerificationStatus::Unsound
                     | crate::state::VerificationStatus::BlockedOnCallee => {
-                        blocked_functions.push(conclusion.function.clone());
+                        blocked_functions.insert(conclusion.function.clone());
                     }
                 }
             }
@@ -4828,7 +5057,7 @@ impl FramaCMcpServer {
             "eva_completed": eva_completed,
             "wp_completed": wp_completed,
         });
-        let next_action = if all_done {
+        let mut next_action = if all_done {
             json!({
                 "status": "done",
                 "tool": null,
@@ -4867,6 +5096,17 @@ impl FramaCMcpServer {
                 "confidence": "medium",
             })
         };
+        // The blocked list is the one unbounded thing an action carries, and
+        // the same rule that previews the two lists beside it applies here.
+        // Every other branch has no such field and this leaves it untouched.
+        if let Some(action) = next_action.as_object_mut() {
+            omit_preview_rows(
+                action,
+                "blocked_functions",
+                "blocked_functions_omitted",
+                VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS,
+            );
+        }
 
         let response = finish_verify_program_step_response(json!({
             "project_locked": project_locked,
@@ -5032,11 +5272,18 @@ impl FramaCMcpServer {
         let goals_by_marker = property_status_map(&goals);
         for goal in &mut goals {
             finish_goal(goal, &goals_by_marker, Some(&resolved.function));
-            let failure_classification = goal_needs_failure_classification(goal)
-                .then(|| classify_wp_failure_from_goal(goal, Some(&resolved.function)));
-            if let Some(obj) = goal.as_object_mut() {
-                if let Some(classification) = failure_classification {
-                    obj.insert("failure_classification".to_string(), classification);
+
+            // The same split the goal list uses, so failure_classification
+            // means one thing across this tool rather than two. What differs is
+            // that nothing is deduplicated here: this path answers an explicit
+            // want ["vc"] for a handful of goals read one at a time, so every
+            // goal carries its own advice and none of them has to resolve a key
+            // against a sibling.
+            if goal_needs_failure_classification(goal) {
+                let per_goal =
+                    goal_classification_with_own_advice(goal, Some(&resolved.function));
+                if let Some(object) = goal.as_object_mut() {
+                    object.insert("failure_classification".to_string(), per_goal);
                 }
             }
         }

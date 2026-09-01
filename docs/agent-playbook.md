@@ -88,6 +88,33 @@ comparing against. Only runs from this session can be named, and an unknown
 hash is an error rather than an empty diff, so a reload or a restart means
 starting from a fresh baseline instead of silently reporting no change.
 
+Record the verdict with `store_function_conclusion` rather than in a file of
+your own. A `verified` status needs a `proof_receipt` as evidence, and the
+server checks the receipt's bytes against the hash it wrote, so echoing the
+object back through your own context is both large and fragile: one function's
+receipt runs to kilobytes, most of it a goal array, and a single altered field
+is rejected without saying which. Pass `proof_receipt_sha256` instead. The
+server resolves the hash against the receipt this process produced, so the
+same coherence check runs against the same bytes and nothing has to be
+transcribed. The same rule as `since` applies: only a run from this session can
+be named, and an unknown hash is an error rather than a shrug.
+
+A goal that failed carries `failure_classification`. Most of it is that goal's
+own: its status, its evidence, and a `next_action` whose reason names
+the file and line. The part that is a function of the category rather than of
+the goal, the longer explanation and any runtime-check suggestion, is sent once
+per `category:goal_kind` pair and rides a single goal in the list under
+`advice`. Every classified goal names its pair in `advice_key`, so a goal
+holding no `advice` block is not missing anything: its advice is on the sibling
+that carries the same key.
+
+The reason this matters to a caller rather than only to the server is size.
+Measured on one function whose goals were all unproved, repeating the block per
+goal came to 106 KB across 21 goals against 1.7 KB of the fields worth triaging
+from, which is enough to overflow a tool-result budget before anything is read.
+If you are scanning a long goal list, read `advice_key` to group, then read one
+`advice` per group.
+
 `rte: true` at load is the cheap way to get runtime-error obligations for the
 whole program, but it is not required. `run_wp` generates them for its targets
 when the project was loaded without it, and reports which under
@@ -242,7 +269,7 @@ Resume after an interruption by calling `verify_program_step`, then `list {kind:
 
 If `verify_program_step` returns more ready functions, stay locked and repeat from `create_sandbox` through the next `verify_program_step` before unlocking with `verify_program_step {lock_project: false}`. The completed set must contain only functions whose verified structured annotations have already been merged into the main project.
 
-Stopping condition: every defined function has a stored conclusion, `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals.
+Stopping condition: every defined function has a stored conclusion, `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals. "No remaining work" arrives as `next_action.tool: null`, which is the stop signal. The same null tool also means the response could not be held to its byte budget, so read `blockers` before concluding you are done: `[]` with `next_action.status: "done"` is the finished run, while `oversized_function_name` or `payload_budget` means the answer did not fit and calling again returns the same thing.
 
 Common failure branch: if no function is ready, inspect the `verification_order` and `scc_groups` returned by `verify_program_step` plus current `list {kind: "conclusions"}` output. If `reload_project` or `run_wp` is rejected while locked, finish sandbox work first or call `verify_program_step {lock_project: false}` only for the final main-project gate.
 
@@ -310,6 +337,64 @@ discharges, but only when the call named a `function`: authorship is answered
 per function, so a whole-project goal list leaves every goal undetermined.
 
 Common failure branch: if the server reports no project loaded, restart from `reload_project`. If a sandbox is missing, recreate it with `create_sandbox`. If a property key or goal no longer exists after reload, refresh with `get_wp_goals` and use the new marker.
+
+### A few goals stuck in a function that already has contracts
+
+The bulk-timeout branch below is the other shape: no contracts, everything
+open. This one is a function that is annotated, mostly proved, and holding a
+handful of goals that will not close. The mistake it invites is editing the
+invariant on suspicion, re-running, and reading a number that barely moves.
+Each guess costs a full proof run, and the number moving is not evidence the
+guess was right.
+
+Read the obligation before changing anything:
+
+```text
+get_wp_goals {function, status: "unproved"}
+```
+
+Nearly every goal it returns carries a `predicate`, which is what turns
+`mem_access_7` into `\valid(bucket_ids + j)`. Work from that field, not from the
+goal name: the trailing number counts siblings generated from one statement, so
+several open checks against one line are told apart by their predicates or not
+at all, and a name alone cannot say whether the write at index `j` or the read
+at `j-1` is the open one.
+
+Not quite every goal, and the exception matters because it is silent. The field
+is copied from the property row the goal discharges, so a goal that matched no
+row, or matched one carrying no predicate, simply has no `predicate` key.
+Measured on this repository's own fixtures, 2 of 79 goals on
+`test_comprehensive.c` and 2 of 21 on `tutorial/linked-n.c`. An earlier version
+of this section claimed the universal, which is the same mistake one level in
+from the one it was written to correct.
+
+`context {want: ["rte_obligations"], function}` is a second call worth making,
+for two reasons: it drafts the `requires` each check would need, which no goal
+carries, and it is where to look for the goals in that remainder. It is not
+where the predicate normally lives, and an even earlier version of this section
+said it was.
+
+Then decide from the predicate rather than from the count:
+
+- The predicate names a bound the caller guarantees and the function does not
+  state. Add the `requires`. `rte_obligations` has already drafted it.
+- The predicate names a bound the loop maintains. Add the invariant that says
+  so, and expect to need the one about contents, not just indices: an insertion
+  loop whose position search depends on the prefix being sorted needs the
+  sortedness stated, because no invariant over indices implies it.
+- The predicate is about a callee's frame. `contract_context` shows whether the
+  callee's `assigns` is what is missing, and no annotation in this function
+  will close it.
+
+Retry before rewriting. `retry_unproved` distinguishes a goal that needs a
+longer budget from one that does not move at whatever budget, and only the
+second is worth new annotation. A goal that is unchanged at six times the
+timeout is not going to yield to a seventh.
+
+Try the strengthening in a sandbox, not in the file. `create_sandbox
+{function}` holds its own copy, so a wrong invariant costs a respawn rather
+than an edit to revert, and the sandbox's goals can be diffed against the main
+project's. Copying the source tree by hand gets none of that.
 
 ### Unproved is not the same as unspecified
 

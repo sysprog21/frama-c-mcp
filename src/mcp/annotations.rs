@@ -403,18 +403,18 @@ pub fn relabel_origins(value: &mut serde_json::Value, origin: &HashMap<String, u
                     // caller writes.
                     "successful" => continue,
                     "derived_from" | "proposed_path" => {
-                        let relabelled =
-                            child.as_str().and_then(|path| relabel_path(path, origin));
-                        if let Some((path, index)) = relabelled {
+                        if let Some((path, index)) =
+                            child.as_str().and_then(|path| relabel_path(path, origin))
+                        {
                             *child = json!(path);
                             relabelled_index = Some(index);
                             continue;
                         }
                     }
                     "frama_c_error" | "message" => {
-                        let relabelled =
-                            child.as_str().and_then(|text| relabel_message(text, origin));
-                        if let Some(text) = relabelled {
+                        if let Some(text) =
+                            child.as_str().and_then(|text| relabel_message(text, origin))
+                        {
                             *child = json!(text);
                             continue;
                         }
@@ -561,26 +561,28 @@ fn build_injection_plan(
 
     // proposed_loop_annots: each loop expanded via loop_annots_to_acsl()
     if let Some(loop_annots) = inputs.loop_annots {
-        for (i, v) in loop_annots.iter().enumerate() {
-            for outcome in loop_annots_to_acsl(v, i, behaviors) {
-                match outcome {
-                    Ok((acsl_text, kind, derived_from, stmt_id, purpose, user_label)) => {
-                        plan.push(InjectionPlanEntry {
-                            acsl_text,
-                            kind,
-                            derived_from,
-                            stmt_id,
-                            purpose,
-                            user_label,
-                        });
-                    }
-                    Err((path, msg)) => early_failures.push(InjectionFailure {
-                        failure_type: classify_failure(&msg),
-                        proposed_path: path,
-                        acsl_text: String::new(),
-                        frama_c_error: msg,
-                    }),
+        let expanded = loop_annots
+            .iter()
+            .enumerate()
+            .flat_map(|(i, v)| loop_annots_to_acsl(v, i, behaviors));
+        for outcome in expanded {
+            match outcome {
+                Ok((acsl_text, kind, derived_from, stmt_id, purpose, user_label)) => {
+                    plan.push(InjectionPlanEntry {
+                        acsl_text,
+                        kind,
+                        derived_from,
+                        stmt_id,
+                        purpose,
+                        user_label,
+                    });
                 }
+                Err((path, msg)) => early_failures.push(InjectionFailure {
+                    failure_type: classify_failure(&msg),
+                    proposed_path: path,
+                    acsl_text: String::new(),
+                    frama_c_error: msg,
+                }),
             }
         }
     }

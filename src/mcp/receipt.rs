@@ -762,14 +762,14 @@ impl FramaCMcpServer {
         }));
 
         // Remembered here rather than at each call site, so every receipt a
-        // caller is handed is one they can later pass as `since`.
-        if let (Some(sha256), Some(receipt_goals)) =
-            (receipt["sha256"].as_str(), receipt["goals"].as_array())
-        {
+        // caller is handed is one they can later pass as "since", or name by
+        // hash where a whole receipt is wanted. The goals travel inside the
+        // body, so there is nothing to store beside it.
+        if let Some(sha256) = receipt["sha256"].as_str().map(str::to_string) {
             self.state
                 .write()
                 .await
-                .remember_receipt_goals(sha256, receipt_goals);
+                .remember_receipt(&sha256, receipt.clone());
         }
         receipt
     }

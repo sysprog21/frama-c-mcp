@@ -597,7 +597,12 @@ conclusion.
 `verify_program_step` returns one `next_action` plus the unverified `frontier`
 and any `blocked_functions`, under a hard `payload_budget` cap; when the payload
 would exceed it, lists are truncated and the dropped count is reported rather
-than silently omitted.
+than silently omitted. `next_action.args` is never truncated, because it is a
+call to make rather than a list to read. When truncation cannot bring the
+payload under the cap, `next_action.tool` is `null` and `blockers` names why,
+and in the last resort the whole body is replaced by
+`status: "payload_truncated"`; a `null` tool means stop, since repeating the
+call returns the same answer.
 
 ## Verification workflows
 

@@ -690,6 +690,7 @@ fn tool_registry_count_matches_declared_snapshots() {
             "function",
             "notes",
             "proof_receipt",
+            "proof_receipt_sha256",
             "specs",
             "status",
             "wp_summary",
