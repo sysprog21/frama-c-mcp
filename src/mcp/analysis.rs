@@ -5096,6 +5096,7 @@ impl FramaCMcpServer {
                 "confidence": "medium",
             })
         };
+
         // The blocked list is the one unbounded thing an action carries, and
         // the same rule that previews the two lists beside it applies here.
         // Every other branch has no such field and this leaves it untouched.

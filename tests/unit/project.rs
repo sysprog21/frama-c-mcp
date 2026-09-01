@@ -580,3 +580,207 @@ fn the_machdep_is_part_of_the_parse_identity() {
     std::fs::remove_file(&custom).expect("remove machdep");
     assert_ne!(loaded, loaded_source_digest(&files, Some(&custom)), "deleted");
 }
+
+#[test]
+fn a_missing_header_is_named_in_either_preprocessor_voice() {
+    // Taken from a real run, follow-on lines included. Frama-C echoes the whole
+    // failed preprocessor command after the diagnostic, and that echo carries
+    // "-include prelude.h" and a quoted source path. It is inert here only
+    // because it says neither "file not found" nor "No such file or directory",
+    // which is a property of the echo rather than of the scan: a widened
+    // matcher that keyed on a quoted name, or on ".h" alone, would answer
+    // "prelude.h" and send a reader to a header that is present and fine.
+    let clang = classify_parse_failure(
+        "[kernel] Parsing src/core/sysroot.c (with preprocessing)\n\
+         /abs/src/core/sysroot.c:14:10: fatal error: 'sys/mount.h' file not found\n\
+            14 | #include <sys/mount.h>\n\
+         1 error generated.\n\
+         [kernel] User Error: failed to run: gcc -E -C -I. -nostdinc \
+         -include prelude.h -include macos-libc.h -Isrc '/abs/src/core/sysroot.c' -o '/tmp/x.i'\n",
+    );
+    assert_eq!(clang.cause, "header_not_found");
+    assert_eq!(clang.subject.as_deref(), Some("sys/mount.h"));
+
+    let gcc = classify_parse_failure(
+        "src/fs.c:12:10: fatal error: sys/event.h: No such file or directory\n",
+    );
+    assert_eq!(gcc.cause, "header_not_found");
+    assert_eq!(gcc.subject.as_deref(), Some("sys/event.h"));
+}
+
+#[test]
+fn an_unresolved_name_is_told_from_a_missing_header() {
+    // The two need different answers: a stub can declare a name as the platform
+    // declares it, and cannot model a header Frama-C's libc does not have.
+    let block = classify_parse_failure(
+        "[kernel] src/sysctl.c:40: user error: Cannot resolve variable KERN_PROC\n",
+    );
+    assert_eq!(block.cause, "undeclared_name");
+    assert_eq!(block.subject.as_deref(), Some("KERN_PROC"));
+}
+
+#[test]
+fn the_first_cause_wins_over_the_errors_it_causes() {
+    // A missing header produces a run of unresolved names after it. Classifying
+    // by the last, or by the most frequent, would rank the consequence above
+    // the cause and send a reader to write stubs for names that would resolve
+    // the moment the header did.
+    let block = classify_parse_failure(
+        "src/fs.c:12:10: fatal error: 'sys/attr.h' file not found\n\
+         [kernel] user error: Cannot resolve variable ATTR_CMN_NAME\n\
+         [kernel] user error: Cannot resolve variable ATTR_CMN_OBJTYPE\n",
+    );
+    assert_eq!(block.cause, "header_not_found");
+    assert_eq!(block.subject.as_deref(), Some("sys/attr.h"));
+}
+
+#[test]
+fn an_unrecognized_failure_quotes_rather_than_guesses() {
+    let block = classify_parse_failure(
+        "[kernel] src/odd.c:3: user error: syntax error near something new\n",
+    );
+    assert_eq!(block.cause, "other");
+    assert_eq!(block.subject, None);
+    assert!(block.message.contains("syntax error"));
+}
+
+fn blocked(cause: &'static str, subject: &str) -> ParseProbe {
+    ParseProbe::Blocked(ParseBlock {
+        cause,
+        subject: Some(subject.to_string()),
+        message: String::new(),
+    })
+}
+
+#[test]
+fn causes_are_ranked_by_how_many_files_each_blocks() {
+    let probed = vec![
+        ("a.c".to_string(), blocked("header_not_found", "sys/event.h")),
+        ("b.c".to_string(), ParseProbe::Parsed),
+        ("c.c".to_string(), blocked("header_not_found", "sys/event.h")),
+        ("d.c".to_string(), blocked("undeclared_name", "KERN_PROC")),
+        ("e.c".to_string(), blocked("header_not_found", "sys/event.h")),
+    ];
+    let payload = parse_surface_payload(&probed, false);
+    assert_eq!(payload["files_total"], 5);
+    assert_eq!(payload["files_parsed"], 1);
+    assert_eq!(payload["files_blocked"], 4);
+
+    let ranked = payload["blocked_by"].as_array().unwrap();
+    assert_eq!(ranked[0]["subject"], "sys/event.h");
+    assert_eq!(ranked[0]["files"], 3);
+    assert_eq!(ranked[0]["example"], "a.c");
+    assert_eq!(ranked[1]["subject"], "KERN_PROC");
+    assert_eq!(ranked[1]["files"], 1);
+
+    // The advice names the largest group and says which kind of gap it is,
+    // because a stub answers one of them and cannot answer the other.
+    let reason = payload["next_action"]["reason"].as_str().unwrap();
+    assert!(reason.contains("sys/event.h"), "{reason}");
+
+    // It must name both readings, since a header missing from the include path
+    // and one Frama-C does not model look identical here.
+    assert!(reason.contains("include path"), "{reason}");
+    assert!(reason.contains("does not model"), "{reason}");
+
+    // The per-file list is what makes this response large on a real tree, so it
+    // is the part that waits to be asked for.
+    assert!(payload.get("files").is_none());
+    assert_eq!(
+        parse_surface_payload(&probed, true)["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+}
+
+#[test]
+fn an_undeclared_name_is_advised_differently_from_a_header() {
+    let probed = vec![("a.c".to_string(), blocked("undeclared_name", "KERN_PROC"))];
+    let reason = parse_surface_payload(&probed, false)["next_action"]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("stub answers honestly"), "{reason}");
+}
+
+#[test]
+fn a_fully_parsing_set_asks_for_nothing() {
+    let probed = vec![
+        ("a.c".to_string(), ParseProbe::Parsed),
+        ("b.c".to_string(), ParseProbe::Parsed),
+    ];
+    let payload = parse_surface_payload(&probed, false);
+    assert_eq!(payload["files_blocked"], 0);
+    assert!(payload["blocked_by"].as_array().unwrap().is_empty());
+    assert_eq!(payload["next_action"]["tool"], serde_json::Value::Null);
+}
+
+/// The producer, not a hand-built probe.
+///
+/// The payload test below was written first and passed while nothing emitted
+/// this cause at all, because it constructs the ParseProbe itself. A test that
+/// green-lights absent functionality is worse than no test, so this one calls
+/// probe_parse and would fail if the guard were dropped. It needs no Frama-C:
+/// the check happens before anything is spawned, which is the point of it.
+#[tokio::test]
+async fn probe_parse_answers_missing_file_without_spawning() {
+    let probe = probe_parse(
+        "__frama_c_mcp_missing_binary__",
+        &[],
+        "/nowhere/definitely-absent.c",
+    )
+    .await;
+    match probe {
+        ParseProbe::Blocked(block) => {
+            assert_eq!(block.cause, "missing_file");
+            assert!(block.message.contains("definitely-absent.c"), "{block:?}");
+        }
+        other => panic!("expected a missing_file block, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_path_that_is_not_a_file_is_not_reported_as_a_parse_failure() {
+    let probed = vec![(
+        "/nowhere/absent.c".to_string(),
+        ParseProbe::Blocked(ParseBlock {
+            cause: "missing_file",
+            subject: None,
+            message: "/nowhere/absent.c is not a file".to_string(),
+        }),
+    )];
+    let payload = parse_surface_payload(&probed, false);
+    let reason = payload["next_action"]["reason"].as_str().unwrap();
+    // It must not read as a modeling gap: nothing was measured for this path.
+    assert!(reason.contains("not files"), "{reason}");
+    assert!(!reason.contains("include path"), "{reason}");
+}
+
+/// The two shapes the hand-rolled parser this replaced got wrong.
+///
+/// It took the first quoted token on the line, which is the heuristic
+/// missing_header_name's own doc comment exists to reject: Frama-C forwards a
+/// preprocessor diagnostic inside a longer "failed to run" line that also
+/// quotes the source and output paths, so the first quote is the compiler's
+/// own argument. And it matched "user error" case-sensitively while Frama-C
+/// writes "User Error:", which left the branch whose job is to quote what it
+/// could not classify returning nothing at all.
+#[test]
+fn a_header_is_read_off_the_phrase_not_off_the_first_quote() {
+    let folded = classify_parse_failure(
+        "[kernel] User Error: failed to run: gcc -E '/abs/src/core/sysroot.c' \
+         -o '/tmp/x.i': 'sys/mount.h' file not found\n",
+    );
+    assert_eq!(folded.cause, "header_not_found");
+    assert_eq!(folded.subject.as_deref(), Some("sys/mount.h"));
+
+    // Nothing classifiable, and the only diagnostic is capitalized.
+    let quoted = classify_parse_failure("[kernel] User Error: something new here\n");
+    assert_eq!(quoted.cause, "other");
+    assert!(
+        quoted.message.contains("something new here"),
+        "the message must carry what could not be classified: {quoted:?}"
+    );
+}

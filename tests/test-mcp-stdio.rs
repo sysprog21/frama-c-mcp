@@ -4620,6 +4620,7 @@ async fn two_identical_runs_produce_one_receipt() {
              host rather than a nondeterministic server. Re-run it alone before \
              reading it as an ordering bug. Moved: {moved:?}"
         );
+
         // Statuses moved with no timeout among them. This is the divergence the
         // test exists for, and it has to say so: falling through to the message
         // below would send the reader to the receipt's own fields while the
@@ -9220,4 +9221,63 @@ async fn a_truncated_check_still_resolves_every_advice_key() {
     }
 
     let _ = client.cancel().await;
+}
+
+/// The parse surface is a measurement, and this is the shape of the answer.
+///
+/// It exists because the count it reports is the kind of number that gets
+/// quoted from a document rather than recomputed, and then read as measured
+/// when it is a year old. Two files, one of each kind, is enough to pin that
+/// the two are told apart: sys/mount.h is absent from Frama-C's modeled libc,
+/// and Frama-C preprocesses with -nostdinc against that libc, so the host's
+/// copy is not reachable here and the failure is the real one rather than a
+/// staged one.
+#[tokio::test]
+async fn parse_surface_tells_an_header_not_found_from_a_file_that_parses() {
+    let ok = workspace_path("tests/fixtures/tutorial/swap-frame.c");
+    let blocked = workspace_path("tests/fixtures/unmodeled-header.c");
+    let client = spawn_mcp_client(ok.to_str().unwrap()).await;
+
+    let report = call_tool_json(
+        &client,
+        "parse_surface",
+        json!({
+            "files": [ok.to_str().unwrap(), blocked.to_str().unwrap()],
+            "detail": "full",
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report["files_total"], 2, "{report:?}");
+    assert_eq!(report["files_parsed"], 1, "{report:?}");
+    assert_eq!(report["files_blocked"], 1, "{report:?}");
+
+    let ranked = report["blocked_by"].as_array().expect("blocked_by");
+    assert_eq!(ranked.len(), 1, "{report:?}");
+    assert_eq!(ranked[0]["cause"], "header_not_found", "{report:?}");
+    assert_eq!(ranked[0]["subject"], "sys/mount.h", "{report:?}");
+    assert_eq!(ranked[0]["files"], 1, "{report:?}");
+
+    // The advice for this cause has to say that a stub does not close it. That
+    // is the whole reason the two causes are separated.
+    let reason = report["next_action"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("does not model"), "{reason}");
+
+    let files = report["files"].as_array().expect("files");
+    let parses: std::collections::BTreeMap<&str, bool> = files
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap_or_default(),
+                entry["parses"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(parses.get(ok.to_str().unwrap()), Some(&true), "{report:?}");
+    assert_eq!(
+        parses.get(blocked.to_str().unwrap()),
+        Some(&false),
+        "{report:?}"
+    );
 }

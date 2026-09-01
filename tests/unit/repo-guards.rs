@@ -2020,7 +2020,7 @@ fn tool_router_matches_the_documented_surface() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
     let documented = documented_tools(&readme);
-    assert_eq!(documented.len(), 14, "parsed {documented:?}");
+    assert_eq!(documented.len(), 15, "parsed {documented:?}");
 
     let registered = FramaCMcpServer::tool_router()
         .list_all()

@@ -98,6 +98,37 @@ where
     }
 }
 
+/// What parse_surface should try to parse, and under which flags.
+///
+/// The load options repeat ReloadProjectParams rather than reading them off the
+/// loaded project, because the question this answers comes before a project
+/// loads: which of these files can load at all, under the flags a build system
+/// would pass. A file that cannot be parsed cannot be in a project to ask
+/// about.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ParseSurfaceParams {
+    /// C sources to try, as paths rather than globs. Expand the set in the
+    /// shell, as in git ls-files "src/*.c", so which files were measured stays
+    /// visible to whoever reads the answer.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub files: Option<Vec<String>>,
+    /// Include directories, as reload_project takes them.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub include_paths: Option<Vec<String>>,
+    /// Preprocessor definitions, as reload_project takes them.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub defines: Option<Vec<String>>,
+    /// Headers force-included ahead of every source, as reload_project takes
+    /// them.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub force_includes: Option<Vec<String>>,
+    /// Target machine model, as reload_project takes it.
+    pub machdep: Option<String>,
+    /// Response size. "summary" (default) reports the counts and the causes,
+    /// ranked by how many files each blocks. "full" adds the per-file verdict.
+    pub detail: Option<Detail>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReloadProjectParams {
     /// C source file paths to reload. If omitted, reloads currently loaded

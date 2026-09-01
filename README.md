@@ -245,7 +245,7 @@ The server exposes the following tool groups:
 
 | Domain | Tools | Purpose |
 |--------|-------|---------|
-| Project | `reload_project`, `list`, `context`, `self_check` | Load source, inspect declarations, navigate call relationships, and report server capabilities |
+| Project | `reload_project`, `list`, `context`, `self_check`, `parse_surface` | Load source, inspect declarations, navigate call relationships, report server capabilities, and measure how much of a file set Frama-C can parse at all |
 | EVA/WP | `check`, `run_wp`, `get_wp_goals`, `run_e_acsl` | Run verification, read what it concluded, and execute runtime counterexamples |
 | Annotations | `inject_all_annotations`, `propose_annotations` | Dry-run validate and inject ACSL annotations, and propose the frame conditions the code determines |
 | Sandbox | `create_sandbox`, `delete_sandbox` | Isolate annotation experiments |

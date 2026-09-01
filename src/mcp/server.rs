@@ -1164,7 +1164,7 @@ pub fn sandbox_not_found_err(experiment_id: &str, existing: &[String]) -> McpErr
     sandbox_not_found_error(experiment_id, existing)
 }
 
-pub const MCP_TOOL_COUNT: usize = 14;
+pub const MCP_TOOL_COUNT: usize = 15;
 
 /// The revision a client gets when it asks for one rmcp does not recognize.
 ///

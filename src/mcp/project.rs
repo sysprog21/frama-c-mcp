@@ -886,6 +886,74 @@ impl FramaCMcpServer {
             })
     }
 
+    #[tool(
+        description = "Report which C sources parse under Frama-C and what stops the rest, grouped by cause and ranked by how many files each blocks. \
+        This measures the parse surface; it cannot widen it. A header_not_found is either a header of this project missing from include_paths or a system header Frama-C's libc does not model, and a locally written declaration answers the first by not being needed and the second not at all, while an undeclared_name is what a stub header can honestly supply. The report says which cause each file hit."
+    )]
+    pub async fn parse_surface(
+        &self,
+        Parameters(params): Parameters<ParseSurfaceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let files = params.files.unwrap_or_default();
+        if files.is_empty() {
+            return Err(McpError::invalid_params(
+                "files must name at least one C source. Expand the set in the shell, as in \
+                 git ls-files \"src/*.c\", so which files were measured stays visible.",
+                None,
+            ));
+        }
+        let options = ProjectLoadOptions {
+            include_paths: params.include_paths.unwrap_or_default(),
+            defines: params.defines.unwrap_or_default(),
+            force_includes: params.force_includes.unwrap_or_default(),
+            machdep: params.machdep,
+            compilation_database: None,
+        };
+        validate_project_options(&options)?;
+        let args = project_cli_args(&options);
+
+        // One process per file, several at a time. The probes are independent
+        // and each is short, but a serial sweep of a real tree is minutes of
+        // wall clock for a question asked while waiting on the answer.
+        let limit = std::thread::available_parallelism()
+            .map(|cores| cores.get().min(PARSE_SURFACE_MAX_PARALLEL))
+            .unwrap_or(2);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, file) in files.iter().enumerate() {
+            let permits = permits.clone();
+            let program = self.frama_c_path.clone();
+            let args = args.clone();
+            let file = file.clone();
+            probes.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                let probe = probe_parse(&program, &args, &file).await;
+                (index, file, probe)
+            });
+        }
+        let mut results = Vec::with_capacity(files.len());
+        while let Some(joined) = probes.join_next().await {
+            let outcome = joined.map_err(|e| {
+                McpError::internal_error(format!("parse probe did not finish: {e}"), None)
+            })?;
+            results.push(outcome);
+        }
+
+        // Back into the caller's order. The probes finish in whatever order the
+        // parses take, and a report whose file list reorders itself run to run
+        // cannot be diffed against the last one.
+        results.sort_by_key(|(index, _, _)| *index);
+        let probed: Vec<(String, ParseProbe)> = results
+            .into_iter()
+            .map(|(_, file, probe)| (file, probe))
+            .collect();
+
+        Ok(json_result(parse_surface_payload(
+            &probed,
+            matches!(params.detail, Some(Detail::Full)),
+        )))
+    }
+
     #[tool(description = "List loaded project entities, sandboxes, or conclusion summaries by kind.")]
     async fn list(
         &self,
@@ -1012,6 +1080,251 @@ fn validate_cpp_entries(entries: &[String], complaint: &'static str) -> Result<(
         return Err(McpError::invalid_params(complaint, None));
     }
     Ok(())
+}
+
+/// Parse probes running at once. One Frama-C front end is cheap, a tree's worth
+/// in series is not, and a machine's worth at once helps nobody.
+pub const PARSE_SURFACE_MAX_PARALLEL: usize = 8;
+
+/// What one file did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseProbe {
+    Parsed,
+    Blocked(ParseBlock),
+}
+
+/// Why one file would not parse, named so a caller can act on it.
+///
+/// Frama-C reports the two causes worth telling apart in different voices, and
+/// the honest answer to each is different. The preprocessor refusing a header
+/// says only that it was not found, and that reads two ways: a header of this
+/// project is missing from the include path, which wants an entry and no stub
+/// at all, or Frama-C's libc does not model a system header, which a local
+/// header declaring only what the tree calls does not close either, because
+/// the analysis then reasons about bodies that do not exist. The kernel
+/// refusing a name is a missing declaration, which a stub can supply as the
+/// platform declares it. Reporting both as "did not parse" is what leaves a
+/// reader unable to tell which one they are looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBlock {
+    pub cause: &'static str,
+    pub subject: Option<String>,
+    pub message: String,
+}
+
+/// Read the first thing that stopped a parse out of a Frama-C run's output.
+///
+/// First rather than worst, because the errors after it are usually its
+/// consequences: a tally over all of them counts one cause several times and
+/// ranks it above a cause that stopped a whole file on its own.
+pub fn classify_parse_failure(output: &str) -> ParseBlock {
+    for line in output.lines() {
+        if let Some(header) = crate::error::missing_header_name(line) {
+            return ParseBlock {
+                cause: "header_not_found",
+                subject: Some(header.to_string()),
+                message: line.trim().to_string(),
+            };
+        }
+        if let Some(name) = undeclared_name(line) {
+            return ParseBlock {
+                cause: "undeclared_name",
+                subject: Some(name),
+                message: line.trim().to_string(),
+            };
+        }
+    }
+
+    // Nothing recognized. The first error line still beats a bare "did not
+    // parse", and a shape this does not know is a reason to go and read it
+    // rather than a reason to invent a cause for it.
+    ParseBlock {
+        cause: "other",
+        subject: None,
+        // Matched case-insensitively. Frama-C writes "User Error:" as often as
+        // "user error", and a case-sensitive search left the one branch whose
+        // job is to quote what it could not classify returning an empty string.
+        message: output
+            .lines()
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("user error") || lower.contains("error:")
+            })
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// The identifier out of the kernel's "Cannot resolve variable".
+fn undeclared_name(line: &str) -> Option<String> {
+    let rest = line.split_once("Cannot resolve variable ")?.1;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// One file, one Frama-C front end, nothing after it.
+pub async fn probe_parse(program: &str, args: &[String], file: &str) -> ParseProbe {
+    // Asked before spawning. A path that is not there is not a parse failure,
+    // and reporting it as one is the miscategorisation this report exists to
+    // avoid: it would sit in the ranking beside real modeling gaps and send
+    // someone looking for a header that was never the problem.
+    if !std::path::Path::new(file).is_file() {
+        return ParseProbe::Blocked(ParseBlock {
+            cause: "missing_file",
+            subject: None,
+            message: format!("{file} is not a file"),
+        });
+    }
+    let mut command = tokio::process::Command::new(program);
+
+    // A dropped timeout future does not reap the child on its own, so without
+    // this every probe that runs long leaves a Frama-C behind.
+    command.kill_on_drop(true);
+    command.args(args);
+
+    // No plugin is asked for, so this run is the parse and the typecheck and
+    // nothing else, which is the whole question being asked.
+    command.arg("-no-autoload-plugins");
+    command.arg(file);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let run = tokio::time::timeout(crate::mcp::budgets::PARSE_PROBE_BUDGET, command.output()).await;
+    match run {
+        Ok(Ok(output)) if output.status.success() => ParseProbe::Parsed,
+        Ok(Ok(output)) => {
+            // Frama-C writes its diagnostics to stdout, so a probe reading only
+            // stderr would classify every failure here as "other".
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            ParseProbe::Blocked(classify_parse_failure(&text))
+        }
+        Ok(Err(e)) => ParseProbe::Blocked(ParseBlock {
+            cause: "probe_failed",
+            subject: None,
+            message: format!("could not run {program}: {e}"),
+        }),
+        Err(_) => ParseProbe::Blocked(ParseBlock {
+            cause: "timeout",
+            subject: None,
+            message: format!(
+                "the parse did not finish in {}s",
+                crate::mcp::budgets::PARSE_PROBE_BUDGET.as_secs()
+            ),
+        }),
+    }
+}
+
+/// The report, assembled from what the probes found.
+pub fn parse_surface_payload(probed: &[(String, ParseProbe)], full: bool) -> serde_json::Value {
+    let mut causes: std::collections::BTreeMap<(&'static str, String), Vec<&str>> =
+        std::collections::BTreeMap::new();
+    let mut per_file = Vec::new();
+    let mut parsed = 0usize;
+    for (file, probe) in probed {
+        match probe {
+            ParseProbe::Parsed => {
+                parsed += 1;
+                if full {
+                    per_file.push(json!({"file": file, "parses": true}));
+                }
+            }
+            ParseProbe::Blocked(block) => {
+                causes
+                    .entry((block.cause, block.subject.clone().unwrap_or_default()))
+                    .or_default()
+                    .push(file);
+                if full {
+                    per_file.push(json!({
+                        "file": file,
+                        "parses": false,
+                        "cause": block.cause,
+                        "subject": block.subject,
+                        "message": block.message,
+                    }));
+                }
+            }
+        }
+    }
+    let mut blocked_by: Vec<serde_json::Value> = causes
+        .iter()
+        .map(|((cause, subject), files)| {
+            json!({
+                "cause": cause,
+                "subject": (!subject.is_empty()).then_some(subject),
+                "files": files.len(),
+                "example": files.first(),
+            })
+        })
+        .collect();
+
+    // Ranked by how many files each blocks, because closing the largest buys
+    // the most and the counts are the point of the report. Ties break on the
+    // subject so two runs over one tree produce one answer.
+    blocked_by.sort_by(|a, b| {
+        b["files"]
+            .as_u64()
+            .cmp(&a["files"].as_u64())
+            .then_with(|| a["subject"].as_str().cmp(&b["subject"].as_str()))
+    });
+
+    let mut payload = json!({
+        "files_total": probed.len(),
+        "files_parsed": parsed,
+        "files_blocked": probed.len() - parsed,
+        "blocked_by": blocked_by,
+        "next_action": parse_surface_next_action(&blocked_by),
+    });
+    if full {
+        payload["files"] = json!(per_file);
+    }
+    payload
+}
+
+/// What to do about the largest group, in the terms that group deserves.
+fn parse_surface_next_action(blocked_by: &[serde_json::Value]) -> serde_json::Value {
+    let Some(top) = blocked_by.first() else {
+        return json!({
+            "tool": null,
+            "args": {},
+            "reason": "Every file parsed under these flags.",
+            "blockers": [],
+            "confidence": "high",
+        });
+    };
+
+    let cause = top["cause"].as_str().unwrap_or("other");
+    let subject = top["subject"].as_str().unwrap_or("");
+    let count = top["files"].as_u64().unwrap_or(0);
+    let reason = match cause {
+        "header_not_found" => format!(
+            "{subject} was not found on the include path and blocks {count} of these files. Two different things look like this. If it belongs to this project, the include path is short an entry and no stub is called for. If it is a system header Frama-C's libc does not model, writing one that declares only what this tree calls does not model it either: the analysis would reason about bodies that do not exist, and a proof resting on that is worth less than no proof. Check which it is before writing anything."
+        ),
+        "undeclared_name" => format!(
+            "{subject} is declared nowhere the analyzer can see and blocks {count} of these files. This is the case a stub answers honestly: declare it as the platform declares it, with the same type."
+        ),
+        "timeout" => format!(
+            "{count} of these files did not finish parsing. That is a front end problem rather than a missing declaration; read one of them directly."
+        ),
+        "missing_file" => format!(
+            "{count} of these paths are not files. Nothing was measured for them, so they are not evidence either way about what parses; check how the list was built."
+        ),
+        _ => format!(
+            "The largest group is {cause}, blocking {count} of these files. Its message is in the per-file list, which detail: \"full\" returns; read it before deciding what it is."
+        ),
+    };
+    json!({
+        "tool": null,
+        "args": {},
+        "reason": reason,
+        "blockers": [cause],
+        "confidence": "medium",
+    })
 }
 
 pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpError> {

@@ -453,6 +453,7 @@ fn tools_list_is_exactly_the_declared_surface() {
         "get_wp_goals",
         "inject_all_annotations",
         "list",
+        "parse_surface",
         "propose_annotations",
         "reload_project",
         "run_e_acsl",
