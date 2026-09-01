@@ -229,8 +229,8 @@ pub struct SessionState {
     pub conclusions: HashMap<String, FunctionVerificationState>,
     pub project_state: Option<ProjectVerificationState>,
     /// Receipts this session produced, keyed by their sha256: the goal set for
-    /// `get_wp_goals {since}` to diff against, and the receipt body itself so
-    /// `store_function_conclusion` can be handed the hash instead of the whole
+    /// get_wp_goals {since} to diff against, and the receipt body itself so
+    /// store_function_conclusion can be handed the hash instead of the whole
     /// thing.
     ///
     /// Session-scoped on purpose. The case a diff is for is two consecutive
@@ -245,7 +245,12 @@ pub struct SessionState {
     /// slip is rejected with no way to tell which field moved. Resolving the
     /// hash against what this process wrote keeps the coherence check exactly
     /// as strong, since the bytes being checked are still the server's own.
-    pub seen_receipts: VecDeque<(String, Vec<serde_json::Value>, serde_json::Value)>,
+    ///
+    /// The goals are not stored beside the body: they are already in it, under
+    /// "goals", written by the same call that produced the hash. Keeping a
+    /// second copy meant the array was held twice per entry, up to the
+    /// SEEN_RECEIPT_LIMIT, and left room for the two to disagree.
+    pub seen_receipts: VecDeque<(String, serde_json::Value)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1152,54 +1157,45 @@ impl SessionState {
         self.wp_completed = true;
     }
 
-    /// Remember a receipt's goals so a later run can be diffed against it.
+    /// Remember a receipt, so the hash the caller was handed can later stand in
+    /// for the whole thing and a later run can be diffed against its goals.
     ///
-    /// Keyed by the receipt hash the caller was handed, which is the only
-    /// identifier they have for "the run I just saw".
-    pub fn remember_receipt_goals(&mut self, sha256: &str, goals: &[serde_json::Value]) {
-        self.remember_receipt(sha256, goals, serde_json::Value::Null);
-    }
-
-    /// Remember a receipt's goals and, when the caller has it, the receipt
-    /// body, so the hash can stand in for the whole thing later.
-    pub fn remember_receipt(
-        &mut self,
-        sha256: &str,
-        goals: &[serde_json::Value],
-        receipt: serde_json::Value,
-    ) {
-        if let Some(slot) = self.seen_receipts.iter_mut().find(|(seen, _, _)| seen == sha256) {
-            // A later call may know the body where an earlier one did not.
-            if slot.2.is_null() {
-                slot.2 = receipt;
-            }
+    /// Keyed by that hash, which is the only identifier a caller has for "the
+    /// run I just saw". Recording the same hash twice keeps the first body: two
+    /// receipts hashing alike are byte-identical, so there is nothing to
+    /// choose between them.
+    pub fn remember_receipt(&mut self, sha256: &str, receipt: serde_json::Value) {
+        if self.seen_receipts.iter().any(|(seen, _)| seen == sha256) {
             return;
         }
         if self.seen_receipts.len() >= SEEN_RECEIPT_LIMIT {
             self.seen_receipts.pop_front();
         }
-        self.seen_receipts
-            .push_back((sha256.to_string(), goals.to_vec(), receipt));
+        self.seen_receipts.push_back((sha256.to_string(), receipt));
     }
 
     /// The goals of a remembered receipt, or None when this session never
     /// produced it. None is an error to the caller rather than an empty diff:
     /// "nothing changed" and "I never saw that run" are different answers.
+    ///
+    /// Read out of the stored body rather than from a field beside it, so the
+    /// diff is against the array the hash was computed over and cannot drift
+    /// from it.
     pub fn receipt_goals(&self, sha256: &str) -> Option<&[serde_json::Value]> {
-        self.seen_receipts
-            .iter()
-            .find(|(seen, _, _)| seen == sha256)
-            .map(|(_, goals, _)| goals.as_slice())
+        self.receipt_body(sha256)?
+            .get("goals")?
+            .as_array()
+            .map(Vec::as_slice)
     }
 
     /// The body of a remembered receipt, or None when this session never
-    /// produced it or recorded only its goals. Same rule as receipt_goals:
-    /// an unknown hash is an error, not an empty answer.
+    /// produced it. Same rule as receipt_goals: an unknown hash is an error,
+    /// not an empty answer.
     pub fn receipt_body(&self, sha256: &str) -> Option<&serde_json::Value> {
         self.seen_receipts
             .iter()
-            .find(|(seen, _, _)| seen == sha256)
-            .map(|(_, _, receipt)| receipt)
+            .find(|(seen, _)| seen == sha256)
+            .map(|(_, receipt)| receipt)
             .filter(|receipt| !receipt.is_null())
     }
 }

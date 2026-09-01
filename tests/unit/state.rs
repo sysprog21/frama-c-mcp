@@ -432,9 +432,14 @@ fn invalidate_all_preserves_conclusions() {
 #[test]
 fn remembered_receipts_are_bounded_deduped_and_dropped_on_reload() {
     let mut state = SessionState::default();
-    let goals = |id: &str| vec![serde_json::json!({"stable_goal_id": id, "status": "valid"})];
+    let receipt = |id: &str| {
+        serde_json::json!({
+            "schema": "frama-c-mcp.proof-receipt",
+            "goals": [{"stable_goal_id": id, "status": "valid"}],
+        })
+    };
 
-    state.remember_receipt_goals("sha-a", &goals("g1"));
+    state.remember_receipt("sha-a", receipt("g1"));
     assert_eq!(
         state.receipt_goals("sha-a").map(<[_]>::len),
         Some(1),
@@ -442,9 +447,10 @@ fn remembered_receipts_are_bounded_deduped_and_dropped_on_reload() {
     );
     assert_eq!(state.receipt_goals("sha-missing"), None);
 
-    // Re-recording the same hash keeps the first goals rather than appending a
-    // second entry under the same name.
-    state.remember_receipt_goals("sha-a", &goals("different"));
+    // Re-recording the same hash keeps the first body rather than appending a
+    // second entry under the same name. Two receipts hashing alike are
+    // byte-identical anyway, so there is nothing to choose between them.
+    state.remember_receipt("sha-a", receipt("different"));
     assert_eq!(
         state.receipt_goals("sha-a").and_then(|goals| goals
             .first()
@@ -455,7 +461,7 @@ fn remembered_receipts_are_bounded_deduped_and_dropped_on_reload() {
     // Oldest out first once the bound is reached, so a long session cannot grow
     // without limit.
     for i in 0..40 {
-        state.remember_receipt_goals(&format!("sha-{i}"), &goals("g"));
+        state.remember_receipt(&format!("sha-{i}"), receipt("g"));
     }
     assert_eq!(state.receipt_goals("sha-a"), None, "evicted with the oldest");
     assert!(state.receipt_goals("sha-39").is_some(), "newest kept");

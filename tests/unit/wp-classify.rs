@@ -180,39 +180,55 @@ fn classify_wp_failure_includes_proofread_report_shape() {
 /// the object cannot practically be echoed back by an MCP client: one
 /// function's receipt is 8 KB whose bulk is the goal array, and a single slip
 /// is rejected with no indication of which field moved. The session therefore
-/// keeps the body next to the goals, and the hash resolves to it.
+/// keeps the body, and the hash resolves to it.
 #[test]
 fn session_remembers_receipt_body_for_lookup_by_hash() {
     use frama_c_mcp::state::SessionState;
 
     let mut state = SessionState::default();
-    let goals = vec![json!({"stable_goal_id": "sg_1", "status": "valid"})];
-    let receipt = json!({"schema": "frama-c-mcp.proof-receipt", "sha256": "abc123"});
+    let receipt = json!({
+        "schema": "frama-c-mcp.proof-receipt",
+        "sha256": "abc123",
+        "goals": [{"stable_goal_id": "sg_1", "status": "valid"}],
+    });
 
-    state.remember_receipt("abc123", &goals, receipt.clone());
+    state.remember_receipt("abc123", receipt.clone());
 
     assert_eq!(state.receipt_body("abc123"), Some(&receipt));
-    assert_eq!(state.receipt_goals("abc123").map(<[_]>::len), Some(1));
     assert!(
         state.receipt_body("never-produced").is_none(),
         "an unknown hash must not resolve: it is an error, not an empty receipt"
     );
 }
 
-/// The goals-only writer stays usable, and a later call that does know the body
-/// fills it in rather than being dropped as a duplicate.
+/// The goals a run is diffed against come out of the stored body rather than a
+/// second copy beside it, so a since diff is against the array the hash was
+/// computed over and the two cannot drift apart.
 #[test]
-fn remembering_goals_first_then_body_keeps_both() {
+fn remembered_goals_are_read_out_of_the_stored_body() {
     use frama_c_mcp::state::SessionState;
 
     let mut state = SessionState::default();
-    let goals = vec![json!({"stable_goal_id": "sg_1", "status": "valid"})];
-    state.remember_receipt_goals("abc123", &goals);
-    assert!(state.receipt_body("abc123").is_none());
+    state.remember_receipt(
+        "abc123",
+        json!({
+            "schema": "frama-c-mcp.proof-receipt",
+            "goals": [{"stable_goal_id": "sg_1", "status": "valid"}],
+        }),
+    );
+    assert_eq!(state.receipt_goals("abc123").map(<[_]>::len), Some(1));
+    assert_eq!(
+        state
+            .receipt_goals("abc123")
+            .and_then(|goals| goals[0]["stable_goal_id"].as_str()),
+        Some("sg_1")
+    );
 
-    let receipt = json!({"schema": "frama-c-mcp.proof-receipt", "sha256": "abc123"});
-    state.remember_receipt("abc123", &goals, receipt.clone());
-    assert_eq!(state.receipt_body("abc123"), Some(&receipt));
+    // A body with no goal array resolves as a body and not as goals, rather
+    // than as an empty diff.
+    state.remember_receipt("def456", json!({"schema": "frama-c-mcp.proof-receipt"}));
+    assert!(state.receipt_body("def456").is_some());
+    assert_eq!(state.receipt_goals("def456"), None);
 }
 
 /// Advice is a function of category and goal kind, so it belongs once per pair
