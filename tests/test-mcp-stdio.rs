@@ -4578,10 +4578,65 @@ async fn two_identical_runs_produce_one_receipt() {
         first_receipt["reported"]["incomplete"], second_receipt["reported"]["incomplete"],
         "the incomplete digest moved between identical runs"
     );
-    assert_eq!(
-        first_receipt["sha256"], second_receipt["sha256"],
-        "identical runs produced different receipts: {first_receipt:?} vs {second_receipt:?}"
-    );
+
+    // A hash mismatch has two causes and they need different answers. Real
+    // nondeterminism is the bug this test exists for. A prover that reached its
+    // budget in one run and not the other is a loaded host, and reporting that
+    // as nondeterminism sends the reader to look for an ordering bug that is
+    // not there. Both were observed on one machine: three full-suite runs, each
+    // failing a different test, all passing alone.
+    //
+    // So the statuses are compared before the hash, and a difference that
+    // involves a timeout is named as what it is. It still fails, because a
+    // silent pass would hide a real divergence behind the same excuse, but it
+    // fails saying which of the two happened.
+    if first_receipt["sha256"] != second_receipt["sha256"] {
+        let statuses = |receipt: &serde_json::Value| {
+            receipt["goals"]
+                .as_array()
+                .map(|goals| {
+                    goals
+                        .iter()
+                        .map(|goal| {
+                            (
+                                goal["stable_goal_id"].as_str().unwrap_or("").to_string(),
+                                goal["status"].as_str().unwrap_or("").to_string(),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default()
+        };
+        let (before, after) = (statuses(first_receipt), statuses(second_receipt));
+        let moved: Vec<String> = before
+            .iter()
+            .filter(|(id, status)| after.get(*id).is_some_and(|now| now != *status))
+            .map(|(id, status)| format!("{id}: {status} -> {}", after[id]))
+            .collect();
+        assert!(
+            !moved.iter().any(|m| m.contains("timeout")),
+            "a goal changed status between identical runs and the change involves \
+             a timeout, so this is a prover that reached its budget on a loaded \
+             host rather than a nondeterministic server. Re-run it alone before \
+             reading it as an ordering bug. Moved: {moved:?}"
+        );
+        // Statuses moved with no timeout among them. This is the divergence the
+        // test exists for, and it has to say so: falling through to the message
+        // below would send the reader to the receipt's own fields while the
+        // moved list on screen shows WP concluding something different.
+        assert!(
+            moved.is_empty(),
+            "identical runs disagreed about goal statuses and no timeout is \
+             involved, so this is the nondeterministic server rather than a \
+             loaded host. Moved: {moved:?}"
+        );
+        panic!(
+            "identical runs produced different receipts with every goal status \
+             equal, so the difference is in the receipt's own fields rather than \
+             in what WP concluded. \
+             First: {first_receipt:?} Second: {second_receipt:?}"
+        );
+    }
 }
 
 #[tokio::test]
