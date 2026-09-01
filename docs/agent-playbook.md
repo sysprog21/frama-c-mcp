@@ -269,7 +269,7 @@ Resume after an interruption by calling `verify_program_step`, then `list {kind:
 
 If `verify_program_step` returns more ready functions, stay locked and repeat from `create_sandbox` through the next `verify_program_step` before unlocking with `verify_program_step {lock_project: false}`. The completed set must contain only functions whose verified structured annotations have already been merged into the main project.
 
-Stopping condition: every defined function has a stored conclusion, `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals.
+Stopping condition: every defined function has a stored conclusion, `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals. "No remaining work" arrives as `next_action.tool: null`, which is the stop signal. The same null tool also means the response could not be held to its byte budget, so read `blockers` before concluding you are done: `[]` with `next_action.status: "done"` is the finished run, while `oversized_function_name` or `payload_budget` means the answer did not fit and calling again returns the same thing.
 
 Common failure branch: if no function is ready, inspect the `verification_order` and `scc_groups` returned by `verify_program_step` plus current `list {kind: "conclusions"}` output. If `reload_project` or `run_wp` is rejected while locked, finish sandbox work first or call `verify_program_step {lock_project: false}` only for the final main-project gate.
 

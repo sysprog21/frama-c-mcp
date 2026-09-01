@@ -27,55 +27,170 @@ const VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS: usize = 16;
 /// ones, cannot dominate the response.
 const CHECK_SUMMARY_PREVIEW_ITEMS: usize = 5;
 
+/// Hold the response to the advertised byte cap, shedding the cheapest thing
+/// first: preview rows, then the blocked list inside next_action, then the
+/// action itself, and only then the whole body.
+///
+/// next_action.args is never shed. It is a call for the caller to make, and a
+/// shortened argument would quietly change what that call asks for.
 pub fn finish_verify_program_step_response(mut response: serde_json::Value) -> serde_json::Value {
-    let mut bytes = verify_program_step_payload_bytes(&response);
     if let Some(obj) = response.as_object_mut() {
         obj.insert(
             "payload_budget".into(),
             json!({
                 "cap_bytes": VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
-                "bytes": bytes,
+                "bytes": 0,
                 "omitted_fields": ["order", "verification_order", "scc_groups", "conclusions", "project_state"],
             }),
         );
     }
-    bytes = verify_program_step_payload_bytes(&response);
-    if let Some(obj) = response.as_object_mut().and_then(|obj| obj.get_mut("payload_budget")).and_then(|value| value.as_object_mut()) {
-        obj.insert("bytes".into(), json!(bytes));
-    }
-    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+    let mut bytes = record_verify_program_step_payload_bytes(&mut response);
+
+    // Keep one row of each preview first, which is enough to show the caller
+    // what shape the omitted rows had. One retained row can itself be larger
+    // than the budget, for example a generated function name or a cyclic SCC,
+    // so the second pass keeps none.
+    for keep in [1, 0] {
+        if bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+            break;
+        }
+        let mut shed = false;
         if let Some(obj) = response.as_object_mut() {
-            let already_omitted = obj
-                .get("ready_functions_omitted")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as usize;
-            if let Some(ready) = obj.get_mut("ready_functions").and_then(|value| value.as_array_mut()) {
-                let total = ready.len() + already_omitted;
-                ready.truncate(1);
-                obj.insert("ready_functions_omitted".into(), json!(total.saturating_sub(1)));
-            }
-            let frontier_already_omitted = obj
-                .get("frontier_omitted")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as usize;
-            if let Some(frontier) = obj.get_mut("frontier").and_then(|value| value.as_array_mut()) {
-                let total = frontier.len() + frontier_already_omitted;
-                frontier.truncate(1);
-                obj.insert("frontier_omitted".into(), json!(total.saturating_sub(1)));
-            }
+            shed |= omit_preview_rows(obj, "ready_functions", "ready_functions_omitted", keep);
+            shed |= omit_preview_rows(obj, "frontier", "frontier_omitted", keep);
         }
-        bytes = verify_program_step_payload_bytes(&response);
-        if let Some(obj) = response.as_object_mut().and_then(|obj| obj.get_mut("payload_budget")).and_then(|value| value.as_object_mut()) {
-            obj.insert("bytes".into(), json!(bytes));
+        if shed {
+            bytes = record_verify_program_step_payload_bytes(&mut response);
         }
+    }
+
+    // The blocked list rides inside next_action, so the passes above cannot
+    // reach it. It arrives already previewed, so reaching here means even the
+    // preview does not fit and no row of it can be kept.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        let shed = response
+            .get_mut("next_action")
+            .and_then(|value| value.as_object_mut())
+            .is_some_and(|action| {
+                omit_preview_rows(action, "blocked_functions", "blocked_functions_omitted", 0)
+            });
+        if shed {
+            bytes = record_verify_program_step_payload_bytes(&mut response);
+        }
+    }
+
+    // The ready function's name also sits in next_action.args, which is not
+    // shed. Drop the whole action instead, and only when that name is what put
+    // the response over: the gate is the measurement, so the reason below is
+    // true whenever it is printed.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        let name_bytes = response
+            .pointer("/next_action/args/function")
+            .and_then(|value| value.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        if name_bytes > 0 && bytes - name_bytes <= VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("next_action".into(), json!({
+                    "tool": null,
+                    "args": {},
+                    "reason": "The ready function's name does not fit the response budget, so no call naming it can be sent; read the frontier with list.",
+                    "blockers": ["oversized_function_name"],
+                    "confidence": "high",
+                }));
+            }
+            bytes = record_verify_program_step_payload_bytes(&mut response);
+        }
+    }
+
+    // Two fields are still bounded only by the project: the in_progress names
+    // echoed in args, which the passes above deliberately do not touch, and a
+    // persist error carrying a path. Neither is reachable at this size in
+    // practice, and this keeps the cap true rather than assuming so.
+    if bytes > VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES {
+        response = json!({
+            "status": "payload_truncated",
+            "next_action": {
+                "tool": null,
+                "args": {},
+                "reason": "The response did not fit the payload budget with every omittable field already dropped; repeating the call returns this same answer.",
+                "blockers": ["payload_budget"],
+                "confidence": "high",
+            },
+            "payload_budget": {
+                "cap_bytes": VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
+                "bytes": 0,
+                "omitted_fields": ["response"],
+            },
+        });
+        record_verify_program_step_payload_bytes(&mut response);
     }
     response
 }
 
+/// Shrink an array field to keep rows, and add the dropped ones to the count
+/// named beside it. The count is cumulative: an earlier pass may already have
+/// previewed the array, and those rows were never here to drop.
+///
+/// Answers whether any row went, so a caller measuring the result can skip the
+/// measurement when nothing changed.
+fn omit_preview_rows(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    omitted: &str,
+    keep: usize,
+) -> bool {
+    let already_omitted = obj
+        .get(omitted)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let Some(items) = obj.get_mut(field).and_then(|value| value.as_array_mut()) else {
+        return false;
+    };
+    let before = items.len();
+    let total = before + already_omitted;
+    items.truncate(keep);
+
+    // Charge the rows that actually went, not an assumed one: truncate keeps
+    // nothing when the array was already empty.
+    let retained = items.len();
+    obj.insert(omitted.into(), json!(total.saturating_sub(retained)));
+    retained < before
+}
+
+/// The size of what is about to be sent. A payload that cannot be serialized
+/// is reported as too large rather than as empty, so it trips the budget guard
+/// instead of sailing past every check.
 fn verify_program_step_payload_bytes(response: &serde_json::Value) -> usize {
     serde_json::to_string_pretty(response)
         .map(|text| text.len())
-        .unwrap_or(0)
+        .unwrap_or(usize::MAX)
+}
+
+/// Record the serialized size. Writing the number can change its digit count,
+/// so measure again until the recorded value is the value being sent.
+///
+/// This terminates. Once payload_budget.bytes exists, the length is
+/// constant + digits(recorded), which is non-decreasing in recorded, so the
+/// iteration is monotone; it is bounded, since a usize has at most 20 digits;
+/// and a bounded monotone integer sequence is eventually constant.
+fn record_verify_program_step_payload_bytes(response: &mut serde_json::Value) -> usize {
+    let mut recorded = 0;
+    loop {
+        let bytes = verify_program_step_payload_bytes(response);
+        if bytes == recorded {
+            return bytes;
+        }
+        recorded = bytes;
+        if let Some(obj) = response
+            .pointer_mut("/payload_budget")
+            .and_then(|value| value.as_object_mut())
+        {
+            obj.insert("bytes".into(), json!(recorded));
+        } else {
+            return bytes;
+        }
+    }
 }
 
 async fn exec_eva_compute(client: &FramaCClient) -> Result<Vec<serde_json::Value>, FramaCError> {
@@ -4821,12 +4936,15 @@ impl FramaCMcpServer {
                 .collect::<Vec<_>>();
 
             // Stored conclusions are the only record of per-function progress.
-            // BTreeSet keeps both lists sorted and deduplicated once the
-            // caller's own in_progress names merge in below, so neither needs a
-            // later sort.
+            // BTreeSet keeps all three lists sorted and deduplicated once the
+            // caller's own in_progress names merge in below, so none needs a
+            // later sort. Order is not cosmetic here: conclusions arrive from a
+            // HashMap, and the blocked list is previewed rather than sent
+            // whole, so an unordered one would show a different sample of the
+            // same state on every call.
             let mut done = std::collections::BTreeSet::new();
             let mut in_progress = std::collections::BTreeSet::new();
-            let mut blocked_functions = Vec::new();
+            let mut blocked_functions = std::collections::BTreeSet::new();
             for conclusion in &conclusions {
                 match conclusion.status {
                     crate::state::VerificationStatus::Verified => {
@@ -4838,7 +4956,7 @@ impl FramaCMcpServer {
                     crate::state::VerificationStatus::Failed
                     | crate::state::VerificationStatus::Unsound
                     | crate::state::VerificationStatus::BlockedOnCallee => {
-                        blocked_functions.push(conclusion.function.clone());
+                        blocked_functions.insert(conclusion.function.clone());
                     }
                 }
             }
@@ -4939,7 +5057,7 @@ impl FramaCMcpServer {
             "eva_completed": eva_completed,
             "wp_completed": wp_completed,
         });
-        let next_action = if all_done {
+        let mut next_action = if all_done {
             json!({
                 "status": "done",
                 "tool": null,
@@ -4978,6 +5096,17 @@ impl FramaCMcpServer {
                 "confidence": "medium",
             })
         };
+        // The blocked list is the one unbounded thing an action carries, and
+        // the same rule that previews the two lists beside it applies here.
+        // Every other branch has no such field and this leaves it untouched.
+        if let Some(action) = next_action.as_object_mut() {
+            omit_preview_rows(
+                action,
+                "blocked_functions",
+                "blocked_functions_omitted",
+                VERIFY_PROGRAM_STEP_READY_PREVIEW_ITEMS,
+            );
+        }
 
         let response = finish_verify_program_step_response(json!({
             "project_locked": project_locked,
