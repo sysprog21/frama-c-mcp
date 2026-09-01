@@ -1158,8 +1158,6 @@ pub fn no_project_loaded_err() -> McpError {
     no_project_loaded_error()
 }
 
-pub const MCP_TOOL_COUNT: usize = 15;
-
 /// "sandbox does not exist" error - returned when require_sandbox fails for all
 /// non-create sandbox tools.
 pub fn sandbox_not_found_err(experiment_id: &str, existing: &[String]) -> McpError {
@@ -4014,7 +4012,13 @@ impl FramaCMcpServer {
         json!({
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
-                "tool_count": MCP_TOOL_COUNT,
+
+                // Counted off the router rather than written down. A number in
+                // a constant is one a person edits to make a build green, which
+                // reads as a check and is not one; this cannot disagree with
+                // the surface it describes.
+                "tool_count": self.tool_router.list_all().len(),
+
 
                 // The fallback, not the negotiated version of any one session:
                 // this payload is built without a peer, and a client that asked

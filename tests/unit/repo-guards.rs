@@ -2020,7 +2020,16 @@ fn tool_router_matches_the_documented_surface() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
     let documented = documented_tools(&readme);
-    assert_eq!(documented.len(), 15, "parsed {documented:?}");
+
+    // Against the router rather than a literal. The set comparison below is the
+    // real check; this one catches a README parse that silently matched
+    // nothing, and it should not itself be a number to bump.
+
+    assert_eq!(
+        documented.len(),
+        FramaCMcpServer::tool_router().list_all().len(),
+        "parsed {documented:?}"
+    );
 
     let registered = FramaCMcpServer::tool_router()
         .list_all()

@@ -445,26 +445,11 @@ fn tools_list_is_exactly_the_declared_surface() {
     let mut mcp = McpHandle::spawn_test_binary_with_frama_c("__frama_c_mcp_missing_binary__");
     let names = listed_tool_names(&mut mcp);
 
-    let expected = [
-        "check",
-        "context",
-        "create_sandbox",
-        "delete_sandbox",
-        "get_wp_goals",
-        "inject_all_annotations",
-        "list",
-        "parse_surface",
-        "propose_annotations",
-        "reload_project",
-        "run_e_acsl",
-        "run_wp",
-        "self_check",
-        "store_function_conclusion",
-        "verify_program_step",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect::<std::collections::BTreeSet<_>>();
+    let expected = DECLARED_TOOLS
+        .iter()
+        .copied()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(names, expected);
     assert_eq!(names.len(), declared_mcp_tool_count());
@@ -754,27 +739,33 @@ fn tool_registry_count_matches_declared_snapshots() {
     );
 }
 
-fn declared_mcp_tool_count() -> usize {
-    let source = std::fs::read_to_string(workspace_path("src/mcp/server.rs"))
-        .expect("read src/mcp/server.rs");
+/// The tool surface this repository declares, in one place.
+///
+/// Written out rather than counted, and the count below is taken from it, so a
+/// new tool is one edit here instead of an integer to bump in several files.
+/// The point of declaring it at all is that a tool appearing or disappearing
+/// unannounced fails a test; a number kept beside the list can be edited to
+/// green without anyone reading the surface it claims to describe.
+const DECLARED_TOOLS: &[&str] = &[
+    "check",
+    "context",
+    "create_sandbox",
+    "delete_sandbox",
+    "get_wp_goals",
+    "inject_all_annotations",
+    "list",
+    "parse_surface",
+    "propose_annotations",
+    "reload_project",
+    "run_e_acsl",
+    "run_wp",
+    "self_check",
+    "store_function_conclusion",
+    "verify_program_step",
+];
 
-    // The visibility prefix is stripped rather than matched: this scraper read
-    // for "const MCP_TOOL_COUNT" and stopped finding it the day the constant
-    // became "pub const", taking five tests down over a modifier that says
-    // nothing about the value it is here to read.
-    let line = source
-        .lines()
-        .map(str::trim_start)
-        .find_map(|line| {
-            let line = line.strip_prefix("pub ").unwrap_or(line);
-            line.starts_with("const MCP_TOOL_COUNT: usize =").then_some(line)
-        })
-        .expect("MCP_TOOL_COUNT declaration");
-    line.split_once('=')
-        .and_then(|(_, value)| value.trim().strip_suffix(';'))
-        .expect("MCP_TOOL_COUNT value")
-        .parse()
-        .expect("MCP_TOOL_COUNT usize")
+fn declared_mcp_tool_count() -> usize {
+    DECLARED_TOOLS.len()
 }
 
 #[test]
