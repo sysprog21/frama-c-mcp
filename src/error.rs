@@ -233,16 +233,28 @@ pub fn stale_marker_error(
 /// it. Searching for the first quoted token instead would return the compiler
 /// invocation's own arguments.
 pub fn missing_header_name(msg: &str) -> Option<&str> {
+    missing_file_name(msg).filter(|name| name.ends_with(".h"))
+}
+
+/// An extensionless file named by a compiler "not found" diagnostic.
+///
+/// This is not by itself enough to call the file a header: an extensionless
+/// source can produce the same wording. Parse-surface classification pairs it
+/// with the echoed `#include` before reporting it as one.
+pub(crate) fn missing_extensionless_name(msg: &str) -> Option<&str> {
+    missing_file_name(msg).filter(|name| std::path::Path::new(name).extension().is_none())
+}
+
+fn missing_file_name(msg: &str) -> Option<&str> {
     let lower = msg.to_ascii_lowercase();
 
-    // Each arm carries its own suffix filter rather than sharing one at the
-    // end. That duplication is the fall-through: a clang match on something
-    // that is not a header, a missing .c say, has to reach the gcc form below
-    // instead of short-circuiting the whole function.
+    // A clang match on something that is not a header, such as a missing .c,
+    // must still short-circuit here: otherwise the later gcc form can read a
+    // different path from the same diagnostic.
     let clang = lower.find("file not found").and_then(|at| {
         let stripped = msg[..at].trim_end().strip_suffix('\'')?;
         let name = &stripped[stripped.rfind('\'')? + 1..];
-        name.ends_with(".h").then_some(name)
+        Some(name)
     });
     if clang.is_some() {
         return clang;
@@ -252,7 +264,7 @@ pub fn missing_header_name(msg: &str) -> Option<&str> {
     let before = msg[..at].trim_end().strip_suffix(':')?.trim_end();
     // rsplit always yields at least one item, so this cannot be the None case.
     let name = before.rsplit(char::is_whitespace).next().unwrap_or(before);
-    name.ends_with(".h").then_some(name)
+    Some(name)
 }
 
 pub fn classify_server_error(msg: &str) -> (&'static str, bool, Option<serde_json::Value>) {

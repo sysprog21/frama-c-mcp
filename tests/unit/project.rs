@@ -606,6 +606,13 @@ fn a_missing_header_is_named_in_either_preprocessor_voice() {
     );
     assert_eq!(gcc.cause, "header_not_found");
     assert_eq!(gcc.subject.as_deref(), Some("sys/event.h"));
+
+    let extensionless = classify_parse_failure(
+        "src/app.c:4:10: fatal error: 'config' file not found\n\
+            4 | #include <config>\n",
+    );
+    assert_eq!(extensionless.cause, "header_not_found");
+    assert_eq!(extensionless.subject.as_deref(), Some("config"));
 }
 
 #[test]

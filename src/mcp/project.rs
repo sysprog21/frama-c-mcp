@@ -374,9 +374,8 @@ impl FramaCMcpServer {
         // Registered and resolved under one guard. Dropping it between the two
         // leaves a window where a second caller replaces the set, and this call
         // then loads another target's model or is refused over a name it just
-        // registered itself.
-        // Parsed before the guard, so a malformed set is refused without having
-        // replaced anything.
+        // registered itself. Parsed before the guard, so a malformed set is
+        // refused without having replaced anything.
         let registering = params
             .verify_profiles
             .as_ref()
@@ -1207,8 +1206,16 @@ pub struct ParseBlock {
 /// consequences: a tally over all of them counts one cause several times and
 /// ranks it above a cause that stopped a whole file on its own.
 pub fn classify_parse_failure(output: &str) -> ParseBlock {
-    for line in output.lines() {
-        if let Some(header) = crate::error::missing_header_name(line) {
+    let lines: Vec<_> = output.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(header) = crate::error::missing_header_name(line).or_else(|| {
+            crate::error::missing_extensionless_name(line).filter(|header| {
+                lines[index + 1..]
+                    .iter()
+                    .take(2)
+                    .any(|line| line.contains("#include") && line.contains(header))
+            })
+        }) {
             return ParseBlock {
                 cause: "header_not_found",
                 subject: Some(header.to_string()),
@@ -1230,6 +1237,7 @@ pub fn classify_parse_failure(output: &str) -> ParseBlock {
     ParseBlock {
         cause: "other",
         subject: None,
+
         // Matched case-insensitively. Frama-C writes "User Error:" as often as
         // "user error", and a case-sensitive search left the one branch whose
         // job is to quote what it could not classify returning an empty string.
