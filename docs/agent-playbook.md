@@ -353,17 +353,26 @@ Read the obligation before changing anything:
 get_wp_goals {function, status: "unproved"}
 ```
 
-Every goal it returns carries a `predicate`, which is what turns `mem_access_7`
-into `\valid(bucket_ids + j)`. Work from that field, not from the goal name:
-the trailing number counts siblings generated from one statement, so several
-open checks against one line are told apart by their predicates or not at all,
-and a name alone cannot say whether the write at index `j` or the read at `j-1`
-is the open one.
+Nearly every goal it returns carries a `predicate`, which is what turns
+`mem_access_7` into `\valid(bucket_ids + j)`. Work from that field, not from the
+goal name: the trailing number counts siblings generated from one statement, so
+several open checks against one line are told apart by their predicates or not
+at all, and a name alone cannot say whether the write at index `j` or the read
+at `j-1` is the open one.
 
-`context {want: ["rte_obligations"], function}` is a second call worth making
-for a different reason: it drafts the `requires` each check would need, which no
-goal carries. It is not where the predicate lives, and an earlier version of
-this section said otherwise.
+Not quite every goal, and the exception matters because it is silent. The field
+is copied from the property row the goal discharges, so a goal that matched no
+row, or matched one carrying no predicate, simply has no `predicate` key.
+Measured on this repository's own fixtures, 2 of 79 goals on
+`test_comprehensive.c` and 2 of 21 on `tutorial/linked-n.c`. An earlier version
+of this section claimed the universal, which is the same mistake one level in
+from the one it was written to correct.
+
+`context {want: ["rte_obligations"], function}` is a second call worth making,
+for two reasons: it drafts the `requires` each check would need, which no goal
+carries, and it is where to look for the goals in that remainder. It is not
+where the predicate normally lives, and an even earlier version of this section
+said it was.
 
 Then decide from the predicate rather than from the count:
 

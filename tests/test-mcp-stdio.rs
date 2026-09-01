@@ -8878,19 +8878,33 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
 
     // The fact the rte guidance rests on, pinned where it can be checked. The
     // advice tells a caller to read the goal's own predicate rather than fetch
-    // it with context {want: ["rte_obligations"]}, and that is only true while
-    // every goal carries one. An earlier round of this work got it backwards,
-    // and nothing end to end would have caught it.
+    // it with context {want: ["rte_obligations"]}, which is only worth saying
+    // while the field is nearly always there. An earlier round of this work got
+    // it backwards, and nothing end to end would have caught it.
+    //
+    // A ratio and not an emptiness check, deliberately. This assertion asserted
+    // "every goal carries one" and passed, on this fixture, while the guidance
+    // it protects said the same thing and was false: predicate is copied from
+    // the property row a goal discharges, so a goal matching no row, or a row
+    // without one, has no such key, and 2 of 79 goals on test_comprehensive.c
+    // do not. An emptiness check here pins bubble_sort.c rather than the claim,
+    // which is the failure mode the guidance itself had.
     let without: Vec<&str> = goals
         .iter()
         .filter(|g| g.get("predicate").and_then(|p| p.as_str()).is_none())
         .filter_map(|g| g["wpo"].as_str())
         .collect();
     assert!(
-        without.is_empty(),
+        without.len() * 4 < goals.len(),
         "the rte advice says to read the goal's predicate, and {} of {} carry \
-         none: {without:?}. Either restore it or change the advice.",
+         none: {without:?}. Below three in four the advice is no longer worth \
+         giving: either restore the field or point at rte_obligations first.",
         without.len(),
+        goals.len()
+    );
+    eprintln!(
+        "predicate coverage: {} of {} goals carry one",
+        goals.len() - without.len(),
         goals.len()
     );
 

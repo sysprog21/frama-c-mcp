@@ -95,7 +95,7 @@ fn classify_failure_reason(
                 // invites: retried at six times the budget it does not move,
                 // and the next thing tried is an invariant guessed from the
                 // goal name.
-                "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix. This one is a runtime-error check, so read the goal's own predicate rather than its name: the name's trailing number counts siblings from one statement and names none of them, while the predicate says which access is open. context {want: [\"rte_obligations\"]} adds the drafted requires, which no goal carries."
+                "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix. This one is a runtime-error check, so read the goal's own predicate rather than its name: the name's trailing number counts siblings from one statement and names none of them, while the predicate says which access is open. context {want: [\"rte_obligations\"]} adds the drafted requires, which no goal carries, and is the fallback when this goal carries no predicate either."
             } else {
                 "Set retry_unproved to tell a slow goal from an unprovable one: it re-runs at double the budget and reports which flip. If none flip, more time is not the fix -- read the VC and supply the missing fact."
             },
@@ -158,13 +158,14 @@ fn classify_failure_reason(
              guarantee or the code must establish: the requires that rules the value out, an \
              assert that carries the fact to this point, or a loop invariant that keeps the index \
              in range. Strengthening the postcondition will not close it. \
-             Read the goal's own predicate to choose which: every goal this returns carries \
-             one, so the open access reads as \\valid(p + i) directly. Do not work from the \
+             Read the goal's own predicate to choose which: the goal usually carries one, \
+             and the open access then reads as \\valid(p + i) directly. Do not work from the \
              goal name, which cannot distinguish siblings: the trailing number in mem_access_7 \
              counts checks generated from one statement and names none of them. Guessing an \
              invariant from the name costs a proof run per guess and does not converge. \
-             context {want: [\"rte_obligations\"]} is worth a call for something else: it \
-             drafts the requires, which the goal does not carry.",
+             context {want: [\"rte_obligations\"]} covers both gaps: it drafts the requires, \
+             which no goal carries, and it is the fallback for the goals whose property row \
+             supplied no predicate to copy.",
         )
     } else if ["unsupported", "unbound", "unknown predicate", "unknown logic"]
         .iter()
@@ -845,8 +846,9 @@ pub fn split_goal_classification(
 fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
     match category {
         "rte" => {
-            "The runtime-error obligation is still open; the goal's own predicate \
-                  names which check it is."
+            "The runtime-error obligation is still open. When the goal carries a \
+             predicate, that names which check it is; when it carries none, \
+             context {want: [\"rte_obligations\"]} is where to look."
         }
         "timeout" => "The prover timed out before proving this obligation.",
         "internal_error" => "Frama-C or WP reported an internal failure for this obligation.",
