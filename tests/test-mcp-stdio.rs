@@ -9623,7 +9623,13 @@ async fn a_named_profile_decides_the_model_wp_proves_under() {
                     "sources": [c_file.to_str().unwrap()],
                     "functions": ["swap"],
                     "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
                     "reproduce": "make verify-demo"
+                },
+                "incomplete": {
+                    "sources": [c_file.to_str().unwrap()],
+                    "functions": ["swap"]
                 }
             },
             "verify_profiles_source": "make print-verify-profiles"
@@ -9633,7 +9639,7 @@ async fn a_named_profile_decides_the_model_wp_proves_under() {
     .unwrap();
     assert_eq!(
         reload["verify_profiles_registered"]["names"],
-        json!(["demo"]),
+        json!(["demo", "incomplete"]),
         "{reload:?}"
     );
     assert_eq!(
@@ -9656,6 +9662,47 @@ async fn a_named_profile_decides_the_model_wp_proves_under() {
         wp["effective_wp_config"]["model"], "Typed+cast",
         "the profile's model did not reach WP: {wp:?}"
     );
+
+    for override_params in [
+        json!({"model": "Typed+nocast"}),
+        json!({"prover": "z3"}),
+        json!({"provers": ["z3"]}),
+        json!({"timeout": 1}),
+    ] {
+        let mut params = json!({"functions": ["swap"], "verify_profile": "demo"});
+        params.as_object_mut().unwrap().extend(override_params.as_object().unwrap().clone());
+        let error = call_tool_json(&client, "run_wp", params)
+            .await
+            .expect_err("profile setting override");
+        assert!(format!("{error:?}").contains("cannot be combined"));
+    }
+
+    let error = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "incomplete"}),
+    )
+    .await
+    .expect_err("incomplete profile is not evidence");
+    assert!(format!("{error:?}").contains("missing functions, model, provers, or timeout_seconds"));
+
+    let sandbox = call_tool_json(&client, "create_sandbox", json!({
+        "function": "swap",
+        "experiment_id": unique_experiment_id("profileevidence"),
+    }))
+    .await
+    .unwrap()["sandbox_name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let error = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": [sandbox], "verify_profile": "demo"}),
+    )
+    .await
+    .expect_err("sandbox is not target evidence");
+    assert!(format!("{error:?}").contains("sandbox proofs are not target evidence"));
 }
 
 /// Naming a profile nobody registered is refused, and the refusal says what is
@@ -9677,4 +9724,209 @@ async fn an_unknown_profile_is_refused_rather_than_defaulted() {
     let text = format!("{error:?}");
     assert!(text.contains("elf"), "{text}");
     assert!(text.contains("Registered: none"), "{text}");
+}
+
+/// The two refusals whose predicates are unit-tested and whose wiring is not.
+///
+/// profile_matches_loaded_project and profile_covers_exactly each have a unit
+/// test, so an inverted condition or a swapped argument at the call site
+/// leaves both green while the refusal never fires. These exercise the call
+/// sites: one loads a file the profile does not name, the other names fewer
+/// functions than the target proves.
+#[tokio::test]
+async fn a_profile_refuses_a_project_and_a_function_set_that_are_not_its_own() {
+    let target = tutorial_c("swap-frame.c");
+    let other = tutorial_c("bsearch.c");
+    let client = spawn_mcp_client(other.to_str().unwrap()).await;
+
+    // Registered against swap-frame, but bsearch is what is loaded.
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [other.to_str().unwrap()],
+            "verify_profiles": {
+                "swap": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap", "order_3"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap"
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let wrong_project = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap", "order_3"], "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("the loaded project is not the profile's");
+    let text = format!("{wrong_project:?}");
+    assert!(text.contains("does not match the loaded project"), "{text}");
+
+    // Now load what the profile names, and ask for a subset of its functions.
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({"verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+
+    let subset = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("a subset is not the target");
+    let text = format!("{subset:?}");
+    assert!(text.contains("is the target that proves"), "{text}");
+}
+
+/// A stored verdict names the target it settles, or is refused.
+///
+/// Before this, a profile's identity lived for exactly one tool call: the
+/// receipt records what a run proved under, and nothing recorded which target
+/// those settings belonged to, so a conclusion could name neither its target
+/// nor the command that decides it. The refusals matter as much as the field:
+/// a conclusion claiming a target its own receipt contradicts is worse than
+/// one claiming nothing.
+#[tokio::test]
+async fn a_conclusion_can_name_the_target_it_settles() {
+    let target = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(target.to_str().unwrap()).await;
+
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "verify_profiles": {
+                "swap": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap"
+                },
+
+                // Same function and sources, a different model: the second half
+                // of the incremental checks below needs a registered name that
+                // a Typed+cast receipt contradicts.
+                "swapnocast": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap-nocast"
+                }
+            },
+            "verify_profile": "swap"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let wp = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+    let sha = wp["proof_receipt"]["sha256"].as_str().expect("receipt sha").to_string();
+
+    // Taken from the receipt rather than written down: the store refuses a
+    // summary whose counts disagree with the goals the receipt carries.
+    let goals = wp["proof_receipt"]["goals"].as_array().expect("goals");
+    let valid = goals.iter().filter(|g| g["status"] == "valid").count();
+    let summary = json!({
+        "total": goals.len(), "valid": valid,
+        "unknown": goals.len() - valid, "timeout": 0, "failed": 0
+    });
+
+    // A function the profile does not prove cannot borrow its name.
+    let wrong_function = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "order_3", "status": "verified",
+               "wp_summary": summary, "proof_receipt_sha256": sha,
+               "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("order_3 is not in the profile");
+    assert!(
+        format!("{wrong_function:?}").contains("does not prove order_3"),
+        "{wrong_function:?}"
+    );
+
+    call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "status": "verified",
+               "wp_summary": summary, "proof_receipt_sha256": sha,
+               "verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+
+    // The tool is incremental, so the two halves of the claim can arrive in
+    // either order and both orders have to be checked. A name arriving after
+    // the receipt is compared against the receipt already stored.
+    let late_name = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "verify_profile": "swapnocast"}),
+    )
+    .await
+    .expect_err("the stored receipt was not produced under Typed+nocast");
+    assert!(
+        format!("{late_name:?}").contains("declares model Typed+nocast"),
+        "{late_name:?}"
+    );
+
+    // And a receipt arriving after the name is compared against the name
+    // already stored, rather than passing because this call named none.
+    let nocast = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "model": "Typed+nocast"}),
+    )
+    .await
+    .unwrap();
+    let nocast_sha = nocast["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("receipt sha")
+        .to_string();
+    let late_receipt = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "proof_receipt_sha256": nocast_sha}),
+    )
+    .await
+    .expect_err("the stored target declares Typed+cast");
+    assert!(
+        format!("{late_receipt:?}").contains("declares model Typed+cast"),
+        "{late_receipt:?}"
+    );
+
+    // The target and its reproducing command survive into the stored verdict.
+    let listed = call_tool_json(
+        &client,
+        "list",
+        json!({"kind": "conclusions", "function": "swap"}),
+    )
+    .await
+    .unwrap();
+    let text = format!("{listed:?}");
+    assert!(text.contains("\"verify_profile\": String(\"swap\")"), "{text}");
+    assert!(text.contains("make verify-swap"), "{text}");
 }

@@ -379,33 +379,6 @@ pub fn tool_result_json(result: CallToolResult) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or_else(|_| json!(text))
 }
 
-/// Attach the profile a run was made under to whatever that run answered with.
-///
-/// run_wp has three exits, and the profile applies to all of them: the sandbox
-/// scope, the isolated per-prover retries, and the main path. A response that
-/// omits it leaves the model a caller proved under recorded nowhere they will
-/// look.
-///
-/// Written against the object rather than through index assignment, which
-/// panics on a payload that is not one. Nothing reaching here answers with a
-/// bare array or string today; the point is that this takes an arbitrary
-/// CallToolResult, so a future one that did would take the server down rather
-/// than lose a field.
-fn with_verify_profile(
-    result: CallToolResult,
-    profile: Option<serde_json::Value>,
-) -> CallToolResult {
-    let Some(profile) = profile else {
-        return result;
-    };
-    let mut payload = tool_result_json(result);
-    let Some(object) = payload.as_object_mut() else {
-        return json_result(payload);
-    };
-    object.insert("verify_profile".to_string(), profile);
-    json_result(payload)
-}
-
 fn check_step_error(error: &McpError) -> serde_json::Value {
     json!({
         "ok": false,
@@ -2476,23 +2449,10 @@ fn enrich_vcs_with_goals(
 
 /// Whether a call names the same functions the profile declares.
 ///
-/// Compared on the bare names. A sandbox target is written "exp42:foo", and a
-/// profile names the function rather than the experiment holding it, so
-/// comparing the qualified form would refuse every sandbox run, and rewriting
-/// the caller's list to bare names would leave the sandbox unable to resolve
-/// them. So the qualifier is stripped for the comparison and the caller's list
-/// is left alone.
-///
-/// Lifted out of apply_verify_profile to be testable at all: that method needs
-/// a live server, and this is the part of it most likely to be broken by a
-/// later simplification back to a plain equality.
+/// Lifted out of apply_verify_profile to be testable independently of a live
+/// server.
 pub fn profile_covers_exactly(requested: &[String], declared: &[String]) -> bool {
-    fn bare(function: &str) -> &str {
-        function
-            .split_once(':')
-            .map_or(function, |(_, name)| name)
-    }
-    let requested: BTreeSet<&str> = requested.iter().map(|f| bare(f)).collect();
+    let requested: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
     let declared: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
     requested == declared
 }
@@ -2506,7 +2466,13 @@ pub fn profile_matches_loaded_project(
     files: &[String],
     options: &ProjectLoadOptions,
 ) -> bool {
-    (profile.sources.is_empty() || profile.sources == files)
+    // A compilation database supplies per-file flags this server never sees, so
+    // a database-backed load is not described by the profile whatever the
+    // fields below say. Refusing it is the only honest answer: the alternative
+    // is calling a run evidence about a target while the flags it actually ran
+    // under came from somewhere the profile does not reach.
+    options.compilation_database.is_none()
+        && (profile.sources.is_empty() || profile.sources == files)
         && profile.include_paths == options.include_paths
         && profile.defines == options.defines
         && profile.force_includes == options.force_includes
@@ -3849,8 +3815,7 @@ impl FramaCMcpServer {
         })
     }
 
-    /// Fill a proof run's config from a registered profile, without overriding
-    /// a value the caller stated.
+    /// Fill a proof run's config from a registered profile.
     ///
     /// Provers arrive as a list and leave as one comma-separated prover string,
     /// because that is Frama-C's own "-wp-prover alt-ergo,z3" and it is not the
@@ -3860,25 +3825,57 @@ impl FramaCMcpServer {
     async fn apply_verify_profile(
         &self,
         params: &mut RunWpParams,
-        verify_loaded_project: bool,
     ) -> Result<Option<serde_json::Value>, McpError> {
         let Some(name) = params.verify_profile.clone() else {
             return Ok(None);
         };
         let profile = self.verify_profile_named(&name).await?;
-        if verify_loaded_project {
-            let state = self.main_frama_c_state.lock().await;
-            let state = state.as_ref().ok_or_else(no_project_loaded_err)?;
-            if !profile_matches_loaded_project(&profile, &state.files, &state.project_options) {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "verify_profile \"{name}\" does not match the loaded project. Reload its sources and load settings before using it as proof evidence."
-                    ),
-                    None,
-                ));
-            }
+
+        // functions is required alongside the proof settings. Without it there
+        // is no set for the coverage check below to compare against, so a
+        // sources-only profile would label whatever the caller happened to ask
+        // for as that target's evidence, which is the claim the check exists to
+        // refuse. A target is a set of functions proved a particular way; a
+        // profile naming only sources describes a load, not a proof.
+        if profile.model.is_none()
+            || profile.provers.is_empty()
+            || profile.timeout_seconds.is_none()
+            || profile.functions.is_empty()
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "verify_profile \"{name}\" is missing functions, model, provers, or timeout_seconds, so it cannot be proof evidence"
+                ),
+                None,
+            ));
         }
-        if !profile.functions.is_empty() {
+        if params.model.is_some()
+            || params.timeout.is_some()
+            || params.prover.is_some()
+            || params.provers.is_some()
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "verify_profile \"{name}\" is proof evidence and cannot be combined with \
+                     model, prover, provers, or timeout overrides. Drop verify_profile to deviate \
+                     from its proof settings."
+                ),
+                None,
+            ));
+        }
+        let state = self.main_frama_c_state.lock().await;
+        let state = state.as_ref().ok_or_else(no_project_loaded_err)?;
+        if !profile_matches_loaded_project(&profile, &state.files, &state.project_options) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "verify_profile \"{name}\" does not match the loaded project. Reload its sources and load settings before using it as proof evidence."
+                ),
+                None,
+            ));
+        }
+        // Unconditional now: the gate above refuses a profile with no function
+        // set, so there is always something to compare against here.
+        {
             if let Some(functions) = &params.functions {
                 if !profile_covers_exactly(functions, &profile.functions) {
                     return Err(McpError::invalid_params(
@@ -3898,9 +3895,9 @@ impl FramaCMcpServer {
                 params.functions = Some(profile.functions.clone());
             }
         }
-        params.model = params.model.take().or_else(|| profile.model.clone());
-        params.timeout = params.timeout.or(profile.timeout_seconds);
-        if params.prover.is_none() && params.provers.is_none() && !profile.provers.is_empty() {
+        params.model = profile.model.clone();
+        params.timeout = profile.timeout_seconds;
+        if !profile.provers.is_empty() {
             params.prover = Some(profile.provers.join(","));
         }
         Ok(Some(json!({
@@ -3924,11 +3921,13 @@ impl FramaCMcpServer {
     ) -> Result<CallToolResult, McpError> {
         match run_wp_target_scope(&params)? {
             RunWpScope::Sandbox => {
-                let profile_applied = self.apply_verify_profile(&mut params, false).await?;
-                return Ok(with_verify_profile(
-                    self.run_wp_on_sandbox(&params).await?,
-                    profile_applied,
-                ));
+                if params.verify_profile.is_some() {
+                    return Err(McpError::invalid_params(
+                        "verify_profile only labels proofs of the loaded main project; sandbox proofs are not target evidence",
+                        None,
+                    ));
+                }
+                return self.run_wp_on_sandbox(&params).await;
             }
             RunWpScope::Main => {}
         }
@@ -3954,7 +3953,7 @@ impl FramaCMcpServer {
         } else {
             None
         };
-        let profile_applied = self.apply_verify_profile(&mut params, true).await?;
+        let profile_applied = self.apply_verify_profile(&mut params).await?;
 
         // Check project lock for main instance WP
         if *self.project_locked.read().await {
@@ -3971,6 +3970,11 @@ impl FramaCMcpServer {
         // path; a singular `prover` and the environment defaults configure the
         // live instance instead. requested_provers already holds the trimmed
         // and validated list whenever `provers` was given.
+        //
+        // Never a profiled run. apply_verify_profile refuses a plural "provers"
+        // beside a profile and never sets one itself, so profile_applied is
+        // None on every path that reaches here, and there is no profile key to
+        // graft onto this exit's response.
         if let Some(provers) = requested_provers
             .as_ref()
             .filter(|_| params.provers.is_some())
@@ -3981,8 +3985,8 @@ impl FramaCMcpServer {
                 (state.files.clone(), state.project_options.clone())
             };
             let functions = params.functions.clone().unwrap_or_default();
-            return Ok(with_verify_profile(
-                self.run_isolated_wp_retries(IsolatedWpRetry {
+            return self
+                .run_isolated_wp_retries(IsolatedWpRetry {
                     files,
                     project_options,
                     rte_enabled: true,
@@ -3992,9 +3996,7 @@ impl FramaCMcpServer {
                     params: &params,
                     scope: "main",
                 })
-                .await?,
-                profile_applied,
-            ));
+                .await;
         }
 
         // Held across the whole transaction below: config, target resolution,
@@ -4178,9 +4180,10 @@ impl FramaCMcpServer {
         // records the model this ran under, and what this adds is which target
         // that model was supposed to belong to, and the command that decides
         // for it. A caller reading only the goals should not have to remember
-        // either. Written into the payload directly. The helper below exists
-        // for the two exits that only ever hold a CallToolResult; here the
-        // value is a Value one line up, and going through the envelope would
+        // either. Written into the payload directly, because this is the only
+        // exit a profile can reach: the sandbox scope refuses one outright and
+        // the isolated retries cannot be asked for beside one. The value is a
+        // Value one line up, so going through the CallToolResult envelope would
         // pretty-print the whole WP document, drop the string, and print it
         // again to add one key. json_result's own comment is about not copying
         // this tree once, so doing it twice for a key insert is the cost it

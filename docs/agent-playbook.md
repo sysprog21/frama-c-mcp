@@ -291,6 +291,40 @@ run_wp {functions?}
 context {want: ["source"], output?}
 ```
 
+### Proving what the build system proves
+
+If the project declares its proof targets, register them once and name the
+target from then on. This server's WP default is not what a target uses, and a
+goal discharged under the wrong memory model is not evidence about that target:
+
+```text
+reload_project {verify_profiles: <json from the build system>, verify_profile: "<target>"}
+run_wp         {verify_profile: "<target>"}
+store_function_conclusion {function, status: "verified", proof_receipt_sha256, verify_profile: "<target>"}
+```
+
+Emit the JSON from the build system rather than writing it, so it cannot drift
+from the command that decides. A named run is refused rather than quietly
+adjusted when it would not be that target's evidence: if the profile omits
+`functions`, `model`, `provers` or `timeout_seconds`; if the call also passes
+`model`, `prover`, `provers` or `timeout`; if the loaded sources and flags are
+not the ones the profile declares; if the functions are not the target's set;
+or if the scope is a sandbox, whose proofs are never target evidence. Reached
+through `check` the same refusals arrive as a failed WP step inside `wp`, with
+the reason in `incomplete[]`, rather than as a tool error, so read the step
+rather than the absence of an error. Omit
+`verify_profile` to deviate on purpose.
+
+`store_function_conclusion {verify_profile}` is what carries the target into
+the stored verdict, along with the `reproduce` command. Without it a conclusion
+records what was proved and not what it settles. It is refused on the same
+grounds a run is: the profile must declare `model`, `provers` and
+`timeout_seconds`, it must prove this function, and the receipt must have been
+produced under that model and over those sources. Because the tool is
+incremental, the comparison is against the conclusion as it will stand, so a
+later call that replaces the receipt is rechecked against the name already
+stored.
+
 Resume after an interruption by calling `verify_program_step`, then `list {kind: "conclusions"}`. Use the returned `project_state`, `verification_order`, `scc_groups`, and current conclusions to rebuild any still-running `in_progress` list; completed functions are derived from stored conclusions.
 
 If `verify_program_step` returns more ready functions, stay locked and repeat from `create_sandbox` through the next `verify_program_step` before unlocking with `verify_program_step {lock_project: false}`. The completed set must contain only functions whose verified structured annotations have already been merged into the main project.

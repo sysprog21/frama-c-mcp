@@ -189,10 +189,14 @@ pub struct ReloadProjectParams {
     /// Register what the project's build system proves each target under, as an
     /// object keyed by target name. Emit it from the build system rather than
     /// writing it here, so it cannot drift from the command that decides:
-    /// "make print-verify-profiles" or the equivalent. Each entry may carry
-    /// sources, functions, model, machdep, include_paths, defines,
-    /// force_includes, provers, timeout_seconds and reproduce. Registered for
-    /// the session; passing it again replaces the set.
+    /// "make print-verify-profiles" or the equivalent. An entry used only to
+    /// load may carry sources, machdep, include_paths, defines, force_includes
+    /// and reproduce. One that a run or a conclusion will name additionally
+    /// needs functions, model, provers and timeout_seconds, and is refused
+    /// without them: the proof settings because it would otherwise prove under
+    /// this server's defaults while reporting the target's name, and the
+    /// function set because there would be nothing to check coverage against.
+    /// Registered for the session; passing it again replaces the set.
     pub verify_profiles: Option<serde_json::Value>,
     /// Where verify_profiles came from, recorded so a later reader can re-run
     /// it
@@ -201,7 +205,9 @@ pub struct ReloadProjectParams {
     /// Load the sources and preprocessor flags of a registered profile. Any
     /// explicit files, include_paths, defines, force_includes or machdep in
     /// this same call win over it, so a caller can deviate on purpose, and the
-    /// response says what was taken from the profile either way.
+    /// response says what was taken from the profile either way. A load that
+    /// deviated is not silently usable as that target's evidence: a later
+    /// run_wp naming the same profile compares the two and refuses.
     pub verify_profile: Option<String>,
 }
 
@@ -297,8 +303,10 @@ pub struct RunWpParams {
     /// Prove under a profile registered through reload_project: its model,
     /// provers and timeout. This server's defaults are not what a project's
     /// proof targets use, and a goal discharged under the wrong memory model is
-    /// not evidence about that target. An explicit model, prover or timeout in
-    /// this same call wins, and the response reports what came from where.
+    /// not evidence about that target. Model, prover, provers, and timeout
+    /// overrides are refused; the profile must declare model, provers, and
+    /// timeout. Sandbox runs cannot use a profile; omit verify_profile to
+    /// intentionally deviate.
     pub verify_profile: Option<String>,
 }
 
@@ -435,6 +443,12 @@ pub struct CheckParams {
     /// reload_project: its sources and preprocessor flags for the reload, its
     /// model, provers and timeout for the proof. That is what makes the result
     /// evidence about that target rather than about this server's defaults.
+    /// Passing model, prover, provers or timeout alongside it does not produce
+    /// a proof: run_wp refuses the combination, and check reports that refusal
+    /// as a failed WP step inside "wp" rather than as a tool error, with the
+    /// reason in incomplete[]. The same holds for a profile missing its proof
+    /// settings and for a load that does not match the profile. Read the step
+    /// rather than the absence of an error.
     pub verify_profile: Option<String>,
     #[schemars(skip)]
     pub precision: Option<i32>,
@@ -877,6 +891,18 @@ pub struct StoreFunctionConclusionParams {
     /// JSON, so it never reaches the handler. Discovered by an end-to-end test
     /// after a unit test on the state alone had passed.
     pub proof_receipt_sha256: Option<String>,
+    /// The proof target this conclusion is evidence about, named from the
+    /// profiles registered through reload_project.
+    ///
+    /// Checked rather than recorded on trust: the profile must declare model,
+    /// provers and timeout_seconds, it must name this function, and the receipt
+    /// must have been produced under the model and over the sources that
+    /// profile declares. The comparison is against the conclusion as it will
+    /// stand, so a later call replacing the receipt is rechecked against a name
+    /// already stored. Without it a verdict can be stored that says nothing
+    /// about which target it settles, which is the state this server was in
+    /// for every conclusion before profiles existed.
+    pub verify_profile: Option<String>,
 
     // S1_info_gather outputs
     /// Callee names list

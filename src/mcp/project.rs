@@ -1002,9 +1002,9 @@ impl FramaCMcpServer {
 
         // One process per file, several at a time. The probes are independent
         // and each is short, but a serial sweep of a real tree is minutes of
-        // wall clock for a question asked while waiting on the answer.
-        // The server's pool, not this call's. Two concurrent sweeps must not
-        // double the number of Frama-C children that exist.
+        // wall clock for a question asked while waiting on the answer. The
+        // server's pool, not this call's. Two concurrent sweeps must not double
+        // the number of Frama-C children that exist.
         let permits = self.parse_probe_slots.clone();
         let mut probes = tokio::task::JoinSet::new();
         for (index, file) in files.iter().enumerate() {

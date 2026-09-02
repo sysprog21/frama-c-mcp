@@ -840,6 +840,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
         let mut receipt = proof_receipt_body(ProofReceiptBody {
             tool: "check",
             source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+            project_load: json!({}),
             ast_digest: json!("ast"),
             ast_digest_unavailable_reason: json!(null),
             contracts: json!({}),
@@ -869,9 +870,10 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
 
     // A key at either governed level moves the id, with no edit anywhere else.
     // The historical bumps were exactly this shape: v3 added subject.contracts,
-    // v4 added subject.ast_digest, v5 added top-level eva. Recomputed, not read
-    // back: the stamped field records the shape at build time, and the question
-    // here is what a differently shaped body hashes to.
+    // v4 added subject.ast_digest, v5 added top-level eva, v6 added
+    // project_load. Recomputed, not read back: the stamped field records the
+    // shape at build time, and the question here is what a differently shaped
+    // body hashes to.
     let with_new_top_level = body(Some(("__shape_probe__", json!({}))));
     assert_ne!(schema_of(&with_new_top_level), receipt_shape());
 
@@ -890,6 +892,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
     let a = proof_receipt_body(ProofReceiptBody {
         tool: "check",
         source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+        project_load: json!({}),
         ast_digest: json!("ast"),
         ast_digest_unavailable_reason: json!(null),
         contracts: json!({}),
@@ -928,7 +931,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
     // When the receipt's field set changes on purpose, update this and say why
     // in the commit.
     assert_eq!(
-        shape, "c96baff31d2f",
+        shape, "8a53d6577dfd",
         "the receipt's field set moved; stored conclusions will stop loading"
     );
 }
@@ -939,6 +942,7 @@ fn an_absent_eva_config_says_which_absence_it_is() {
         proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool: "check",
             source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+            project_load: json!({}),
             ast_digest: json!("ast"),
             ast_digest_unavailable_reason: json!(null),
             contracts: json!({}),
@@ -989,6 +993,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let first = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1002,6 +1007,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let second = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1017,6 +1023,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let changed = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1980,6 +1987,7 @@ fn ast_digest_separates_runs_that_goal_counts_cannot() {
         proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool: "run_wp",
             source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+            project_load: json!({}),
             ast_digest: digest.clone(),
             ast_digest_unavailable_reason: if digest.is_null() {
                 json!("no_client")
@@ -2149,12 +2157,9 @@ fn a_comma_separated_prover_argument_names_each_of_them() {
 
 /// The comparison a profile makes before it will call a run its evidence.
 ///
-/// Extracted from apply_verify_profile, which needs a live server, because a
-/// sandbox target is written "exp42:foo" and a profile names "foo". Comparing
-/// the qualified form refuses every sandbox run; that is the regression this
-/// pins, and nothing else in any suite would catch it.
+/// Extracted from apply_verify_profile, which needs a live server.
 #[test]
-fn a_profile_matches_a_sandbox_target_by_its_bare_name() {
+fn a_profile_matches_its_main_target_exactly() {
     let declared = vec!["elf_phdr_fetch".to_string(), "hex_nibble".to_string()];
 
     // Unqualified, in a different order: the same target.
@@ -2163,18 +2168,9 @@ fn a_profile_matches_a_sandbox_target_by_its_bare_name() {
         &declared
     ));
 
-    // Sandbox-qualified: still the same functions, in an experiment.
-    assert!(profile_covers_exactly(
-        &[
-            "exp42:elf_phdr_fetch".to_string(),
-            "exp42:hex_nibble".to_string()
-        ],
-        &declared
-    ));
-
     // A subset is not the target, which is the whole point of the check.
     assert!(!profile_covers_exactly(
-        &["exp42:hex_nibble".to_string()],
+        &["hex_nibble".to_string()],
         &declared
     ));
 
@@ -2186,6 +2182,32 @@ fn a_profile_matches_a_sandbox_target_by_its_bare_name() {
             "elf_segment_extent".to_string()
         ],
         &declared
+    ));
+}
+
+#[test]
+fn a_database_backed_load_is_not_a_profile_match() {
+    // A compilation database supplies per-file flags this server never sees, so
+    // nothing the profile declares can describe the load. Accepting it would
+    // label a run as a target's evidence while the flags it ran under came from
+    // somewhere the profile does not reach.
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        ..Default::default()
+    };
+    let with_database = ProjectLoadOptions {
+        compilation_database: Some("build/compile_commands.json".into()),
+        ..Default::default()
+    };
+    assert!(!profile_matches_loaded_project(
+        &profile,
+        &["src/target.c".to_string()],
+        &with_database
+    ));
+    assert!(profile_matches_loaded_project(
+        &profile,
+        &["src/target.c".to_string()],
+        &ProjectLoadOptions::default()
     ));
 }
 

@@ -399,6 +399,19 @@ pub struct FunctionVerificationState {
     pub stale_dependencies: Vec<StaleDependency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_receipt: Option<serde_json::Value>,
+    /// The proof target this conclusion is evidence about, and the command
+    /// that decides for it.
+    ///
+    /// Both are optional because a conclusion can be reached without naming a
+    /// target. What they remove when present is the gap that made a profile
+    /// worth exactly one tool call: the receipt records what a run proved
+    /// under, and until now nothing recorded which target those settings were
+    /// supposed to belong to, so a stored verdict could name neither the
+    /// target nor the command that actually decides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproduce: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_env_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -691,6 +704,8 @@ pub struct FunctionConclusionUpdate {
     pub notes: Option<String>,
     pub callees: Option<Vec<String>>,
     pub proof_receipt: Option<serde_json::Value>,
+    pub verify_profile: Option<String>,
+    pub reproduce: Option<String>,
 }
 
 /// Summary returned by list_conclusions.
@@ -984,6 +999,10 @@ impl SessionState {
             entry.proof_env_hash = proof_env_hash.clone();
             entry.stale_proof_environment = None;
         }
+        if let Some(v) = update.verify_profile {
+            entry.verify_profile = Some(v);
+            entry.reproduce = update.reproduce;
+        }
 
         if refreshed_callees.is_some() {
             entry.callee_spec_hashes = entry
@@ -1134,6 +1153,12 @@ impl SessionState {
             "timeout_seconds": receipt.pointer("/wp/timeout_seconds/effective").cloned().or_else(|| conclusion.wp_summary.as_ref().and_then(|s| s.timeout_used.map(serde_json::Value::from))),
             "assumed_callee_contracts": conclusion.callees.clone(),
             "proof_receipt_sha256": receipt.get("sha256").cloned(),
+            "verify_profile": conclusion.verify_profile.clone(),
+
+            // The command that decides. This server is an accelerator: goals
+            // discharging here are progress, and a stored verdict should carry
+            // the thing that settles it rather than leave a reader to remember.
+            "reproduce": conclusion.reproduce.clone(),
         }))
     }
 
@@ -1212,6 +1237,8 @@ impl SessionState {
             specs: Vec::new(),
             wp_summary: None,
             notes: String::new(),
+            verify_profile: None,
+            reproduce: None,
             callees: Vec::new(),
             callee_spec_hashes: HashMap::new(),
             stale_dependencies: Vec::new(),

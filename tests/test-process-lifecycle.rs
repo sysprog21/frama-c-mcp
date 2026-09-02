@@ -679,6 +679,7 @@ fn tool_registry_count_matches_declared_snapshots() {
             "proof_receipt_sha256",
             "specs",
             "status",
+            "verify_profile",
             "wp_summary",
         ])
     );

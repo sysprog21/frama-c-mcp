@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use frama_c_mcp::state::*;
+use frama_c_mcp::mcp::server::conclusions::profile_evidence_error;
 use serde_json::json;
 use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 
@@ -557,6 +558,8 @@ fn round_trip_reachable_conclusion_fields() {
         notes: Some("ok".into()),
         callees: Some(vec!["g".into(), "h".into()]),
         proof_receipt: Some(proof_receipt("env-a")),
+        verify_profile: None,
+        reproduce: None,
     }).unwrap();
 
     let stored = state.get_conclusion("F").expect("conclusion stored").clone();
@@ -1430,4 +1433,81 @@ fn profile_paths_are_not_normalized() {
     assert_eq!(elf.sources, vec!["src/elf.c "]);
     assert_eq!(elf.include_paths, vec!["include "]);
     assert_eq!(elf.force_includes, vec!["prelude.h "]);
+}
+
+// Moved out of src/mcp/conclusions.rs: this tree keeps every test under tests/,
+// and src carries no cfg(test) at all.
+    #[test]
+    fn profile_evidence_requires_the_receipt_function_and_source_paths() {
+        let profile: crate::state::VerificationProfile = serde_json::from_value(json!({
+            "functions": ["swap", "order_3"],
+            "sources": ["swap-frame.c", "support.c"],
+            "model": "Typed+cast",
+            "include_paths": ["include"],
+            "defines": ["TARGET=1"],
+            "force_includes": ["target.h"],
+            "machdep": "gcc_x86_64",
+            "provers": ["alt-ergo"],
+            "timeout_seconds": 10
+        }))
+        .unwrap();
+
+        let wrong_function = json!({
+            "wp": {"functions": ["order_3"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "swap-frame.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert!(
+            profile_evidence_error("target", &profile, "swap", Some(&wrong_function))
+                .unwrap()
+                .contains("does not prove swap")
+        );
+
+        let wrong_source = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "other.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert!(
+            profile_evidence_error("target", &profile, "swap", Some(&wrong_source))
+                .unwrap()
+                .contains("declares sources")
+        );
+
+        let matching_sources = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert_eq!(
+            profile_evidence_error("target", &profile, "swap", Some(&matching_sources)),
+            None
+        );
+
+        let wrong_load = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": {"include_paths": [], "defines": [], "force_includes": [], "machdep": null, "compilation_database": null}}
+        });
+        assert!(profile_evidence_error("target", &profile, "swap", Some(&wrong_load))
+            .unwrap()
+            .contains("project load settings"));
+    }
+
+#[test]
+fn a_conclusion_written_before_profiles_still_loads() {
+    // The two fields were added to a struct that is persisted, so a session
+    // upgrading mid-project must not lose the conclusions already on disk.
+    // serde defaults a missing Option to None, and this pins that rather than
+    // trusting it: the failure mode is silent, and it costs a user their
+    // recorded verdicts.
+    let old = serde_json::json!({
+        "function": "swap",
+        "status": "verified",
+        "specs": [],
+        "wp_summary": null,
+        "notes": "",
+        "callees": []
+    });
+    let loaded: FunctionVerificationState =
+        serde_json::from_value(old).expect("a pre-profile conclusion still deserializes");
+    assert_eq!(loaded.function, "swap");
+    assert_eq!(loaded.verify_profile, None);
+    assert_eq!(loaded.reproduce, None);
 }
