@@ -607,6 +607,17 @@ fn a_missing_header_is_named_in_either_preprocessor_voice() {
     assert_eq!(gcc.cause, "header_not_found");
     assert_eq!(gcc.subject.as_deref(), Some("sys/event.h"));
 
+    // The hash and the directive may be separated: both forms are legal C and
+    // both appear in echoed source, and a literal "#include" match drops them
+    // into "other", the bucket that names no cause at all.
+    for spelling in ["#include <config>", "# include <config>", "#\tinclude <config>"] {
+        let spaced = classify_parse_failure(&format!(
+            "src/app.c:4:10: fatal error: 'config' file not found\n    4 | {spelling}\n"
+        ));
+        assert_eq!(spaced.cause, "header_not_found", "{spelling}");
+        assert_eq!(spaced.subject.as_deref(), Some("config"), "{spelling}");
+    }
+
     let extensionless = classify_parse_failure(
         "src/app.c:4:10: fatal error: 'config' file not found\n\
             4 | #include <config>\n",

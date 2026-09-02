@@ -1213,7 +1213,7 @@ pub fn classify_parse_failure(output: &str) -> ParseBlock {
                 lines[index + 1..]
                     .iter()
                     .take(2)
-                    .any(|line| line.contains("#include") && line.contains(header))
+                    .any(|line| includes_header(line, header))
             })
         }) {
             return ParseBlock {
@@ -1250,6 +1250,23 @@ pub fn classify_parse_failure(output: &str) -> ParseBlock {
             .map(|line| line.trim().to_string())
             .unwrap_or_default(),
     }
+}
+
+/// Whether a line is an include directive naming this header.
+///
+/// C allows whitespace between the hash and the directive, so "# include" and
+/// a tab-separated form are both legal and both appear in echoed source. A
+/// literal "#include" match misses them and drops the file into "other", which
+/// is the bucket that names no cause at all.
+fn includes_header(line: &str, header: &str) -> bool {
+    // The hash is found rather than anchored at the start: Frama-C echoes the
+    // offending source with a line number and a bar in front of it, so the
+    // directive is mid-line. Anchoring was the first attempt and it dropped the
+    // ordinary case while fixing the spaced one.
+    let Some(hash) = line.find('#') else {
+        return false;
+    };
+    line[hash + 1..].trim_start().starts_with("include") && line.contains(header)
 }
 
 /// The identifier out of the kernel's "Cannot resolve variable".
