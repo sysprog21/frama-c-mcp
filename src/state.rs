@@ -208,6 +208,95 @@ pub struct SandboxMetadata {
 /// feature.
 const SEEN_RECEIPT_LIMIT: usize = 32;
 
+/// One proof target as the project's build system defines it.
+///
+/// Every field is what a run has to match to be evidence about that target.
+/// None means the project did not state one, which is different from a default:
+/// a caller is told what was declared, and nothing is invented on its behalf.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+
+// A misspelled key is refused rather than ignored. The whole point of these is
+// that a run under the wrong model must not pass quietly, and "models" silently
+// meaning no model declared is exactly that failure with an extra step.
+#[serde(deny_unknown_fields)]
+pub struct VerificationProfile {
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub functions: Vec<String>,
+    pub model: Option<String>,
+    pub machdep: Option<String>,
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    #[serde(default)]
+    pub defines: Vec<String>,
+    #[serde(default)]
+    pub force_includes: Vec<String>,
+    #[serde(default)]
+    pub provers: Vec<String>,
+    pub timeout_seconds: Option<u32>,
+    /// The command that makes this target's verdict outside this server.
+    ///
+    /// Carried so a conclusion can name it. This server is an accelerator: a
+    /// goal discharging here is progress, and the project's own command is what
+    /// decides, so the two should not have to be connected from memory.
+    pub reproduce: Option<String>,
+}
+
+/// Read a profile map as a project emitted it.
+///
+/// Refuses rather than repairs. A profile that names neither a function nor a
+/// source cannot be matched against anything later, and accepting it would put
+/// a name in the registry that silently never applies.
+pub fn parse_verification_profiles(
+    value: &serde_json::Value,
+) -> Result<BTreeMap<String, VerificationProfile>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "profiles must be an object keyed by target name".to_string())?;
+    if object.is_empty() {
+        return Err("profiles is empty, so no target could be named later".to_string());
+    }
+    let mut profiles = BTreeMap::new();
+    for (name, body) in object {
+        let mut profile: VerificationProfile = serde_json::from_value(body.clone())
+            .map_err(|e| format!("profile \"{name}\": {e}"))?;
+
+        // Function and prover names are trimmed, and one that is nothing but
+        // padding is refused. The remaining lists contain command arguments or
+        // paths, whose spelling must be left for their later validation.
+        //
+        // Both halves matter and for the same reason: a name is compared for
+        // equality later, so " elf_phdr_fetch " would register, match no
+        // function all session, and then produce a refusal printing it against
+        // the name it differs from only by two spaces. Trimming is what the
+        // prover argument already does with the same kind of input, and a blank
+        // left after it was a build system emitting nothing by accident.
+        for (field, entries) in [
+            ("functions", &mut profile.functions),
+            ("provers", &mut profile.provers),
+        ] {
+            for entry in entries.iter_mut() {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "profile \"{name}\" has a blank entry in {field}, which can never match"
+                    ));
+                }
+                *entry = trimmed.to_string();
+            }
+        }
+        if profile.functions.is_empty() && profile.sources.is_empty() {
+            return Err(format!(
+                "profile \"{name}\" names neither functions nor sources, so nothing \
+                 could ever be matched to it"
+            ));
+        }
+        profiles.insert(name.clone(), profile);
+    }
+    Ok(profiles)
+}
+
 #[derive(Debug, Default)]
 pub struct SessionState {
     pub project_loaded: bool,
@@ -228,6 +317,19 @@ pub struct SessionState {
     // Skill-based verification
     pub conclusions: HashMap<String, FunctionVerificationState>,
     pub project_state: Option<ProjectVerificationState>,
+    /// What the project's own build system proves each target under, keyed by
+    /// target name, and where the caller says it came from.
+    ///
+    /// This server's WP defaults are not what a project's proof targets use,
+    /// and a goal discharged under the wrong memory model says nothing about
+    /// whether that target passes. Mirroring the target by hand on every call
+    /// is five values to transcribe and nothing to check the transcription, so
+    /// the values are registered once and named afterwards.
+    ///
+    /// Session-scoped rather than persisted: they describe the build system as
+    /// it is now, and a stale copy is the drift they exist to prevent.
+    pub verification_profiles: BTreeMap<String, VerificationProfile>,
+    pub verification_profiles_source: Option<String>,
     /// Receipts this session produced, keyed by their sha256: the goal set for
     /// get_wp_goals {since} to diff against, and the receipt body itself so
     /// store_function_conclusion can be handed the hash instead of the whole
@@ -297,6 +399,19 @@ pub struct FunctionVerificationState {
     pub stale_dependencies: Vec<StaleDependency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_receipt: Option<serde_json::Value>,
+    /// The proof target this conclusion is evidence about, and the command
+    /// that decides for it.
+    ///
+    /// Both are optional because a conclusion can be reached without naming a
+    /// target. What they remove when present is the gap that made a profile
+    /// worth exactly one tool call: the receipt records what a run proved
+    /// under, and until now nothing recorded which target those settings were
+    /// supposed to belong to, so a stored verdict could name neither the
+    /// target nor the command that actually decides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproduce: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof_env_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -589,6 +704,8 @@ pub struct FunctionConclusionUpdate {
     pub notes: Option<String>,
     pub callees: Option<Vec<String>>,
     pub proof_receipt: Option<serde_json::Value>,
+    pub verify_profile: Option<String>,
+    pub reproduce: Option<String>,
 }
 
 /// Summary returned by list_conclusions.
@@ -882,6 +999,10 @@ impl SessionState {
             entry.proof_env_hash = proof_env_hash.clone();
             entry.stale_proof_environment = None;
         }
+        if let Some(v) = update.verify_profile {
+            entry.verify_profile = Some(v);
+            entry.reproduce = update.reproduce;
+        }
 
         if refreshed_callees.is_some() {
             entry.callee_spec_hashes = entry
@@ -1032,6 +1153,12 @@ impl SessionState {
             "timeout_seconds": receipt.pointer("/wp/timeout_seconds/effective").cloned().or_else(|| conclusion.wp_summary.as_ref().and_then(|s| s.timeout_used.map(serde_json::Value::from))),
             "assumed_callee_contracts": conclusion.callees.clone(),
             "proof_receipt_sha256": receipt.get("sha256").cloned(),
+            "verify_profile": conclusion.verify_profile.clone(),
+
+            // The command that decides. This server is an accelerator: goals
+            // discharging here are progress, and a stored verdict should carry
+            // the thing that settles it rather than leave a reader to remember.
+            "reproduce": conclusion.reproduce.clone(),
         }))
     }
 
@@ -1110,6 +1237,8 @@ impl SessionState {
             specs: Vec::new(),
             wp_summary: None,
             notes: String::new(),
+            verify_profile: None,
+            reproduce: None,
             callees: Vec::new(),
             callee_spec_hashes: HashMap::new(),
             stale_dependencies: Vec::new(),

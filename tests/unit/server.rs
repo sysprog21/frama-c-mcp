@@ -342,7 +342,13 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
     );
     let payload = server.self_check_payload().await;
     let payload = &payload["capabilities"];
-    assert_eq!(payload["server"]["tool_count"], MCP_TOOL_COUNT);
+
+    // A literal, not the router. Comparing the reported count to the router it
+    // is computed from can only fail if the field goes missing, which is a
+    // tautology dressed as a check. The pin that matters, self_check against
+    // the declared surface, lives in the lifecycle suite; this one is here so
+    // the pure-Rust lane notices a count that moved without anyone saying so.
+    assert_eq!(payload["server"]["tool_count"], 15);
     assert_eq!(payload["server"]["protocol_version"], "2024-11-05");
 
     // The revisions this server agrees to, reported rather than assumed. 2026

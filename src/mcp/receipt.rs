@@ -219,6 +219,7 @@ pub struct ProofReceiptRequest<'a> {
 pub struct ProofReceiptBody<'a> {
     pub tool: &'a str,
     pub source_files: Vec<serde_json::Value>,
+    pub project_load: serde_json::Value,
     pub ast_digest: serde_json::Value,
     pub ast_digest_unavailable_reason: serde_json::Value,
     pub contracts: serde_json::Value,
@@ -343,6 +344,7 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
     let ProofReceiptBody {
         tool,
         source_files,
+        project_load,
         ast_digest,
         ast_digest_unavailable_reason,
         contracts,
@@ -363,6 +365,11 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
             "tool": tool,
             "source_hash": source_hash,
             "files": source_files,
+
+            // The complete project load whose preprocessor and target settings
+            // produced this proof. Unlike ast_digest, this distinguishes even
+            // configuration changes that select identical code.
+            "project_load": project_load,
 
             // What was actually analysed, which the file hashes above cannot
             // show. Two runs over identical files still analyse different code
@@ -440,8 +447,9 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
 /// the format, and no two receipts would share one.
 ///
 /// That boundary is also the historical record: v3 added "subject.contracts",
-/// v4 added "subject.ast_digest", v5 added top-level "eva". Every bump this
-/// format ever had is a key at one of these two levels.
+/// v4 added "subject.ast_digest", v5 added top-level "eva", v6 added
+/// "subject.project_load". Every bump this format ever had is a key at one of
+/// these two levels.
 pub fn schema_of(receipt: &serde_json::Value) -> String {
     // "sha256" is excluded, and the exclusion is what makes the id reproducible
     // from a finished receipt. proof_receipt_with_hash adds that key after this
@@ -486,6 +494,7 @@ pub fn receipt_shape() -> &'static str {
         let probe = proof_receipt_body(ProofReceiptBody {
             tool: "",
             source_files: Vec::new(),
+            project_load: json!({}),
             ast_digest: json!(""),
             ast_digest_unavailable_reason: json!(null),
             contracts: json!({}),
@@ -747,9 +756,26 @@ impl FramaCMcpServer {
             .await;
         let (ast_digest, ast_digest_unavailable_reason) =
             self.proof_receipt_ast_digest(client, goals_status_source).await;
+        let project_load = self
+            .main_frama_c_state
+            .lock()
+            .await
+            .as_ref()
+            .filter(|state| state.files == source_files)
+            .map(|state| {
+                json!({
+                    "include_paths": state.project_options.include_paths,
+                    "defines": state.project_options.defines,
+                    "force_includes": state.project_options.force_includes,
+                    "machdep": state.project_options.machdep,
+                    "compilation_database": state.project_options.compilation_database,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
         let receipt = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool,
             source_files: proof_receipt_source_files(&source_files),
+            project_load,
             ast_digest,
             ast_digest_unavailable_reason,
             contracts,

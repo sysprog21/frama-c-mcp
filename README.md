@@ -245,7 +245,7 @@ The server exposes the following tool groups:
 
 | Domain | Tools | Purpose |
 |--------|-------|---------|
-| Project | `reload_project`, `list`, `context`, `self_check` | Load source, inspect declarations, navigate call relationships, and report server capabilities |
+| Project | `reload_project`, `list`, `context`, `self_check`, `parse_surface` | Load source, inspect declarations, navigate call relationships, report server capabilities, and measure how much of a file set Frama-C can parse at all |
 | EVA/WP | `check`, `run_wp`, `get_wp_goals`, `run_e_acsl` | Run verification, read what it concluded, and execute runtime counterexamples |
 | Annotations | `inject_all_annotations`, `propose_annotations` | Dry-run validate and inject ACSL annotations, and propose the frame conditions the code determines |
 | Sandbox | `create_sandbox`, `delete_sandbox` | Isolate annotation experiments |
@@ -274,6 +274,65 @@ that points out of it are all refused.
 `run_e_acsl {tool}` names the E-ACSL wrapper, not an arbitrary executable: it
 must be `e-acsl-gcc` or `e-acsl-gcc.sh`, resolved through PATH. Both names
 exist because installs differ.
+
+### Proving what the build system proves
+
+This server's WP defaults are not what a project's proof targets use. A goal
+discharged under `Typed+nocast` says nothing about a target that declares
+`caveat`, so evidence produced under the wrong model is not evidence about that
+target at all.
+
+Register what the build system says, and name it on the same call or a later
+one. Registration happens before the load, so one call can both hand over the
+set and load under one of them:
+
+```
+reload_project {verify_profiles: <json>, verify_profiles_source: "make print-verify-profiles",
+                verify_profile: "elf"}   # registers, then loads elf's sources and cpp flags
+run_wp         {verify_profile: "elf"}   # its model, provers and timeout
+check          {verify_profile: "elf"}   # both
+reload_project {verify_profile: "gva"}   # a later target, already registered
+```
+
+Registering without naming a profile and without `files` is not a load, and a
+fresh session answers it with "no project loaded" because there is nothing to
+reparse. A malformed set is refused before anything is replaced; a set that
+parses is registered even if the load that follows it fails.
+
+A profile that is only used to load may carry `sources`, `machdep`,
+`include_paths`, `defines`, `force_includes` and `reproduce`. One you intend to
+prove under additionally needs `functions`, `model`, `provers` and
+`timeout_seconds`, and a run naming it is refused unless all four are there:
+without the proof settings it would fall back to this server's defaults and
+report the target's name over them, and without a function set there is nothing
+for the coverage check to compare against. Emit the JSON from the build system that defines the targets
+rather than writing it by hand, so it cannot drift from the command that
+decides. An unknown key is refused rather than ignored. A profile
+whose model key is misspelled as `models` would otherwise register with no
+model at all, and the next run would prove under this server's default and
+report it as that target's evidence, which is the failure profiles exist to
+prevent. Naming a profile nobody registered is refused too, rather than
+falling back to the default.
+
+Passing `model`, `prover`, `provers` or `timeout` alongside `verify_profile` is
+refused rather than allowed to win. A run labelled as a target's evidence has
+to be the target's settings, and letting an override through produced exactly
+the mislabelling profiles exist to prevent: proving under one model while the
+response named another. Omit `verify_profile` to deviate on purpose.
+Evidence profiles must declare all three proof settings: `model`, non-empty
+`provers`, and `timeout_seconds`; an incomplete profile may be registered for
+loading, but cannot label a proof result. Sandboxes are likewise excluded:
+their generated source is not the registered build target.
+
+The load settings behave the same way by a different route. `reload_project`
+lets an explicit `machdep` or include path override the profile, and a later
+profiled run then compares what was loaded against what the profile declares
+and refuses if they differ, so a deviating load cannot be reported as that
+target's evidence either.
+
+`reproduce` is the command that actually decides. This server is an
+accelerator: goals discharging here are progress, and the project's own command
+is the verdict.
 
 `reload_project {include_paths, defines, force_includes}` become preprocessor
 flags, and Frama-C hands those to a shell (its `-cpp-extra-args` is "unsafe in

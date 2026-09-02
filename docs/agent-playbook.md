@@ -31,6 +31,32 @@ A load that fails hard never reaches this, since Frama-C exits before the
 session exists. Read `reload.error` there: it carries the process output,
 which is where an ACSL type error names its predicate and line.
 
+When several files fail that way, ask what the ceiling is before working
+around it one file at a time:
+
+```text
+parse_surface {files, include_paths?, defines?, force_includes?, machdep?, detail?}
+```
+
+It reports how many of a set parse and ranks what blocks the rest, with
+`detail: "full"` adding the per-file verdict. Recompute this rather than
+quoting a count from a document, which is the whole reason the tool exists.
+
+Two of the causes are the ones you act on, and they want opposite things. A
+`header_not_found` is either a header of this project missing from
+`include_paths`, which needs no stub at all, or a system header Frama-C's libc
+does not model, which a stub cannot honestly close: one declaring only what the
+tree calls leaves the analysis reasoning about bodies that do not exist. An
+`undeclared_name` is what a stub does answer, declared as the platform declares
+it.
+
+The rest are not about stubs. `missing_file` means the path is not there and
+nothing was measured for it, so it is evidence neither way; `timeout` means the
+front end did not finish and wants reading directly; `probe_failed` means
+Frama-C itself could not be run, so nothing was measured for that file either;
+`other` quotes the first error rather than guessing a cause for it. That quote
+is per file, so the last one wants `detail: "full"` to read at all.
+
 Call order:
 
 ```text
@@ -264,6 +290,40 @@ verify_program_step {in_progress?, lock_project?}
 run_wp {functions?}
 context {want: ["source"], output?}
 ```
+
+### Proving what the build system proves
+
+If the project declares its proof targets, register them once and name the
+target from then on. This server's WP default is not what a target uses, and a
+goal discharged under the wrong memory model is not evidence about that target:
+
+```text
+reload_project {verify_profiles: <json from the build system>, verify_profile: "<target>"}
+run_wp         {verify_profile: "<target>"}
+store_function_conclusion {function, status: "verified", proof_receipt_sha256, verify_profile: "<target>"}
+```
+
+Emit the JSON from the build system rather than writing it, so it cannot drift
+from the command that decides. A named run is refused rather than quietly
+adjusted when it would not be that target's evidence: if the profile omits
+`functions`, `model`, `provers` or `timeout_seconds`; if the call also passes
+`model`, `prover`, `provers` or `timeout`; if the loaded sources and flags are
+not the ones the profile declares; if the functions are not the target's set;
+or if the scope is a sandbox, whose proofs are never target evidence. Reached
+through `check` the same refusals arrive as a failed WP step inside `wp`, with
+the reason in `incomplete[]`, rather than as a tool error, so read the step
+rather than the absence of an error. Omit
+`verify_profile` to deviate on purpose.
+
+`store_function_conclusion {verify_profile}` is what carries the target into
+the stored verdict, along with the `reproduce` command. Without it a conclusion
+records what was proved and not what it settles. It is refused on the same
+grounds a run is: the profile must declare `model`, `provers` and
+`timeout_seconds`, it must prove this function, and the receipt must have been
+produced under that model and over those sources. Because the tool is
+incremental, the comparison is against the conclusion as it will stand, so a
+later call that replaces the receipt is rechecked against the name already
+stored.
 
 Resume after an interruption by calling `verify_program_step`, then `list {kind: "conclusions"}`. Use the returned `project_state`, `verification_order`, `scc_groups`, and current conclusions to rebuild any still-running `in_progress` list; completed functions are derived from stored conclusions.
 

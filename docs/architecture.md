@@ -25,7 +25,7 @@ The first reload_project starts the main Frama-C process.
 
 | Modules | Responsibilities |
 |---|---|
-| `mcp/*.rs` | 14 tool implementations, one `#[tool_router]` per module, split by domain below |
+| `mcp/*.rs` | 15 tool implementations, one `#[tool_router]` per module, split by domain below |
 | `mcp/server.rs` | Server state, sandbox registry, conclusion persistence, and helpers shared by the tool modules |
 | `mcp/project.rs`, `mcp/analysis.rs`, `mcp/annotations.rs`, `mcp/sandbox.rs`, `mcp/conclusions.rs` | The tool handlers themselves |
 | `mcp/wpcli.rs` | The four paths that run Frama-C as a command line rather than through the socket, because WP settings are process state |
@@ -83,7 +83,7 @@ hands back subtly wrong C is the failure mode with the highest cost.
 
 Verdict and completeness are separate axes. `check` reports `verdict: "proved"` only when `incomplete[]` is empty, so a step that did not run cannot read as a clean result; the CLI's `--require-complete` turns any `incomplete[]` entry into a non-zero exit.
 
-Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt`, whose `schema` names the format and carries no version, and whose field shape a reader can recompute to tell whether two receipts are the same format, holding the source hash, AST digest, environment, effective EVA and WP configurations, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. The EVA half is read back off the Frama-C process rather than taken from the request, because EVA's settings outlive one call: a profile that leaves a parameter unset issues no setter, so an earlier call's value is still in force. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
+Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt`, whose `schema` names the format and carries no version, and whose field shape a reader can recompute to tell whether two receipts are the same format, holding the source hash, AST digest, the preprocessor and target settings the sources were loaded under, environment, effective EVA and WP configurations, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. The load settings are recorded separately from the AST digest because they distinguish configuration changes that select identical code, which a digest over the parsed program cannot. The EVA half is read back off the Frama-C process rather than taken from the request, because EVA's settings outlive one call: a profile that leaves a parameter unset issues no setter, so an earlier call's value is still in force. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
 
 ## Design Decisions
 

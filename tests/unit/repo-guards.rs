@@ -530,6 +530,59 @@ fn no_function_in_src_nests_control_flow_past_three() {
     );
 }
 
+/// No macro in src aborts the process.
+///
+/// This server holds a Frama-C child, a socket, and a session's conclusions; a
+/// panic takes all three down and answers the caller with a closed pipe rather
+/// than an error they can act on. Every failure here already has a channel,
+/// McpError upstream and FramaCError downstream, so reaching for a panicking
+/// macro is a decision rather than an accident, and the decision is no.
+///
+/// Zero rather than a ceiling, deliberately. A ceiling is a measurement, and a
+/// guard carrying one is a number the next person edits to get their build
+/// green. Zero is a policy, so there is nothing to bump: a new panic has to
+/// argue with this comment.
+///
+/// unwrap and expect are not counted here. They panic too, and the eight in
+/// src today are all either a literal regex behind a OnceLock or a stated
+/// invariant, which is a judgement per site rather than a number, so it stays
+/// a review question. Line comments are skipped; a macro named inside a block
+/// comment or a string literal would be counted, and src contains no instance
+/// of either.
+#[test]
+fn no_macro_in_src_aborts_the_process() {
+    const FORBIDDEN: &[&str] = &["panic!", "todo!", "unimplemented!", "unreachable!"];
+
+    let mut files = Vec::new();
+    source_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        "rs",
+        &mut files,
+    );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for macro_name in FORBIDDEN {
+                if line.contains(macro_name) {
+                    offenders.push(format!("{}:{} {macro_name}", path.display(), number + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these abort the process instead of answering the caller: {offenders:?}"
+    );
+}
+
 /// Whether a line's first token opens a control-flow block.
 ///
 /// The leading brace of "} else if" and "} while" is skipped, so a chained
@@ -2020,7 +2073,16 @@ fn tool_router_matches_the_documented_surface() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
     let documented = documented_tools(&readme);
-    assert_eq!(documented.len(), 14, "parsed {documented:?}");
+
+    // Against the router rather than a literal. The set comparison below is the
+    // real check; this one catches a README parse that silently matched
+    // nothing, and it should not itself be a number to bump.
+
+    assert_eq!(
+        documented.len(),
+        FramaCMcpServer::tool_router().list_all().len(),
+        "parsed {documented:?}"
+    );
 
     let registered = FramaCMcpServer::tool_router()
         .list_all()

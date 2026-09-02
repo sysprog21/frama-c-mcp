@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
+use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
 
@@ -839,6 +840,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
         let mut receipt = proof_receipt_body(ProofReceiptBody {
             tool: "check",
             source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+            project_load: json!({}),
             ast_digest: json!("ast"),
             ast_digest_unavailable_reason: json!(null),
             contracts: json!({}),
@@ -868,9 +870,10 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
 
     // A key at either governed level moves the id, with no edit anywhere else.
     // The historical bumps were exactly this shape: v3 added subject.contracts,
-    // v4 added subject.ast_digest, v5 added top-level eva. Recomputed, not read
-    // back: the stamped field records the shape at build time, and the question
-    // here is what a differently shaped body hashes to.
+    // v4 added subject.ast_digest, v5 added top-level eva, v6 added
+    // project_load. Recomputed, not read back: the stamped field records the
+    // shape at build time, and the question here is what a differently shaped
+    // body hashes to.
     let with_new_top_level = body(Some(("__shape_probe__", json!({}))));
     assert_ne!(schema_of(&with_new_top_level), receipt_shape());
 
@@ -889,6 +892,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
     let a = proof_receipt_body(ProofReceiptBody {
         tool: "check",
         source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+        project_load: json!({}),
         ast_digest: json!("ast"),
         ast_digest_unavailable_reason: json!(null),
         contracts: json!({}),
@@ -927,7 +931,7 @@ fn the_receipt_format_id_follows_the_body_rather_than_a_hand_written_version() {
     // When the receipt's field set changes on purpose, update this and say why
     // in the commit.
     assert_eq!(
-        shape, "c96baff31d2f",
+        shape, "8a53d6577dfd",
         "the receipt's field set moved; stored conclusions will stop loading"
     );
 }
@@ -938,6 +942,7 @@ fn an_absent_eva_config_says_which_absence_it_is() {
         proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool: "check",
             source_files: vec![json!({"path": "a.c", "sha256": "h"})],
+            project_load: json!({}),
             ast_digest: json!("ast"),
             ast_digest_unavailable_reason: json!(null),
             contracts: json!({}),
@@ -988,6 +993,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let first = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1001,6 +1007,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let second = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1016,6 +1023,7 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let changed = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        project_load: json!({}),
         ast_digest: json!("ast0"),
         ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
@@ -1979,6 +1987,7 @@ fn ast_digest_separates_runs_that_goal_counts_cannot() {
         proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool: "run_wp",
             source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+            project_load: json!({}),
             ast_digest: digest.clone(),
             ast_digest_unavailable_reason: if digest.is_null() {
                 json!("no_client")
@@ -2104,4 +2113,122 @@ fn timed_out_non_rte_goal_keeps_the_generic_advice() {
         .unwrap();
     assert!(fix.contains("retry_unproved"));
     assert!(!fix.contains("rte_obligations"));
+}
+
+/// A comma-separated prover argument names several provers, not one.
+///
+/// FRAMAC_PROVERS is comma-split and so is Frama-C's own -wp-prover, so that
+/// spelling is what a caller reaches for. Wrapping it whole in a one-element
+/// list made "alt-ergo,z3" a single prover name, which matches no identifier
+/// the server offers, so apply_prover_selection refused the run outright. That
+/// is how a profile declaring two provers could not be mirrored at all.
+#[test]
+fn a_comma_separated_prover_argument_names_each_of_them() {
+    let params = RunWpParams {
+        prover: Some("alt-ergo,z3".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&params, None).unwrap(),
+        Some(vec!["alt-ergo".to_string(), "z3".to_string()])
+    );
+
+    // Spacing is the caller's, not a second syntax.
+    let spaced = RunWpParams {
+        prover: Some(" alt-ergo , z3 ".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&spaced, None).unwrap(),
+        Some(vec!["alt-ergo".to_string(), "z3".to_string()])
+    );
+
+    // One name still means one prover, and the singular argument still does not
+    // select the isolated per-prover path.
+    let single = RunWpParams {
+        prover: Some("z3".to_string()),
+        ..RunWpParams::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&single, None).unwrap(),
+        Some(vec!["z3".to_string()])
+    );
+}
+
+/// The comparison a profile makes before it will call a run its evidence.
+///
+/// Extracted from apply_verify_profile, which needs a live server.
+#[test]
+fn a_profile_matches_its_main_target_exactly() {
+    let declared = vec!["elf_phdr_fetch".to_string(), "hex_nibble".to_string()];
+
+    // Unqualified, in a different order: the same target.
+    assert!(profile_covers_exactly(
+        &["hex_nibble".to_string(), "elf_phdr_fetch".to_string()],
+        &declared
+    ));
+
+    // A subset is not the target, which is the whole point of the check.
+    assert!(!profile_covers_exactly(
+        &["hex_nibble".to_string()],
+        &declared
+    ));
+
+    // Nor is a superset, or a different function entirely.
+    assert!(!profile_covers_exactly(
+        &[
+            "elf_phdr_fetch".to_string(),
+            "hex_nibble".to_string(),
+            "elf_segment_extent".to_string()
+        ],
+        &declared
+    ));
+}
+
+#[test]
+fn a_database_backed_load_is_not_a_profile_match() {
+    // A compilation database supplies per-file flags this server never sees, so
+    // nothing the profile declares can describe the load. Accepting it would
+    // label a run as a target's evidence while the flags it ran under came from
+    // somewhere the profile does not reach.
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        ..Default::default()
+    };
+    let with_database = ProjectLoadOptions {
+        compilation_database: Some("build/compile_commands.json".into()),
+        ..Default::default()
+    };
+    assert!(!profile_matches_loaded_project(
+        &profile,
+        &["src/target.c".to_string()],
+        &with_database
+    ));
+    assert!(profile_matches_loaded_project(
+        &profile,
+        &["src/target.c".to_string()],
+        &ProjectLoadOptions::default()
+    ));
+}
+
+#[test]
+fn a_profile_only_labels_its_loaded_project() {
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        include_paths: vec!["include".into()],
+        defines: vec!["TARGET=1".into()],
+        force_includes: vec!["target.h".into()],
+        machdep: Some("x86_64".into()),
+        ..Default::default()
+    };
+    let options = ProjectLoadOptions {
+        include_paths: vec!["include".into()],
+        defines: vec!["TARGET=1".into()],
+        force_includes: vec!["target.h".into()],
+        machdep: Some("x86_64".into()),
+        ..Default::default()
+    };
+    assert!(profile_matches_loaded_project(&profile, &["src/target.c".into()], &options));
+    assert!(!profile_matches_loaded_project(&profile, &["src/other.c".into()], &options));
+    assert!(!profile_matches_loaded_project(&profile, &["src/target.c".into()], &ProjectLoadOptions::default()));
 }

@@ -35,6 +35,7 @@ pub fn fixture_receipt(
     proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "check",
         source_files: vec![serde_json::json!({"path": format!("{label}.c"), "sha256": "h"})],
+        project_load: serde_json::json!({}),
         ast_digest: serde_json::json!("ast"),
         ast_digest_unavailable_reason: serde_json::json!(null),
         contracts: serde_json::json!({}),

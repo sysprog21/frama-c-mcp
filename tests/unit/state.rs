@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use frama_c_mcp::state::*;
+use frama_c_mcp::mcp::server::conclusions::profile_evidence_error;
+use serde_json::json;
 use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
 
 #[test]
@@ -556,6 +558,8 @@ fn round_trip_reachable_conclusion_fields() {
         notes: Some("ok".into()),
         callees: Some(vec!["g".into(), "h".into()]),
         proof_receipt: Some(proof_receipt("env-a")),
+        verify_profile: None,
+        reproduce: None,
     }).unwrap();
 
     let stored = state.get_conclusion("F").expect("conclusion stored").clone();
@@ -1332,4 +1336,178 @@ fn the_stale_marker_map_iterates_in_marker_order() {
     state.set_stale_markers(markers);
     assert!(state.stale_marker("#p007").is_some(), "lookup still works");
     assert!(state.stale_marker("#p099").is_none());
+}
+
+#[test]
+fn a_profile_map_is_read_as_the_build_system_emitted_it() {
+    let profiles = parse_verification_profiles(&json!({
+        "elf": {
+            "sources": ["src/core/elf.c"],
+            "functions": ["elf_phdr_fetch", "hex_nibble"],
+            "model": "caveat",
+            "machdep": "gcc_x86_64",
+            "include_paths": ["frama-c-stubs"],
+            "force_includes": ["prelude.h"],
+            "provers": ["alt-ergo", "z3"],
+            "timeout_seconds": 30,
+            "reproduce": "make verify-elf"
+        }
+    }))
+    .expect("valid profiles");
+    let elf = &profiles["elf"];
+    assert_eq!(elf.model.as_deref(), Some("caveat"));
+    assert_eq!(elf.provers, vec!["alt-ergo", "z3"]);
+    assert_eq!(elf.timeout_seconds, Some(30));
+    assert_eq!(elf.reproduce.as_deref(), Some("make verify-elf"));
+}
+
+#[test]
+fn a_misspelled_profile_key_is_refused_rather_than_ignored() {
+    // The failure this whole thing exists to prevent is a run under the wrong
+    // model passing as evidence. "models" quietly meaning no model declared is
+    // that same failure with an extra step, so it has to be an error.
+    let err = parse_verification_profiles(&json!({
+        "elf": {"functions": ["f"], "models": "caveat"}
+    }))
+    .expect_err("unknown key");
+    assert!(err.contains("elf"), "{err}");
+    assert!(err.contains("models"), "{err}");
+}
+
+#[test]
+fn a_profile_matching_nothing_is_refused() {
+    // Registering a name that can never be matched to a function or a source
+    // puts something in the registry that silently never applies.
+    let err = parse_verification_profiles(&json!({"elf": {"model": "caveat"}}))
+        .expect_err("nothing to match");
+    assert!(err.contains("neither functions nor sources"), "{err}");
+}
+
+#[test]
+fn profiles_must_be_a_named_map() {
+    assert!(parse_verification_profiles(&json!([])).is_err());
+    assert!(parse_verification_profiles(&json!({})).is_err());
+}
+
+#[test]
+fn a_blank_entry_is_refused_at_registration() {
+    // A non-empty list of empty strings passes "names something" and matches
+    // nothing, so it would sit in the registry looking usable all session.
+    let err = parse_verification_profiles(&json!({
+        "elf": {"functions": ["elf_phdr_fetch", "  "], "model": "caveat"}
+    }))
+    .expect_err("blank function name");
+    assert!(err.contains("blank entry in functions"), "{err}");
+
+    let err = parse_verification_profiles(&json!({
+        "elf": {"functions": ["f"], "provers": ["alt-ergo", ""]}
+    }))
+    .expect_err("blank prover");
+    assert!(err.contains("blank entry in provers"), "{err}");
+}
+
+#[test]
+fn a_padded_entry_is_trimmed_rather_than_left_to_never_match() {
+    // Padding is not a name. Left alone, " elf_phdr_fetch " registers, matches
+    // nothing all session, and then prints a refusal against a name it differs
+    // from by two spaces.
+    let profiles = parse_verification_profiles(&json!({
+        "elf": {"functions": [" elf_phdr_fetch ", "hex_nibble"], "provers": [" z3 "]}
+    }))
+    .expect("padded entries are trimmed");
+    assert_eq!(profiles["elf"].functions, vec!["elf_phdr_fetch", "hex_nibble"]);
+    assert_eq!(profiles["elf"].provers, vec!["z3"]);
+}
+
+#[test]
+fn profile_paths_are_not_normalized() {
+    let profiles = parse_verification_profiles(&json!({
+        "elf": {
+            "sources": ["src/elf.c "],
+            "include_paths": ["include "],
+            "force_includes": ["prelude.h "],
+        }
+    }))
+    .expect("paths are preserved for later validation");
+    let elf = &profiles["elf"];
+    assert_eq!(elf.sources, vec!["src/elf.c "]);
+    assert_eq!(elf.include_paths, vec!["include "]);
+    assert_eq!(elf.force_includes, vec!["prelude.h "]);
+}
+
+// Moved out of src/mcp/conclusions.rs: this tree keeps every test under tests/,
+// and src carries no cfg(test) at all.
+    #[test]
+    fn profile_evidence_requires_the_receipt_function_and_source_paths() {
+        let profile: crate::state::VerificationProfile = serde_json::from_value(json!({
+            "functions": ["swap", "order_3"],
+            "sources": ["swap-frame.c", "support.c"],
+            "model": "Typed+cast",
+            "include_paths": ["include"],
+            "defines": ["TARGET=1"],
+            "force_includes": ["target.h"],
+            "machdep": "gcc_x86_64",
+            "provers": ["alt-ergo"],
+            "timeout_seconds": 10
+        }))
+        .unwrap();
+
+        let wrong_function = json!({
+            "wp": {"functions": ["order_3"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "swap-frame.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert!(
+            profile_evidence_error("target", &profile, "swap", Some(&wrong_function))
+                .unwrap()
+                .contains("does not prove swap")
+        );
+
+        let wrong_source = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "other.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert!(
+            profile_evidence_error("target", &profile, "swap", Some(&wrong_source))
+                .unwrap()
+                .contains("declares sources")
+        );
+
+        let matching_sources = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+        });
+        assert_eq!(
+            profile_evidence_error("target", &profile, "swap", Some(&matching_sources)),
+            None
+        );
+
+        let wrong_load = json!({
+            "wp": {"functions": ["swap"], "model": "Typed+cast"},
+            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": {"include_paths": [], "defines": [], "force_includes": [], "machdep": null, "compilation_database": null}}
+        });
+        assert!(profile_evidence_error("target", &profile, "swap", Some(&wrong_load))
+            .unwrap()
+            .contains("project load settings"));
+    }
+
+#[test]
+fn a_conclusion_written_before_profiles_still_loads() {
+    // The two fields were added to a struct that is persisted, so a session
+    // upgrading mid-project must not lose the conclusions already on disk.
+    // serde defaults a missing Option to None, and this pins that rather than
+    // trusting it: the failure mode is silent, and it costs a user their
+    // recorded verdicts.
+    let old = serde_json::json!({
+        "function": "swap",
+        "status": "verified",
+        "specs": [],
+        "wp_summary": null,
+        "notes": "",
+        "callees": []
+    });
+    let loaded: FunctionVerificationState =
+        serde_json::from_value(old).expect("a pre-profile conclusion still deserializes");
+    assert_eq!(loaded.function, "swap");
+    assert_eq!(loaded.verify_profile, None);
+    assert_eq!(loaded.reproduce, None);
 }

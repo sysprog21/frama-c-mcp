@@ -1164,8 +1164,6 @@ pub fn sandbox_not_found_err(experiment_id: &str, existing: &[String]) -> McpErr
     sandbox_not_found_error(experiment_id, existing)
 }
 
-pub const MCP_TOOL_COUNT: usize = 14;
-
 /// The revision a client gets when it asks for one rmcp does not recognize.
 ///
 /// Named once and read by both get_info and self_check. It was spelled at both
@@ -1278,16 +1276,14 @@ pub fn wp_run_response(
     proofread_report: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let model = params.model.as_deref().unwrap_or(default_wp_model());
-    let requested_provers = params
-        .provers
-        .as_ref()
-        .map(|provers| json!(provers))
-        .or_else(|| params.prover.as_deref().map(|prover| json!(prover)));
+
+    // Reported as the list it names, in either spelling. Echoing the singular
+    // argument verbatim would print "alt-ergo,z3" beside an effective list of
+    // two, and every sibling block here pairs requested with effective in one
+    // type, which is what a reader diffing two runs' configs relies on.
+    let requested_provers = requested_wp_provers(params).ok().flatten();
     let env_provers = env_wp_provers().ok().flatten();
-    let provers = requested_wp_provers(params)
-        .ok()
-        .flatten()
-        .or_else(|| env_provers.clone());
+    let provers = requested_provers.clone().or_else(|| env_provers.clone());
     let timeout = params.timeout.or_else(|| env_wp_u32("FRAMAC_TIMEOUT").ok().flatten());
     let par = params.par.or_else(|| env_wp_u32("FRAMAC_PAR").ok().flatten());
     let provers_known = provers.is_some();
@@ -1399,10 +1395,23 @@ fn requested_wp_provers(params: &RunWpParams) -> Result<Option<Vec<String>>, Mcp
             None,
         ));
     }
-    let provers = params
-        .provers
-        .clone()
-        .or_else(|| params.prover.as_ref().map(|prover| vec![prover.clone()]));
+
+    // The singular argument is comma-separated, which is what -wp-prover and
+    // FRAMAC_PROVERS both accept and what parse_wp_provers already does with
+    // the environment. Wrapping it whole in a one-element list made
+    // "alt-ergo,z3" a single prover name, which matches no identifier the
+    // server offers, so apply_prover_selection refused the run outright on a
+    // spelling this tree accepts everywhere else.
+    let provers = params.provers.clone().or_else(|| {
+        params.prover.as_ref().map(|prover| {
+            prover
+                .split(',')
+                .map(str::trim)
+                .filter(|prover| !prover.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    });
     match provers {
         Some(provers) => {
             let provers = provers
@@ -1552,6 +1561,49 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         return None;
     }
     Some(flags.join(" "))
+}
+
+/// The refusal for a name nobody registered, with what is registered beside it.
+///
+/// Taken out of the lookup so a caller already holding the state guard can
+/// build the same message without dropping it, which is what the registration
+/// path has to do to stay atomic.
+pub fn unknown_verify_profile(
+    name: &str,
+    registered: &std::collections::BTreeMap<String, crate::state::VerificationProfile>,
+) -> McpError {
+    let known: Vec<&str> = registered.keys().map(String::as_str).collect();
+    McpError::invalid_params(
+        format!(
+            "no verify_profile named \"{name}\". Registered: {}. Register them through \
+             reload_project, emitted by the build system that defines the targets, so they \
+             cannot drift from the command that decides.",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ),
+        None,
+    )
+}
+
+impl FramaCMcpServer {
+    /// A registered profile by name, or a refusal that says what is registered.
+    ///
+    /// Both tools that take a verify_profile resolve it through here. They had
+    /// a copy each, identical but for the closing sentence, which is how two
+    /// messages about one thing start disagreeing about it.
+    pub async fn verify_profile_named(
+        &self,
+        name: &str,
+    ) -> Result<crate::state::VerificationProfile, McpError> {
+        let state = self.state.read().await;
+        if let Some(profile) = state.verification_profiles.get(name) {
+            return Ok(profile.clone());
+        }
+        Err(unknown_verify_profile(name, &state.verification_profiles))
+    }
 }
 
 pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
@@ -2212,6 +2264,15 @@ pub struct FramaCMcpServer {
     sandboxes: Arc<RwLock<SandboxRegistry>>,
     /// Maximum concurrent sandboxes
     max_sandboxes: usize,
+    /// How many parse probes may run at once, for the whole server rather than
+    /// for one call.
+    ///
+    /// A per-call pool composes with nothing: two concurrent parse_surface
+    /// calls double it, and a session already holding max_sandboxes Frama-C
+    /// children pays for both. Each front end is a few hundred megabytes, so
+    /// the number that matters is how many exist, not how many one request
+    /// asked for.
+    parse_probe_slots: Arc<tokio::sync::Semaphore>,
     /// Path to frama-c binary (for spawning sandbox instances + main)
     frama_c_path: String,
     /// The directory holding the AST printed for the most recent run_e_acsl
@@ -2885,6 +2946,11 @@ impl FramaCMcpServer {
             state,
             sandboxes: Arc::new(RwLock::new(SandboxRegistry::default())),
             max_sandboxes,
+            parse_probe_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism()
+                    .map(|cores| cores.get().min(project::PARSE_PROBE_MAX_PARALLEL))
+                    .unwrap_or(2),
+            )),
             frama_c_path,
             current_ast_dir: Arc::new(AsyncMutex::new(None)),
             current_check_source_dir: Arc::new(AsyncMutex::new(None)),
@@ -3962,7 +4028,13 @@ impl FramaCMcpServer {
         json!({
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
-                "tool_count": MCP_TOOL_COUNT,
+
+                // Counted off the router rather than written down. A number in
+                // a constant is one a person edits to make a build green, which
+                // reads as a check and is not one; this cannot disagree with
+                // the surface it describes.
+                "tool_count": self.tool_router.list_all().len(),
+
 
                 // The fallback, not the negotiated version of any one session:
                 // this payload is built without a peer, and a client that asked

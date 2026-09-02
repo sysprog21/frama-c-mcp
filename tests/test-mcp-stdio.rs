@@ -51,8 +51,7 @@ use tokio::process::Command;
 
 /// Workspace-relative path resolver.
 fn workspace_path(rel: &str) -> PathBuf {
-    let crate_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set");
+    let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     PathBuf::from(crate_dir).join(rel)
 }
 
@@ -137,12 +136,8 @@ async fn spawn_mcp_client_inner(
         }
     }
 
-    let transport = TokioChildProcess::new(cmd)
-        .expect("failed to spawn MCP server child process");
-    let client = ()
-        .serve(transport)
-        .await
-        .expect("failed to initialize MCP client handshake");
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn MCP server child process");
+    let client = ().serve(transport).await.expect("failed to initialize MCP client handshake");
 
     // Lazy mode: caller expects c_file to be loaded, so reload_project is
     // called here. Empty c_file lets tests exercise tools that perform their
@@ -170,10 +165,7 @@ async fn raw_call(
         _ => return Err(format!("tool args must be JSON object, got {:?}", args)),
     };
     client
-        .call_tool(
-            CallToolRequestParams::new(name.to_string())
-                .with_arguments(args_obj),
-        )
+        .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args_obj))
         .await
         .map_err(|e| format!("tool call '{}' failed: {}", name, e))
 }
@@ -245,7 +237,12 @@ async fn context_json(
     function: &str,
     want: &str,
 ) -> Result<Value, String> {
-    call_tool_json(client, "context", json!({"function": function, "want": [want]})).await
+    call_tool_json(
+        client,
+        "context",
+        json!({"function": function, "want": [want]}),
+    )
+    .await
 }
 
 /// Call a tool returning plain text (e.g. `context {want: ["source"]}`).
@@ -433,8 +430,17 @@ fn ready_names(value: &Value) -> Vec<String> {
 }
 
 fn assert_verify_program_step_bounded(value: &Value) {
-    for field in ["order", "verification_order", "scc_groups", "conclusions", "project_state"] {
-        assert!(value.get(field).is_none(), "{field} should be omitted: {value:?}");
+    for field in [
+        "order",
+        "verification_order",
+        "scc_groups",
+        "conclusions",
+        "project_state",
+    ] {
+        assert!(
+            value.get(field).is_none(),
+            "{field} should be omitted: {value:?}"
+        );
     }
     let budget = &value["payload_budget"];
     assert_eq!(budget["cap_bytes"], 16 * 1024);
@@ -498,10 +504,22 @@ async fn read_only_list_tools_return_stable_shapes() {
         .as_array()
         .and_then(|items| items.first())
         .unwrap_or_else(|| panic!("annotations missing: {:?}", annotations));
-    assert!(annotation["property_marker"].as_str().is_some(), "{:?}", annotation);
-    assert!(annotation["function_marker"].as_str().is_some(), "{:?}", annotation);
+    assert!(
+        annotation["property_marker"].as_str().is_some(),
+        "{:?}",
+        annotation
+    );
+    assert!(
+        annotation["function_marker"].as_str().is_some(),
+        "{:?}",
+        annotation
+    );
     assert!(annotation["kind"].as_str().is_some(), "{:?}", annotation);
-    assert!(annotation["raw_status"].as_str().is_some(), "{:?}", annotation);
+    assert!(
+        annotation["raw_status"].as_str().is_some(),
+        "{:?}",
+        annotation
+    );
     assert!(
         annotation["normalized_status"].as_str().is_some(),
         "{:?}",
@@ -800,9 +818,8 @@ async fn check_reports_an_assumption_under_the_shared_goal_identity() {
     let items = result["incomplete"]
         .as_array()
         .expect("incomplete is an array");
-    let by_code = |code: &str| -> Vec<&Value> {
-        items.iter().filter(|item| item["code"] == code).collect()
-    };
+    let by_code =
+        |code: &str| -> Vec<&Value> { items.iter().filter(|item| item["code"] == code).collect() };
 
     let assumed = by_code("UNPROVED_ASSUMPTION");
     assert_eq!(
@@ -1004,7 +1021,9 @@ async fn check_reports_an_axiom_as_an_assumption() {
         .unwrap_or_default();
     assert!(!goals.is_empty(), "WP emitted no goal at all: {result:?}");
     assert!(
-        goals.iter().all(|goal| goal["normalized_status"] == "valid"),
+        goals
+            .iter()
+            .all(|goal| goal["normalized_status"] == "valid"),
         "a non-valid goal would carry this file on its own: {result:?}"
     );
 
@@ -1071,7 +1090,9 @@ async fn e_acsl_catches_a_runtime_violation() {
     let fixture = workspace_path("tests/fixtures/e-acsl-violation.c");
     let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
 
-    let self_check = call_tool_json(&client, "self_check", json!({})).await.unwrap();
+    let self_check = call_tool_json(&client, "self_check", json!({}))
+        .await
+        .unwrap();
     let e_acsl = &self_check["capabilities"]["e_acsl"];
     if e_acsl["available"] != true {
         // Skipping is for a developer box without the tool. In CI it would turn
@@ -1388,7 +1409,10 @@ async fn a_replayed_wp_verdict_is_reported_as_one() {
     let echoed = call_tool_json(&client, "run_wp", json!({"timeout": 5}))
         .await
         .unwrap();
-    assert_eq!(echoed["effective_wp_config"]["cache"]["effective"], "Update");
+    assert_eq!(
+        echoed["effective_wp_config"]["cache"]["effective"],
+        "Update"
+    );
     assert_eq!(
         echoed["effective_wp_config"]["cache"]["requested"],
         json!(null)
@@ -1677,11 +1701,7 @@ async fn context_symbol_and_callgraph_wants_return_stable_shapes() {
         assert!(edge["to_marker"].as_str().is_some(), "{:?}", edge);
         assert!(edge["depth"].as_u64().is_some(), "{:?}", edge);
     }
-    for (from, to) in [
-        ("main", "run"),
-        ("run", "buf_sum"),
-        ("buf_sum", "buf_get"),
-    ] {
+    for (from, to) in [("main", "run"), ("run", "buf_sum"), ("buf_sum", "buf_get")] {
         assert!(
             chain
                 .iter()
@@ -1753,31 +1773,72 @@ fn assert_triage_matches_goals(payload: &Value) {
                 .iter()
                 .any(|f| f.get("category").and_then(|c| c.as_str()) == Some("timeout"))
         });
-    let kind = payload["wp_timeout_triage"]["kind"].as_str().unwrap_or_default();
+    let kind = payload["wp_timeout_triage"]["kind"]
+        .as_str()
+        .unwrap_or_default();
     if timed_out {
         assert_ne!(
             kind, "none",
             "a goal reached the prover budget, so triage must not report no timeout evidence: {payload:?}"
         );
     } else {
-        assert_eq!(kind, "none", "nothing timed out, so triage must be clean: {payload:?}");
+        assert_eq!(
+            kind, "none",
+            "nothing timed out, so triage must be clean: {payload:?}"
+        );
     }
 }
 
 fn assert_wp_run_shape(payload: &Value, scope: &str) {
-    assert_eq!(payload["effective_wp_config"]["scope"], scope, "{:?}", payload);
-    assert!(payload["effective_wp_config"]["functions"].as_array().is_some(), "{:?}", payload);
-    assert!(payload["effective_wp_config"]["model"].as_str().is_some(), "{:?}", payload);
-    assert!(payload["effective_wp_config"]["rte"].as_bool().is_some(), "{:?}", payload);
+    assert_eq!(
+        payload["effective_wp_config"]["scope"], scope,
+        "{:?}",
+        payload
+    );
+    assert!(
+        payload["effective_wp_config"]["functions"]
+            .as_array()
+            .is_some(),
+        "{:?}",
+        payload
+    );
+    assert!(
+        payload["effective_wp_config"]["model"].as_str().is_some(),
+        "{:?}",
+        payload
+    );
+    assert!(
+        payload["effective_wp_config"]["rte"].as_bool().is_some(),
+        "{:?}",
+        payload
+    );
     for section in ["provers", "timeout_seconds", "parallel", "prop"] {
-        assert!(payload["effective_wp_config"][section]["effective_known"].as_bool().is_some(),
-            "{section} effective_known missing: {:?}", payload);
+        assert!(
+            payload["effective_wp_config"][section]["effective_known"]
+                .as_bool()
+                .is_some(),
+            "{section} effective_known missing: {:?}",
+            payload
+        );
     }
-    assert!(payload["effective_wp_config"]["raw_task_ids"].is_null()
-        || payload["effective_wp_config"]["raw_task_ids"].as_array().is_some(), "{:?}", payload);
-    assert!(payload["wp_timeout_triage"]["kind"].as_str().is_some(), "{:?}", payload);
-    assert!(payload["frama_c_options"].is_array() || payload["frama_c_options"].is_object(),
-        "{:?}", payload);
+    assert!(
+        payload["effective_wp_config"]["raw_task_ids"].is_null()
+            || payload["effective_wp_config"]["raw_task_ids"]
+                .as_array()
+                .is_some(),
+        "{:?}",
+        payload
+    );
+    assert!(
+        payload["wp_timeout_triage"]["kind"].as_str().is_some(),
+        "{:?}",
+        payload
+    );
+    assert!(
+        payload["frama_c_options"].is_array() || payload["frama_c_options"].is_object(),
+        "{:?}",
+        payload
+    );
     if let Some(protocol) = payload["frama_c_protocol"].as_array() {
         let first = protocol.first().expect("WP protocol should not be empty");
         assert_eq!(first["request"], "plugins.wp.startProofs", "{:?}", payload);
@@ -1789,7 +1850,11 @@ fn assert_wp_run_shape(payload: &Value, scope: &str) {
 }
 
 fn assert_wp_goal_shape(goal: &Value) {
-    assert!(goal["wpo"].as_str().is_some() || goal["wpo_id"].as_str().is_some(), "{:?}", goal);
+    assert!(
+        goal["wpo"].as_str().is_some() || goal["wpo_id"].as_str().is_some(),
+        "{:?}",
+        goal
+    );
     for key in [
         "stable_goal_id",
         "frama_c_goal_name",
@@ -1801,21 +1866,49 @@ fn assert_wp_goal_shape(goal: &Value) {
     ] {
         assert!(goal[key].as_str().is_some(), "{key} missing: {:?}", goal);
     }
-    assert!(goal["source_location"]["line"].as_i64().is_some(), "{:?}", goal);
+    assert!(
+        goal["source_location"]["line"].as_i64().is_some(),
+        "{:?}",
+        goal
+    );
     assert!(goal["counts_as_progress"].as_bool().is_some(), "{:?}", goal);
     assert!(goal["vacuous"].as_bool().is_some(), "{:?}", goal);
     if goal["failure_classification"].is_object() {
-        assert!(goal["failure_classification"]["category"].as_str().is_some(), "{:?}", goal);
-        assert!(goal["failure_classification"]["next_action"]["tool"].as_str().is_some(),
-            "{:?}", goal);
-        assert!(goal["failure_classification"]["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
-            .as_bool().is_some(), "{:?}", goal);
+        assert!(
+            goal["failure_classification"]["category"]
+                .as_str()
+                .is_some(),
+            "{:?}",
+            goal
+        );
+        assert!(
+            goal["failure_classification"]["next_action"]["tool"]
+                .as_str()
+                .is_some(),
+            "{:?}",
+            goal
+        );
+        assert!(
+            goal["failure_classification"]["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
+                .as_bool()
+                .is_some(),
+            "{:?}",
+            goal
+        );
     }
 }
 
 fn assert_vc_details_shape(details: &Value) {
-    assert!(details["current_assigns"].as_array().is_some(), "{:?}", details);
-    assert!(details["conclusion"].is_null() || details["conclusion"].is_object(), "{:?}", details);
+    assert!(
+        details["current_assigns"].as_array().is_some(),
+        "{:?}",
+        details
+    );
+    assert!(
+        details["conclusion"].is_null() || details["conclusion"].is_object(),
+        "{:?}",
+        details
+    );
     let vc = details["vcs"]
         .as_array()
         .and_then(|items| items.iter().find(|vc| vc["wpo_id"].as_str().is_some()))
@@ -1838,7 +1931,9 @@ fn assert_vc_details_shape(details: &Value) {
     // The reason to ask for detail at all: the obligation rendered as a
     // sequent, hypotheses over the line and the goal under it, rather than the
     // two arrays a reader has to reassemble by hand.
-    let sequent = vc["sequent"].as_str().unwrap_or_else(|| panic!("sequent missing: {vc:?}"));
+    let sequent = vc["sequent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("sequent missing: {vc:?}"));
     let (above, below) = sequent
         .split_once("\n---")
         .unwrap_or_else(|| panic!("sequent has no separator: {sequent}"));
@@ -1851,24 +1946,46 @@ fn assert_vc_details_shape(details: &Value) {
     // puts a formula carrying a newline on one line.
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let goal = one_line(vc["goal"].as_str().unwrap_or_default());
-    assert!(below.contains(&goal), "goal missing below the line: {sequent}");
+    assert!(
+        below.contains(&goal),
+        "goal missing below the line: {sequent}"
+    );
     for hypothesis in vc["hypotheses"].as_array().into_iter().flatten() {
         if let Some(formula) = hypothesis["formula"].as_str() {
             let formula = one_line(formula);
-            assert!(above.contains(&formula), "hypothesis {formula} missing: {sequent}");
+            assert!(
+                above.contains(&formula),
+                "hypothesis {formula} missing: {sequent}"
+            );
         }
     }
     assert!(vc["clause"]["kind"].as_str().is_some(), "{:?}", vc);
-    assert!(vc["related_acsl_clause"]["kind"].as_str().is_some(), "{:?}", vc);
-    assert!(vc["prover_result"]["normalized_status"].as_str().is_some(), "{:?}", vc);
+    assert!(
+        vc["related_acsl_clause"]["kind"].as_str().is_some(),
+        "{:?}",
+        vc
+    );
+    assert!(
+        vc["prover_result"]["normalized_status"].as_str().is_some(),
+        "{:?}",
+        vc
+    );
 }
 
 fn assert_verification_status_shape(status: &Value) {
-    assert!(status["total_properties"].as_u64().is_some(), "{:?}", status);
+    assert!(
+        status["total_properties"].as_u64().is_some(),
+        "{:?}",
+        status
+    );
     assert!(status["by_status"].is_object(), "{:?}", status);
     assert!(status["by_normalized_status"].is_object(), "{:?}", status);
     assert!(status["by_kind"].is_object(), "{:?}", status);
-    assert!(status["non_progress_count"].as_u64().is_some(), "{:?}", status);
+    assert!(
+        status["non_progress_count"].as_u64().is_some(),
+        "{:?}",
+        status
+    );
     assert!(status["vacuous_count"].as_u64().is_some(), "{:?}", status);
     assert_eq!(status["session"]["project_loaded"], Value::Bool(true));
     assert_eq!(status["session"]["wp_completed"], Value::Bool(true));
@@ -1882,7 +1999,9 @@ fn assert_verification_status_shape(status: &Value) {
     let valid_by_status = status["by_status"]["valid"].as_u64().unwrap_or(0);
     if valid_by_status > 0 {
         assert_eq!(
-            status["by_normalized_status"]["valid"].as_u64().unwrap_or(0),
+            status["by_normalized_status"]["valid"]
+                .as_u64()
+                .unwrap_or(0),
             valid_by_status,
             "by_normalized_status must agree with by_status on valid: {status:?}"
         );
@@ -2613,9 +2732,21 @@ void ghost_loop(unsigned n)
     assert!(src.contains("ghost"), "ghost block missing: {}", src);
     assert!(src.contains("unsigned int i"), "counter missing: {}", src);
     assert!(src.contains("i < n"), "loop guard missing: {}", src);
-    assert!(src.contains("loop invariant"), "loop invariant missing: {}", src);
-    assert!(src.contains("loop assigns i"), "loop assigns missing: {}", src);
-    assert!(src.contains("loop variant"), "loop variant missing: {}", src);
+    assert!(
+        src.contains("loop invariant"),
+        "loop invariant missing: {}",
+        src
+    );
+    assert!(
+        src.contains("loop assigns i"),
+        "loop assigns missing: {}",
+        src
+    );
+    assert!(
+        src.contains("loop variant"),
+        "loop variant missing: {}",
+        src
+    );
     assert!(src.contains("assert i"), "post assert missing: {}", src);
 
     let ast = call_tool_json(
@@ -2643,14 +2774,17 @@ void ghost_loop(unsigned n)
         }
         None
     }
-    let loop_stmt = find_sid(ast["body"].as_array().expect("body"), loop_sid)
-        .expect("inserted loop in AST");
+    let loop_stmt =
+        find_sid(ast["body"].as_array().expect("body"), loop_sid).expect("inserted loop in AST");
     assert_eq!(
-        loop_stmt["kind"], Value::String("loop".into()),
+        loop_stmt["kind"],
+        Value::String("loop".into()),
         "loop AST: {:?}",
         loop_stmt
     );
-    let annotations = loop_stmt["annotations"].as_array().expect("loop annotations");
+    let annotations = loop_stmt["annotations"]
+        .as_array()
+        .expect("loop annotations");
     assert!(
         annotations
             .iter()
@@ -2669,7 +2803,11 @@ void ghost_loop(unsigned n)
     )
     .await
     .unwrap();
-    assert_eq!(wp["effective_wp_config"]["scope"], "sandbox", "wp: {:?}", wp);
+    assert_eq!(
+        wp["effective_wp_config"]["scope"], "sandbox",
+        "wp: {:?}",
+        wp
+    );
 
     let _ = client.cancel().await;
 }
@@ -3293,7 +3431,10 @@ int f(int n)
     );
     assert_eq!(sandbox_retry["effective_wp_config"]["rte"], true);
     assert_eq!(
-        sandbox_retry["wp_attempts"].as_array().expect("sandbox attempts").len(),
+        sandbox_retry["wp_attempts"]
+            .as_array()
+            .expect("sandbox attempts")
+            .len(),
         1
     );
     assert_eq!(
@@ -3399,15 +3540,15 @@ async fn wp_goals_surface_vacuous_call_precondition_status() {
         later_precondition
     );
     assert_eq!(
-        later_precondition["failure_classification"]["category"],
-        "callee_requires_too_strict",
+        later_precondition["failure_classification"]["category"], "callee_requires_too_strict",
         "call precondition should be classified: {:?}",
         later_precondition
     );
     assert!(
         later_precondition["failure_classification"]["evidence"]
             .as_array()
-            .map_or(0, Vec::len) >= 1,
+            .map_or(0, Vec::len)
+            >= 1,
         "classification should carry evidence: {:?}",
         later_precondition
     );
@@ -3419,7 +3560,8 @@ async fn wp_goals_surface_vacuous_call_precondition_status() {
         later_precondition
     );
     assert!(
-        later_precondition["failure_classification"]["wp_timeout_triage"]["retry_with_higher_prover_timeout"]
+        later_precondition["failure_classification"]["wp_timeout_triage"]
+            ["retry_with_higher_prover_timeout"]
             .as_bool()
             .is_some(),
         "classification should include timeout retry guidance: {:?}",
@@ -3640,18 +3782,21 @@ int my_abs(int val)
         .unwrap_or_else(|| panic!("disjoint groups missing: {:?}", context));
     assert_eq!(disjoint.len(), 2, "triangle groups: {:?}", disjoint);
     assert!(
-        disjoint.iter().any(|group| group == &json!(["equilateral", "isocele", "scalene"])),
+        disjoint
+            .iter()
+            .any(|group| group == &json!(["equilateral", "isocele", "scalene"])),
         "side group missing from contract context: {:?}",
         disjoint
     );
     assert!(
-        disjoint.iter().any(|group| group == &json!(["obtuse", "right", "acute"])),
+        disjoint
+            .iter()
+            .any(|group| group == &json!(["obtuse", "right", "acute"])),
         "angle group missing from contract context: {:?}",
         disjoint
     );
     assert_eq!(
-        context["proposed_contract"]["proposed_disjoint_behaviors"],
-        contract["disjoint"],
+        context["proposed_contract"]["proposed_disjoint_behaviors"], contract["disjoint"],
         "{:?}",
         context
     );
@@ -3843,7 +3988,12 @@ async fn tutorial_sandbox_preserves_logic_dependencies() {
             "sort-permutation.c" => {
                 assert!(
                     has_report_item(report, "copied_global_acsl", "predicate", "sorted")
-                        && has_report_item(report, "copied_global_acsl", "inductive", "permutation")
+                        && has_report_item(
+                            report,
+                            "copied_global_acsl",
+                            "inductive",
+                            "permutation"
+                        )
                         && has_report_item(report, "callees", "definition", "swap")
                         && has_report_item(report, "callees", "declaration", "min_idx_in"),
                     "sort extraction report missing: {:?}",
@@ -3929,8 +4079,16 @@ async fn tutorial_loops_expose_named_invariants_and_termination_clauses() {
     .await
     .unwrap();
     let find_annotations = find_annotations.as_array().expect("find annotations");
-    assert!(has_kind(find_annotations, "terminates"), "{:?}", find_annotations);
-    assert!(has_kind(find_annotations, "exits"), "{:?}", find_annotations);
+    assert!(
+        has_kind(find_annotations, "terminates"),
+        "{:?}",
+        find_annotations
+    );
+    assert!(
+        has_kind(find_annotations, "exits"),
+        "{:?}",
+        find_annotations
+    );
 
     let max_annotations = context_json(&client, "max_element", "current_annotations")
     .await
@@ -3943,8 +4101,16 @@ async fn tutorial_loops_expose_named_invariants_and_termination_clauses() {
             max_annotations
         );
     }
-    assert!(has_kind(max_annotations, "assigns"), "{:?}", max_annotations);
-    assert!(has_kind(max_annotations, "decreases"), "{:?}", max_annotations);
+    assert!(
+        has_kind(max_annotations, "assigns"),
+        "{:?}",
+        max_annotations
+    );
+    assert!(
+        has_kind(max_annotations, "decreases"),
+        "{:?}",
+        max_annotations
+    );
 
     let _ = client.cancel().await;
 }
@@ -4047,9 +4213,7 @@ async fn tutorial_modular_sandbox_uses_header_contracts() {
         src
     );
     assert!(
-        src.contains("ensures \\result")
-            && src.contains("\\old(a)")
-            && src.contains("\\old(b)"),
+        src.contains("ensures \\result") && src.contains("\\old(a)") && src.contains("\\old(b)"),
         "mod_max prototype contract missing from sandbox:\n{}",
         src
     );
@@ -4077,7 +4241,11 @@ async fn tutorial_modular_sandbox_uses_header_contracts() {
             .count();
         total += goals.len();
     }
-    assert_eq!((proved, total), (28, 28), "tutorial modular WP baseline changed");
+    assert_eq!(
+        (proved, total),
+        (28, 28),
+        "tutorial modular WP baseline changed"
+    );
 
     let _ = client.cancel().await;
 }
@@ -4264,11 +4432,15 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
         alarm["property_marker"]
     );
     assert!(
-        investigation["diagnostic_summary"]["alarm_kind"].as_str().is_some(),
+        investigation["diagnostic_summary"]["alarm_kind"]
+            .as_str()
+            .is_some(),
         "{:?}",
         investigation
     );
-    assert!(investigation["diagnostic_summary"].get("kinstr_marker").is_some());
+    assert!(investigation["diagnostic_summary"]
+        .get("kinstr_marker")
+        .is_some());
     assert!(
         investigation["diagnostic_summary"]["value_before"].is_null()
             || investigation["diagnostic_summary"]["value_before"].is_object(),
@@ -4314,8 +4486,7 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
         .and_then(|items| items.first())
     {
         assert_eq!(
-            suggestion["source_property_marker"],
-            alarm["property_marker"],
+            suggestion["source_property_marker"], alarm["property_marker"],
             "{:?}",
             investigation
         );
@@ -4361,7 +4532,10 @@ async fn check_receipt_reports_eva_settings_left_by_an_earlier_call() {
     // a real Frama-C.
     for config in [&deep_config, &default["proof_receipt"]["eva"]] {
         let entries = config.as_object().expect("EVA config object");
-        assert!(entries.len() >= 16, "too few EVA settings read back: {entries:?}");
+        assert!(
+            entries.len() >= 16,
+            "too few EVA settings read back: {entries:?}"
+        );
         for (key, value) in entries {
             assert!(
                 value.get("unavailable").is_none(),
@@ -4549,12 +4723,18 @@ async fn two_identical_runs_produce_one_receipt() {
     let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
 
     let first_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
-    let first = call_tool_json(&first_client, "check", json!({})).await.unwrap();
-    let repeated = call_tool_json(&first_client, "check", json!({})).await.unwrap();
+    let first = call_tool_json(&first_client, "check", json!({}))
+        .await
+        .unwrap();
+    let repeated = call_tool_json(&first_client, "check", json!({}))
+        .await
+        .unwrap();
     let _ = first_client.cancel().await;
 
     let second_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
-    let second = call_tool_json(&second_client, "check", json!({})).await.unwrap();
+    let second = call_tool_json(&second_client, "check", json!({}))
+        .await
+        .unwrap();
     let _ = second_client.cancel().await;
 
     // Same server, second call. The markers differ between these two and the
@@ -4620,6 +4800,7 @@ async fn two_identical_runs_produce_one_receipt() {
              host rather than a nondeterministic server. Re-run it alone before \
              reading it as an ordering bug. Moved: {moved:?}"
         );
+
         // Statuses moved with no timeout among them. This is the divergence the
         // test exists for, and it has to say so: falling through to the message
         // below would send the reader to the receipt's own fields while the
@@ -4660,7 +4841,12 @@ async fn wp_targets_do_not_reorder_within_one_session() {
 
     // Sorted, which is what makes it a property rather than a coincidence of
     // this fixture's map layout.
-    let names: Vec<&str> = functions.as_array().unwrap().iter().filter_map(|n| n.as_str()).collect();
+    let names: Vec<&str> = functions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "WP targets are not in a defined order");
@@ -4727,7 +4913,11 @@ async fn property_identity_is_preserved_across_analysis_tools() {
         .unwrap_or_else(|| panic!("EVA properties missing: {:?}", alarms));
     assert!(alarm["property_marker"].as_str().is_some(), "{:?}", alarm);
     assert!(alarm["function_marker"].as_str().is_some(), "{:?}", alarm);
-    assert!(alarm["source_location"]["line"].as_i64().is_some(), "{:?}", alarm);
+    assert!(
+        alarm["source_location"]["line"].as_i64().is_some(),
+        "{:?}",
+        alarm
+    );
     assert!(alarm["raw_status"].as_str().is_some(), "{:?}", alarm);
     assert!(alarm["normalized_status"].as_str().is_some(), "{:?}", alarm);
 
@@ -4834,8 +5024,16 @@ async fn property_identity_is_preserved_across_analysis_tools() {
         "{:?}",
         details["wp_print"]
     );
-    assert!(details["why3_dump"]["status"].as_str().is_some(), "{:?}", details);
-    assert!(details["why3_dump"]["files"].as_array().is_some(), "{:?}", details);
+    assert!(
+        details["why3_dump"]["status"].as_str().is_some(),
+        "{:?}",
+        details
+    );
+    assert!(
+        details["why3_dump"]["files"].as_array().is_some(),
+        "{:?}",
+        details
+    );
 
     // What the file cap left out, so a short list cannot be read as a complete
     // one. The dumps are also selected in name order rather than in readdir
@@ -4878,10 +5076,22 @@ async fn property_identity_is_preserved_across_analysis_tools() {
     assert!(vc["raw_vc_text"]["goal"].as_str().is_some(), "{:?}", vc);
     assert!(vc["hypotheses"].as_array().is_some(), "{:?}", vc);
     assert!(vc["clause"]["kind"].as_str().is_some(), "{:?}", vc);
-    assert!(vc["related_acsl_clause"]["kind"].as_str().is_some(), "{:?}", vc);
-    assert!(vc["involved_variables"]["names"].as_array().is_some(), "{:?}", vc);
+    assert!(
+        vc["related_acsl_clause"]["kind"].as_str().is_some(),
+        "{:?}",
+        vc
+    );
+    assert!(
+        vc["involved_variables"]["names"].as_array().is_some(),
+        "{:?}",
+        vc
+    );
     assert!(vc["callee_contracts"].is_object(), "{:?}", vc);
-    assert!(vc["prover_result"]["normalized_status"].as_str().is_some(), "{:?}", vc);
+    assert!(
+        vc["prover_result"]["normalized_status"].as_str().is_some(),
+        "{:?}",
+        vc
+    );
     assert!(vc["goal_kind"].as_str().is_some(), "{:?}", vc);
     assert!(vc["stable_goal_id"].as_str().is_some(), "{:?}", vc);
     let classified_vc = details["vcs"]
@@ -5066,8 +5276,10 @@ async fn stable_goal_id_survives_reload() {
             .as_array()
             .unwrap_or_else(|| panic!("goal array missing: {:?}", reloaded))
             .iter()
-            .any(|goal| goal["stable_goal_id"].as_str() == Some(first_id.as_str())
-                && goal["frama_c_goal_name"].as_str().is_some()),
+            .any(
+                |goal| goal["stable_goal_id"].as_str() == Some(first_id.as_str())
+                    && goal["frama_c_goal_name"].as_str().is_some()
+            ),
         "stable goal id did not survive reload: before={first_id}, after={:?}",
         reloaded
     );
@@ -5118,7 +5330,9 @@ int sum_to(int n)
     assert!(
         context["function_acsl_attachment_points"]
             .as_array()
-            .map(|points| points.iter().any(|point| point.as_str() == Some("requires")))
+            .map(|points| points
+                .iter()
+                .any(|point| point.as_str() == Some("requires")))
             .unwrap_or(false),
         "ACSL attachment points missing from CIL context: {:?}",
         context
@@ -5447,7 +5661,11 @@ void touch(int *p)
         "raw writes missing: {:?}",
         effects
     );
-    assert!(effects["callee_assigns"].as_array().is_some(), "{:?}", effects);
+    assert!(
+        effects["callee_assigns"].as_array().is_some(),
+        "{:?}",
+        effects
+    );
 
     let _ = client.cancel().await;
 }
@@ -5473,9 +5691,7 @@ void fill(int *xs, int n)
 
     let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
 
-    let effects = context_json(&client, "fill", "loop_effects")
-    .await
-    .unwrap();
+    let effects = context_json(&client, "fill", "loop_effects").await.unwrap();
 
     let loops = effects.as_array().expect("loop effects");
     assert_eq!(loops.len(), 1, "{:?}", effects);
@@ -5549,8 +5765,16 @@ int dev_read(ring_buffer_t *rb)
     );
 
     let src = print_source(&client, Some(&sb_name)).await;
-    assert!(src.contains("rb_is_empty"), "sandbox source lost target: {}", src);
-    assert!(src.contains("ring_buffer_t"), "sandbox source lost target type: {}", src);
+    assert!(
+        src.contains("rb_is_empty"),
+        "sandbox source lost target: {}",
+        src
+    );
+    assert!(
+        src.contains("ring_buffer_t"),
+        "sandbox source lost target type: {}",
+        src
+    );
 
     let _ = client.cancel().await;
 }
@@ -5643,22 +5867,32 @@ async fn inject_all_classifies_failures_correctly() {
         .map(|f| f["type"].as_str().unwrap_or("?").to_string())
         .collect();
 
-    assert!(types.contains(&"proposed_self_referential".to_string()),
-        "missing proposed_self_referential in {:?}", types);
-    assert!(types.contains(&"proposed_local_var_in_funspec".to_string()),
-        "missing proposed_local_var_in_funspec in {:?}", types);
+    assert!(
+        types.contains(&"proposed_self_referential".to_string()),
+        "missing proposed_self_referential in {:?}",
+        types
+    );
+    assert!(
+        types.contains(&"proposed_local_var_in_funspec".to_string()),
+        "missing proposed_local_var_in_funspec in {:?}",
+        types
+    );
 
     // Verify each failure carries the correct proposed_path → type mapping
     for f in failures {
         let path = f["proposed_path"].as_str().unwrap_or("");
         let ftype = f["type"].as_str().unwrap_or("");
         match path {
-            "proposed_requires[1]" =>
-                assert_eq!(ftype, "proposed_self_referential",
-                    "undef pred at path 'proposed_requires[1]': got {}", ftype),
-            "proposed_assigns[0]" =>
-                assert_eq!(ftype, "proposed_local_var_in_funspec",
-                    "broken assigns at 'proposed_assigns[0]': got {}", ftype),
+            "proposed_requires[1]" => assert_eq!(
+                ftype, "proposed_self_referential",
+                "undef pred at path 'proposed_requires[1]': got {}",
+                ftype
+            ),
+            "proposed_assigns[0]" => assert_eq!(
+                ftype, "proposed_local_var_in_funspec",
+                "broken assigns at 'proposed_assigns[0]': got {}",
+                ftype
+            ),
             other => panic!("unexpected failure path: {}", other),
         }
     }
@@ -5785,7 +6019,10 @@ async fn inject_all_annotations_dry_run_reports_diagnostics_without_mutating_san
     assert_eq!(valid["index"], 0);
     assert_eq!(valid["insertion_target"]["function"], "bubble_sort");
     assert_eq!(valid["insertion_target"]["kind"], "spec");
-    assert_eq!(valid["insertion_target"]["stmt_id"], serde_json::Value::Null);
+    assert_eq!(
+        valid["insertion_target"]["stmt_id"],
+        serde_json::Value::Null
+    );
     let failures = result["failures"].as_array().expect("failures");
     assert!(failures
         .iter()
@@ -5836,8 +6073,11 @@ async fn inject_all_rejects_missing_experiment_id_prefix() {
     // The tool returns Err(McpError) for invalid_params.
     let err = res.expect_err("expected error for missing experiment_id prefix");
     let msg = format!("{}", err);
-    assert!(msg.contains("experiment_id") || msg.contains("prefix"),
-        "error msg should mention experiment_id/prefix; got: {}", msg);
+    assert!(
+        msg.contains("experiment_id") || msg.contains("prefix"),
+        "error msg should mention experiment_id/prefix; got: {}",
+        msg
+    );
 
     let _ = client.cancel().await;
 }
@@ -5990,10 +6230,16 @@ async fn inject_all_schema_v2_behaviors_and_undeclared_reference() {
         .expect("undeclared ensure failure");
     assert_eq!(f["proposed_path"].as_str().unwrap(), "proposed_ensures[1]");
     let err = f["frama_c_error"].as_str().unwrap_or("");
-    assert!(err.contains("'undeclared_bhv'"),
-        "error should mention undeclared name: {}", err);
-    assert!(err.contains("not declared in proposed_behaviors"),
-        "error should explain the rule: {}", err);
+    assert!(
+        err.contains("'undeclared_bhv'"),
+        "error should mention undeclared name: {}",
+        err
+    );
+    assert!(
+        err.contains("not declared in proposed_behaviors"),
+        "error should explain the rule: {}",
+        err
+    );
     let group_failure = failures
         .iter()
         .find(|failure| failure["proposed_path"] == "proposed_disjoint_behaviors[0]")
@@ -6456,7 +6702,10 @@ async fn verify_program_step_schedules_chain_and_recursive_scc() {
     assert!(second.get("workflow_next_action").is_none());
 
     let main_after = print_source(&client, None).await;
-    assert_eq!(main_before, main_after, "main source changed during scheduling");
+    assert_eq!(
+        main_before, main_after,
+        "main source changed during scheduling"
+    );
 
     let _ = client.cancel().await;
 
@@ -6478,21 +6727,33 @@ int top(int x) { return ra(x); }
     )
     .expect("write fixture");
     let recursive_run = tempfile::tempdir().expect("tempdir");
-    let client = spawn_mcp_client_in_dir(recursive.to_str().unwrap(), Some(recursive_run.path())).await;
+    let client =
+        spawn_mcp_client_in_dir(recursive.to_str().unwrap(), Some(recursive_run.path())).await;
     let initial = call_tool_json(&client, "verify_program_step", json!({}))
         .await
         .unwrap();
     assert_eq!(ready_names(&initial["ready_functions"]), vec!["leaf"]);
 
-    let _ = call_tool_json(&client, "store_function_conclusion", verified_conclusion_payload("leaf"))
+    let _ = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        verified_conclusion_payload("leaf"),
+    )
     .await
     .unwrap();
     let after_leaf = call_tool_json(&client, "verify_program_step", json!({}))
         .await
         .unwrap();
-    assert_eq!(ready_names(&after_leaf["ready_functions"]), vec!["ra", "rb"]);
+    assert_eq!(
+        ready_names(&after_leaf["ready_functions"]),
+        vec!["ra", "rb"]
+    );
     for entry in after_leaf["ready_functions"].as_array().unwrap() {
-        assert_eq!(entry["is_cycle"], true, "recursive members should be marked: {:?}", entry);
+        assert_eq!(
+            entry["is_cycle"], true,
+            "recursive members should be marked: {:?}",
+            entry
+        );
         assert_eq!(entry["scc_members"], json!(["ra", "rb"]));
     }
 
@@ -6792,7 +7053,11 @@ async fn verify_program_step_chain_and_inprogress() {
 fn labelled_goal<'a>(goals: &'a Value, source: &str) -> &'a Value {
     goals
         .as_array()
-        .and_then(|items| items.iter().find(|goal| goal["hash_label"].as_str().is_some()))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|goal| goal["hash_label"].as_str().is_some())
+        })
         .unwrap_or_else(|| panic!("{source} has no labelled goal: {goals:?}"))
 }
 
@@ -6975,7 +7240,10 @@ async fn self_check_canary_judges_the_backend_without_disturbing_the_session() {
     // And the session survived. Without the separate server this is the
     // annotated source of abs-int-fixed.c, and "keep" does not appear in it.
     let src = print_source(&client, None).await;
-    assert!(src.contains("int keep(int x)"), "the canary reloaded the session: {src}");
+    assert!(
+        src.contains("int keep(int x)"),
+        "the canary reloaded the session: {src}"
+    );
     assert!(
         src.contains("assigns \\nothing"),
         "the canary discarded the injected clause: {src}"
@@ -7006,7 +7274,9 @@ async fn self_check_probes_rather_than_reporting_every_request_unprobed() {
     std::fs::write(&c_file, "int id(int x)\n{\n    return x;\n}\n").expect("write fixture");
     let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
 
-    let report = call_tool_json(&client, "self_check", json!({})).await.unwrap();
+    let report = call_tool_json(&client, "self_check", json!({}))
+        .await
+        .unwrap();
 
     for field in ["required_requests", "ast_utils_registered_requests"] {
         let requests = report[field]
@@ -7305,7 +7575,10 @@ async fn a_timed_out_goal_is_retried_at_double_the_timeout() {
         .await
         .unwrap();
     let settled_goals = settled_goals.as_array().expect("goal array");
-    assert!(!settled_goals.is_empty(), "no goals at all: {settled_goals:?}");
+    assert!(
+        !settled_goals.is_empty(),
+        "no goals at all: {settled_goals:?}"
+    );
     assert!(
         settled_goals
             .iter()
@@ -7349,7 +7622,9 @@ async fn check_want_selects_the_analyses_and_says_which_it_skipped() {
     // The fixture proves clean, so with both analyses there is nothing to
     // report. That is what makes the two runs below readable: any code they
     // carry is about the analysis that did not run.
-    let both = call_tool_json(&client, "check", json!({"files": [file]})).await.unwrap();
+    let both = call_tool_json(&client, "check", json!({"files": [file]}))
+        .await
+        .unwrap();
     assert_eq!(both["schema"], "frama-c-mcp.check.v2", "{both:?}");
     assert_eq!(both["verdict"], "proved", "{both:?}");
     assert_eq!(codes(&both), Vec::<String>::new(), "{both:?}");
@@ -7477,7 +7752,9 @@ async fn check_returns_one_field_set_on_both_paths() {
             "{label}: verdict {verdict}"
         );
         assert_eq!(
-            payload["incomplete"].as_array().is_some_and(|items| items.is_empty()),
+            payload["incomplete"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
             verdict == "proved",
             "{label}: proved and an empty incomplete array must agree: {payload:?}"
         );
@@ -7555,7 +7832,10 @@ async fn the_receipt_records_the_contract_it_proved_under() {
         "the receipt cannot see the precondition change"
     );
     assert!(narrow_requires.contains("≤ 1"), "{narrow_requires}");
-    assert_ne!(wide["sha256"], narrow["sha256"], "receipt hashes should differ");
+    assert_ne!(
+        wide["sha256"], narrow["sha256"],
+        "receipt hashes should differ"
+    );
 
     // The generated label is stripped, so two runs of the same contract still
     // compare equal even though each injection carries a fresh one.
@@ -7750,7 +8030,9 @@ fn assert_every_want_answered(payload: &Value, wants: &[&str], tool: &str) {
 async fn a_source_position_answers_what_a_variable_holds_there() {
     let fixture = workspace_path("tests/fixtures/eva-value-at-position.c");
     let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
-    let checked = call_tool_json(&client, "check", json!({"want": ["eva"]})).await.unwrap();
+    let checked = call_tool_json(&client, "check", json!({"want": ["eva"]}))
+        .await
+        .unwrap();
     assert_eva_run_shape(&checked["eva"]);
 
     // Column 4 of "total = n * 2;", the assignment inside the branch.
@@ -7830,14 +8112,22 @@ async fn clause_origin_comes_from_the_emitter_not_the_label() {
     let origin_of = |predicate: &str| {
         clauses
             .iter()
-            .find(|clause| clause["descr"].as_str().is_some_and(|d| d.contains(predicate)))
+            .find(|clause| {
+                clause["descr"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(predicate))
+            })
             .map(|clause| clause["origin"].as_str().unwrap_or("missing").to_string())
             .unwrap_or_else(|| panic!("no clause matching {predicate}: {clauses:?}"))
     };
 
     // What this server wrote this session, from both collection sites.
     assert_eq!(origin_of("\\false"), "injected", "contract clause");
-    assert_eq!(origin_of("x \u{2261} x"), "injected", "statement annotation");
+    assert_eq!(
+        origin_of("x \u{2261} x"),
+        "injected",
+        "statement annotation"
+    );
 
     // The impostor: source text whose ACSL name has the shape this server
     // generates. This is the assertion the whole plug-in request exists for.
@@ -7862,7 +8152,10 @@ async fn clause_origin_comes_from_the_emitter_not_the_label() {
         .iter()
         .filter(|clause| clause["kind"].as_str() == Some("behavior"))
         .collect();
-    assert!(!behaviors.is_empty(), "no behavior rows to check: {clauses:?}");
+    assert!(
+        !behaviors.is_empty(),
+        "no behavior rows to check: {clauses:?}"
+    );
     for behavior in behaviors {
         assert!(
             behavior["origin"].is_null(),
@@ -7898,9 +8191,14 @@ async fn clause_origin_comes_from_the_emitter_not_the_label() {
     // need one request per function to say anything. It says nothing instead.
     // Checked on a goal the property join did reach, since a missing origin has
     // to mean undetermined rather than enrichment never having run.
-    let unscoped = call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap();
+    let unscoped = call_tool_json(&client, "get_wp_goals", json!({}))
+        .await
+        .unwrap();
     let goal = goal_named(&unscoped, "Assert0");
-    assert!(goal["origin"].is_null(), "unscoped goal has an origin: {goal:?}");
+    assert!(
+        goal["origin"].is_null(),
+        "unscoped goal has an origin: {goal:?}"
+    );
     assert!(
         goal["normalized_property_status"].is_string(),
         "unscoped goal was never enriched, so its missing origin proves nothing: {goal:?}"
@@ -8170,7 +8468,6 @@ async fn test_pointer_writes_unsoundness() {
 
     let _ = client.cancel().await;
 }
-
 
 /// A write through a pointer parameter belongs in the frame, and an unknown
 /// callee means no frame at all.
@@ -8519,13 +8816,22 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
     for label in ["plain", "same-code", "changed"] {
         assert_eq!(by_label(label)["model"], "Typed+nocast", "{result:?}");
     }
-    assert_eq!(by_label("same-code-cast")["model"], "Typed+cast", "{result:?}");
+    assert_eq!(
+        by_label("same-code-cast")["model"],
+        "Typed+cast",
+        "{result:?}"
+    );
 
     // A define that selects nothing must be reported against the first variant
     // sharing its AST.
-    assert_eq!(by_label("same-code")["duplicate_ast"], "plain", "{result:?}");
     assert_eq!(
-        by_label("same-code")["ast_digest"], by_label("plain")["ast_digest"],
+        by_label("same-code")["duplicate_ast"],
+        "plain",
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("same-code")["ast_digest"],
+        by_label("plain")["ast_digest"],
         "{result:?}"
     );
     assert!(
@@ -8540,7 +8846,8 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
         "a define that changes code is not a duplicate: {result:?}"
     );
     assert_ne!(
-        by_label("changed")["ast_digest"], by_label("plain")["ast_digest"],
+        by_label("changed")["ast_digest"],
+        by_label("plain")["ast_digest"],
         "{result:?}"
     );
 
@@ -8658,7 +8965,10 @@ async fn a_reload_counts_what_the_parse_dropped_and_keeps_counting_it() {
             .is_some_and(|file| file.ends_with("ast-parse-losses.c")),
         "{first}"
     );
-    assert_eq!(first["categories"]["kernel:asm:clobber"]["locations_omitted"], 0);
+    assert_eq!(
+        first["categories"]["kernel:asm:clobber"]["locations_omitted"],
+        0
+    );
     assert_eq!(
         first["categories"]["kernel:attrs:unknown"]["count_unit"],
         "distinct_attribute_names"
@@ -8713,7 +9023,12 @@ async fn check_names_each_ast_loss_on_every_call_not_only_the_first() {
     let second = call_tool_json(&client, "check", want)
         .await
         .expect("a second check in the same session");
-    assert_eq!(ast_incomplete_codes(&second), codes, "{:?}", second["incomplete"]);
+    assert_eq!(
+        ast_incomplete_codes(&second),
+        codes,
+        "{:?}",
+        second["incomplete"]
+    );
 
     // No hedge on the count. The record is a boot parse, so nothing was
     // suppressed and nothing else was writing into its window.
@@ -8882,7 +9197,11 @@ async fn a_respawn_reports_the_new_process_parse() {
         2,
         "a new process has spent no warn-once category: {respawned}"
     );
-    assert_eq!(category_count(&respawned, "kernel:asm:clobber"), 2, "{respawned}");
+    assert_eq!(
+        category_count(&respawned, "kernel:asm:clobber"),
+        2,
+        "{respawned}"
+    );
     let _ = client.cancel().await;
 }
 
@@ -9220,4 +9539,394 @@ async fn a_truncated_check_still_resolves_every_advice_key() {
     }
 
     let _ = client.cancel().await;
+}
+
+/// The parse surface is a measurement, and this is the shape of the answer.
+///
+/// It exists because the count it reports is the kind of number that gets
+/// quoted from a document rather than recomputed, and then read as measured
+/// when it is a year old. Two files, one of each kind, is enough to pin that
+/// the two are told apart: sys/mount.h is absent from Frama-C's modeled libc,
+/// and Frama-C preprocesses with -nostdinc against that libc, so the host's
+/// copy is not reachable here and the failure is the real one rather than a
+/// staged one.
+#[tokio::test]
+async fn parse_surface_tells_a_header_not_found_from_a_file_that_parses() {
+    let ok = workspace_path("tests/fixtures/tutorial/swap-frame.c");
+    let blocked = workspace_path("tests/fixtures/unmodeled-header.c");
+    let client = spawn_mcp_client(ok.to_str().unwrap()).await;
+
+    let report = call_tool_json(
+        &client,
+        "parse_surface",
+        json!({
+            "files": [ok.to_str().unwrap(), blocked.to_str().unwrap()],
+            "detail": "full",
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report["files_total"], 2, "{report:?}");
+    assert_eq!(report["files_parsed"], 1, "{report:?}");
+    assert_eq!(report["files_blocked"], 1, "{report:?}");
+
+    let ranked = report["blocked_by"].as_array().expect("blocked_by");
+    assert_eq!(ranked.len(), 1, "{report:?}");
+    assert_eq!(ranked[0]["cause"], "header_not_found", "{report:?}");
+    assert_eq!(ranked[0]["subject"], "sys/mount.h", "{report:?}");
+    assert_eq!(ranked[0]["files"], 1, "{report:?}");
+
+    // The advice for this cause has to say that a stub does not close it. That
+    // is the whole reason the two causes are separated.
+    let reason = report["next_action"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("does not model"), "{reason}");
+
+    let files = report["files"].as_array().expect("files");
+    let parses: std::collections::BTreeMap<&str, bool> = files
+        .iter()
+        .map(|entry| {
+            (
+                entry["file"].as_str().unwrap_or_default(),
+                entry["parses"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(parses.get(ok.to_str().unwrap()), Some(&true), "{report:?}");
+    assert_eq!(
+        parses.get(blocked.to_str().unwrap()),
+        Some(&false),
+        "{report:?}"
+    );
+}
+
+/// A profile is only worth having if the model it declares reaches WP.
+///
+/// This server's default is Typed+nocast, and a project's target can declare
+/// something else, so the assertion that matters is not that the response
+/// echoes the profile back: it is that effective_wp_config, which is read off
+/// the process that did the proving, reports the profile's model rather than
+/// the default. Those two can disagree, and if they ever do the echo is the
+/// thing that would keep looking right.
+#[tokio::test]
+async fn a_named_profile_decides_the_model_wp_proves_under() {
+    let c_file = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let reload = call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [c_file.to_str().unwrap()],
+            "verify_profiles": {
+                "demo": {
+                    "sources": [c_file.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-demo"
+                },
+                "incomplete": {
+                    "sources": [c_file.to_str().unwrap()],
+                    "functions": ["swap"]
+                }
+            },
+            "verify_profiles_source": "make print-verify-profiles"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reload["verify_profiles_registered"]["names"],
+        json!(["demo", "incomplete"]),
+        "{reload:?}"
+    );
+    assert_eq!(
+        reload["verify_profiles_registered"]["source"],
+        "make print-verify-profiles",
+        "{reload:?}"
+    );
+
+    let wp = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "demo"}),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(wp["verify_profile"]["name"], "demo", "{wp:?}");
+    assert_eq!(wp["verify_profile"]["reproduce"], "make verify-demo", "{wp:?}");
+    assert_eq!(
+        wp["effective_wp_config"]["model"], "Typed+cast",
+        "the profile's model did not reach WP: {wp:?}"
+    );
+
+    for override_params in [
+        json!({"model": "Typed+nocast"}),
+        json!({"prover": "z3"}),
+        json!({"provers": ["z3"]}),
+        json!({"timeout": 1}),
+    ] {
+        let mut params = json!({"functions": ["swap"], "verify_profile": "demo"});
+        params.as_object_mut().unwrap().extend(override_params.as_object().unwrap().clone());
+        let error = call_tool_json(&client, "run_wp", params)
+            .await
+            .expect_err("profile setting override");
+        assert!(format!("{error:?}").contains("cannot be combined"));
+    }
+
+    let error = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "incomplete"}),
+    )
+    .await
+    .expect_err("incomplete profile is not evidence");
+    assert!(format!("{error:?}").contains("missing functions, model, provers, or timeout_seconds"));
+
+    let sandbox = call_tool_json(&client, "create_sandbox", json!({
+        "function": "swap",
+        "experiment_id": unique_experiment_id("profileevidence"),
+    }))
+    .await
+    .unwrap()["sandbox_name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let error = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": [sandbox], "verify_profile": "demo"}),
+    )
+    .await
+    .expect_err("sandbox is not target evidence");
+    assert!(format!("{error:?}").contains("sandbox proofs are not target evidence"));
+}
+
+/// Naming a profile nobody registered is refused, and the refusal says what is
+/// registered. Falling back to the default here would prove something under a
+/// model the caller did not ask for and report it as that target's evidence,
+/// which is the failure the profiles exist to prevent.
+#[tokio::test]
+async fn an_unknown_profile_is_refused_rather_than_defaulted() {
+    let c_file = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let error = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "elf"}),
+    )
+    .await
+    .expect_err("unknown profile");
+    let text = format!("{error:?}");
+    assert!(text.contains("elf"), "{text}");
+    assert!(text.contains("Registered: none"), "{text}");
+}
+
+/// The two refusals whose predicates are unit-tested and whose wiring is not.
+///
+/// profile_matches_loaded_project and profile_covers_exactly each have a unit
+/// test, so an inverted condition or a swapped argument at the call site
+/// leaves both green while the refusal never fires. These exercise the call
+/// sites: one loads a file the profile does not name, the other names fewer
+/// functions than the target proves.
+#[tokio::test]
+async fn a_profile_refuses_a_project_and_a_function_set_that_are_not_its_own() {
+    let target = tutorial_c("swap-frame.c");
+    let other = tutorial_c("bsearch.c");
+    let client = spawn_mcp_client(other.to_str().unwrap()).await;
+
+    // Registered against swap-frame, but bsearch is what is loaded.
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [other.to_str().unwrap()],
+            "verify_profiles": {
+                "swap": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap", "order_3"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap"
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let wrong_project = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap", "order_3"], "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("the loaded project is not the profile's");
+    let text = format!("{wrong_project:?}");
+    assert!(text.contains("does not match the loaded project"), "{text}");
+
+    // Now load what the profile names, and ask for a subset of its functions.
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({"verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+
+    let subset = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("a subset is not the target");
+    let text = format!("{subset:?}");
+    assert!(text.contains("is the target that proves"), "{text}");
+}
+
+/// A stored verdict names the target it settles, or is refused.
+///
+/// Before this, a profile's identity lived for exactly one tool call: the
+/// receipt records what a run proved under, and nothing recorded which target
+/// those settings belonged to, so a conclusion could name neither its target
+/// nor the command that decides it. The refusals matter as much as the field:
+/// a conclusion claiming a target its own receipt contradicts is worse than
+/// one claiming nothing.
+#[tokio::test]
+async fn a_conclusion_can_name_the_target_it_settles() {
+    let target = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(target.to_str().unwrap()).await;
+
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "verify_profiles": {
+                "swap": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap"
+                },
+
+                // Same function and sources, a different model: the second half
+                // of the incremental checks below needs a registered name that
+                // a Typed+cast receipt contradicts.
+                "swapnocast": {
+                    "sources": [target.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-swap-nocast"
+                }
+            },
+            "verify_profile": "swap"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let wp = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+    let sha = wp["proof_receipt"]["sha256"].as_str().expect("receipt sha").to_string();
+
+    // Taken from the receipt rather than written down: the store refuses a
+    // summary whose counts disagree with the goals the receipt carries.
+    let goals = wp["proof_receipt"]["goals"].as_array().expect("goals");
+    let valid = goals.iter().filter(|g| g["status"] == "valid").count();
+    let summary = json!({
+        "total": goals.len(), "valid": valid,
+        "unknown": goals.len() - valid, "timeout": 0, "failed": 0
+    });
+
+    // A function the profile does not prove cannot borrow its name.
+    let wrong_function = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "order_3", "status": "verified",
+               "wp_summary": summary, "proof_receipt_sha256": sha,
+               "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("order_3 is not in the profile");
+    assert!(
+        format!("{wrong_function:?}").contains("does not prove order_3"),
+        "{wrong_function:?}"
+    );
+
+    call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "status": "verified",
+               "wp_summary": summary, "proof_receipt_sha256": sha,
+               "verify_profile": "swap"}),
+    )
+    .await
+    .unwrap();
+
+    // The tool is incremental, so the two halves of the claim can arrive in
+    // either order and both orders have to be checked. A name arriving after
+    // the receipt is compared against the receipt already stored.
+    let late_name = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "verify_profile": "swapnocast"}),
+    )
+    .await
+    .expect_err("the stored receipt was not produced under Typed+nocast");
+    assert!(
+        format!("{late_name:?}").contains("declares model Typed+nocast"),
+        "{late_name:?}"
+    );
+
+    // And a receipt arriving after the name is compared against the name
+    // already stored, rather than passing because this call named none.
+    let nocast = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": ["swap"], "model": "Typed+nocast"}),
+    )
+    .await
+    .unwrap();
+    let nocast_sha = nocast["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("receipt sha")
+        .to_string();
+    let late_receipt = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "proof_receipt_sha256": nocast_sha}),
+    )
+    .await
+    .expect_err("the stored target declares Typed+cast");
+    assert!(
+        format!("{late_receipt:?}").contains("declares model Typed+cast"),
+        "{late_receipt:?}"
+    );
+
+    // The target and its reproducing command survive into the stored verdict.
+    let listed = call_tool_json(
+        &client,
+        "list",
+        json!({"kind": "conclusions", "function": "swap"}),
+    )
+    .await
+    .unwrap();
+    let text = format!("{listed:?}");
+    assert!(text.contains("\"verify_profile\": String(\"swap\")"), "{text}");
+    assert!(text.contains("make verify-swap"), "{text}");
 }

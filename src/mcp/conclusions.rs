@@ -1,5 +1,95 @@
 use super::*;
 
+/// Why a receipt is not evidence about the target a conclusion names, or None.
+///
+/// Five questions, and deliberately not seven. The target and receipt have to
+/// prove this function; the run has to have been made under the model and load
+/// settings the target declares; and it has to have been made over the sources
+/// the target names. A
+/// receipt records provers and timeout as "effective" and Frama-C leaves those
+/// null whenever it does not report them back, so comparing them would refuse
+/// runs that were correct. Model and sources are on every receipt this server
+/// writes.
+///
+/// Absent halves are skipped rather than refused. A conclusion can be stored
+/// before any proof exists, and a check that treated a missing receipt as a
+/// mismatch would make naming the target impossible until the proof landed.
+pub fn profile_evidence_error(
+    name: &str,
+    profile: &crate::state::VerificationProfile,
+    function: &str,
+    receipt: Option<&serde_json::Value>,
+) -> Option<String> {
+    if !profile.functions.iter().any(|f| f == function) {
+        return Some(format!(
+            "verify_profile \"{name}\" does not prove {function}, so a conclusion for it is not \
+             evidence about that target"
+        ));
+    }
+    if let Some(receipt) = receipt {
+        let proved_functions = receipt
+            .pointer("/wp/functions")
+            .and_then(|functions| functions.as_array());
+        if !proved_functions.is_some_and(|functions| {
+            functions
+                .iter()
+                .any(|proved| proved.as_str() == Some(function))
+        }) {
+            return Some(format!(
+                "this receipt does not prove {function}, so it is not evidence about verify_profile \"{name}\""
+            ));
+        }
+    }
+    let proved_under = receipt
+        .and_then(|receipt| receipt.pointer("/wp/model"))
+        .and_then(|model| model.as_str());
+    if let (Some(declared), Some(used)) = (profile.model.as_deref(), proved_under) {
+        if declared != used {
+            return Some(format!(
+                "verify_profile \"{name}\" declares model {declared} and this receipt was \
+                 produced under {used}, so it is not evidence about that target"
+            ));
+        }
+    }
+
+    // A profile may name functions without sources, but a receipt supplied as
+    // evidence must name every source a source-constrained profile declares.
+    let mut proved_over: Vec<&str> = receipt
+        .and_then(|receipt| receipt.pointer("/subject/files"))
+        .and_then(|files| files.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.pointer("/path").and_then(|path| path.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut declared: Vec<&str> = profile.sources.iter().map(String::as_str).collect();
+    proved_over.sort_unstable();
+    declared.sort_unstable();
+    if !declared.is_empty() && receipt.is_some() && declared != proved_over {
+        return Some(format!(
+            "verify_profile \"{name}\" declares sources {declared:?} and this receipt was \
+             produced over {proved_over:?}, so it is not evidence about that target"
+        ));
+    }
+    if let Some(receipt) = receipt {
+        let expected_load = serde_json::json!({
+            "include_paths": profile.include_paths,
+            "defines": profile.defines,
+            "force_includes": profile.force_includes,
+            "machdep": profile.machdep,
+            "compilation_database": null,
+        });
+        if receipt.pointer("/subject/project_load") != Some(&expected_load) {
+            return Some(format!(
+                "verify_profile \"{name}\" declares different project load settings than this receipt, so it is not evidence about that target"
+            ));
+        }
+    }
+    None
+}
+
 #[tool_router(router = conclusions_router, vis = "pub(crate)")]
 impl FramaCMcpServer {
     #[tool(
@@ -74,11 +164,63 @@ impl FramaCMcpServer {
         };
 
         let func_name = params.function;
+        let requested_profile = params.verify_profile;
         // The name becomes a directory under .frama-c-mcp/.
         require_safe_path_segment(&func_name, "function")?;
 
         // Long-text fields never pass through this API; callers write
-        // `.frama-c-mcp/<func>/<field>.md` themselves.
+        // ".frama-c-mcp/<func>/<field>.md" themselves. Validate the state that
+        // will actually be merged. Reading it before this lock lets a
+        // concurrent receipt/profile update slip between the check and store.
+        let mut state = self.state.write().await;
+        let stored = state.get_conclusion(&func_name).cloned();
+        let effective_receipt = proof_receipt.as_ref().or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|conclusion| conclusion.proof_receipt.as_ref())
+        });
+        let evidence_profile = requested_profile.as_ref().or_else(|| {
+            proof_receipt.as_ref().and_then(|_| {
+                stored
+                    .as_ref()
+                    .and_then(|conclusion| conclusion.verify_profile.as_ref())
+            })
+        });
+        let reproduce = if let Some(name) = evidence_profile {
+            match state.verification_profiles.get(name).cloned() {
+                // Persisted conclusions can outlive the session profile
+                // registry.
+                None if requested_profile.is_none() => None,
+                None => return Err(unknown_verify_profile(name, &state.verification_profiles)),
+                Some(profile) => {
+                    if profile.model.is_none()
+                        || profile.provers.is_empty()
+                        || profile.timeout_seconds.is_none()
+                        || profile.functions.is_empty()
+                    {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "verify_profile \"{name}\" is missing functions, model, provers, \
+                                 or timeout_seconds, so it cannot be proof evidence"
+                            ),
+                            None,
+                        ));
+                    }
+                    if let Some(reason) =
+                        profile_evidence_error(name, &profile, &func_name, effective_receipt)
+                    {
+                        return Err(McpError::invalid_params(reason, None));
+                    }
+                    if requested_profile.is_some() {
+                        profile.reproduce
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let update = FunctionConclusionUpdate {
             function: func_name.clone(),
             status,
@@ -87,9 +229,10 @@ impl FramaCMcpServer {
             notes: params.notes,
             callees: params.callees,
             proof_receipt,
+            verify_profile: requested_profile,
+            reproduce,
         };
 
-        let mut state = self.state.write().await;
         let touched = state
             .store_conclusion(update)
             .map_err(|e| McpError::invalid_params(e, None))?;
