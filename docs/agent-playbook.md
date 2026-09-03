@@ -301,7 +301,25 @@ goal discharged under the wrong memory model is not evidence about that target:
 reload_project {verify_profiles: <json from the build system>, verify_profile: "<target>"}
 run_wp         {verify_profile: "<target>"}
 store_function_conclusion {function, status: "verified", proof_receipt_sha256, verify_profile: "<target>"}
+proof_coverage {verify_profile: "<target>"}
 ```
+
+`proof_coverage` answers with a row per function whose `reason` is the
+instruction, and an empty `reason` is the only thing that counts toward
+`function_coverage`:
+
+| `reason` | What to do |
+|---|---|
+| `different_project` | The receipt was produced over another file set, or the same files under different preprocessor settings. It is not evidence about what is loaded now. |
+| `not_defined_in_project` | The target names it, this project only declares it. Load the file that defines it; proving harder cannot help. |
+| `missing_conclusion` | Nothing is stored for it. Prove it. |
+| `different_verify_profile`, `profile_evidence_mismatch` | The stored evidence belongs to another target, or to this target as it was declared before. Re-run under this one. |
+| `stale_dependencies`, `stale_proof_environment` | A callee's contract or the prover environment moved. Re-run the proof. |
+| `stale_source` | A file the receipt hashed was edited after the proof. Re-run. Because a receipt records the whole loaded file set, one edit does this to every function. |
+| `unverified_callee` | Fix what `blocking_callees` names first. This propagates through the call chain. |
+| `receipt_does_not_prove_function` | The receipt filed for it came from proving something else. |
+| `proved_under_a_goal_filter` | The run passed `prop`, so it discharged the obligations that filter selected and left the rest unattempted. Re-run without `prop`. |
+| `missing_proof_receipt`, or a status name | No evidence, or a verdict that is not `verified`. |
 
 Emit the JSON from the build system rather than writing it, so it cannot drift
 from the command that decides. A named run is refused rather than quietly
@@ -314,6 +332,14 @@ through `check` the same refusals arrive as a failed WP step inside `wp`, with
 the reason in `incomplete[]`, rather than as a tool error, so read the step
 rather than the absence of an error. Omit
 `verify_profile` to deviate on purpose.
+
+Omitting it does not buy a sandbox proof, though. A sandbox proves an extracted
+copy of the function whose uncontracted callees are stubs, so
+`store_function_conclusion` refuses a sandbox receipt for any function, with or
+without a target named. Merge the annotations back, re-run WP on the main
+project, and store that receipt. The same applies to a receipt that does not
+record which functions WP ran over, or that records some other function: it is
+not evidence about the one it is filed under.
 
 `store_function_conclusion {verify_profile}` is what carries the target into
 the stored verdict, along with the `reproduce` command. Without it a conclusion

@@ -2967,6 +2967,7 @@ impl FramaCMcpServer {
     pub fn tool_router() -> ToolRouter<Self> {
         Self::project_router()
             + Self::analysis_router()
+            + Self::coverage_router()
             + Self::annotations_router()
             + Self::sandbox_router()
             + Self::conclusions_router()
@@ -4300,6 +4301,8 @@ use wpclass::*;
 #[path = "analysis.rs"]
 pub mod analysis;
 use analysis::unproved_assumption_findings;
+#[path = "coverage.rs"]
+pub mod coverage;
 #[path = "annotations.rs"]
 pub mod annotations;
 #[path = "conclusions.rs"]

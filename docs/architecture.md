@@ -25,9 +25,9 @@ The first reload_project starts the main Frama-C process.
 
 | Modules | Responsibilities |
 |---|---|
-| `mcp/*.rs` | 15 tool implementations, one `#[tool_router]` per module, split by domain below |
+| `mcp/*.rs` | 16 tool implementations, one `#[tool_router]` per module, split by domain below |
 | `mcp/server.rs` | Server state, sandbox registry, conclusion persistence, and helpers shared by the tool modules |
-| `mcp/project.rs`, `mcp/analysis.rs`, `mcp/annotations.rs`, `mcp/sandbox.rs`, `mcp/conclusions.rs` | The tool handlers themselves |
+| `mcp/project.rs`, `mcp/analysis.rs`, `mcp/coverage.rs`, `mcp/annotations.rs`, `mcp/sandbox.rs`, `mcp/conclusions.rs` | The tool handlers themselves |
 | `mcp/wpcli.rs` | The four paths that run Frama-C as a command line rather than through the socket, because WP settings are process state |
 | `mcp/eacsl.rs` | E-ACSL instrumentation, compilation, and execution: the only code here that runs the program under analysis |
 | `mcp/receipt.rs` | Proof receipts: source hashes, environment, effective WP configuration, per-goal statuses, and the digest over them |

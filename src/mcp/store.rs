@@ -642,7 +642,7 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
             // never written again.
             let total = conclusion.wp_summary.as_ref().map(|s| s.total).unwrap_or(0);
             let reason = match conclusion.proof_receipt.as_ref() {
-                Some(receipt) => crate::state::proof_receipt_evidence_error(receipt, total),
+                Some(receipt) => crate::state::proof_receipt_evidence_error(receipt, total, &func),
                 None => Some("missing proof_receipt".to_string()),
             };
             if let Some(reason) = reason {

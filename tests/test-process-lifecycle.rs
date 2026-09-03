@@ -16,10 +16,11 @@ use receipt_fixture::fixture_receipt_json as receipt_json;
 /// readable string and assert it back.
 fn receipt_sha(
     label: &str,
+    functions: &[&str],
     environment: serde_json::Value,
     goals: Vec<serde_json::Value>,
 ) -> String {
-    receipt_fixture::fixture_receipt(label, environment, goals)["sha256"]
+    receipt_fixture::fixture_receipt(label, functions, environment, goals)["sha256"]
         .as_str()
         .expect("fixture receipt carries a sha256")
         .to_string()
@@ -756,6 +757,7 @@ const DECLARED_TOOLS: &[&str] = &[
     "inject_all_annotations",
     "list",
     "parse_surface",
+    "proof_coverage",
     "propose_annotations",
     "reload_project",
     "run_e_acsl",
@@ -825,7 +827,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_state_func","status":"verified","notes":"ok","wp_summary":{{"total":1,"valid":1,"unknown":0,"timeout":0,"failed":0,"model":"Typed","timeout_used":1}},"proof_receipt":{receipt},"callees":[]}}"#,
-            receipt = receipt_json("sha-shape", serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
+            receipt = receipt_json("sha-shape", &["shape_state_func"], serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
         ),
     ));
     assert_eq!(payload["stored"], "shape_state_func");
@@ -839,7 +841,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
     assert_eq!(conclusions[0]["wp_summary"]["valid"], 1);
     assert_eq!(
         conclusions[0]["verified_with"]["proof_receipt_sha256"],
-        receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})])
+        receipt_sha("sha-shape", &["shape_state_func"], serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})])
     );
 
     let payload = tool_payload(&mcp.call_tool(
@@ -866,8 +868,8 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
     assert!(payload["callees"].is_array());
     assert!(payload["callee_spec_hashes"].is_object());
     assert!(payload["stale_dependencies"].is_array());
-    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
-    assert_eq!(payload["verified_with"]["proof_receipt_sha256"], receipt_sha("sha-shape", serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
+    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-shape", &["shape_state_func"], serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
+    assert_eq!(payload["verified_with"]["proof_receipt_sha256"], receipt_sha("sha-shape", &["shape_state_func"], serde_json::json!({"frama_c_version": "31.0"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
     assert!(payload.get("proposed_requires").is_none());
     assert!(payload["wp_summary"].is_object());
     assert_eq!(payload["sandbox_clean"], true);
@@ -879,7 +881,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_bad_verified","status":"verified","wp_summary":{{"total":1,"valid":0,"unknown":1,"timeout":0,"failed":0}},"proof_receipt":{receipt}}}"#,
-            receipt = receipt_json("sha-bad", serde_json::from_str(r#"{}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "unknown"}]"#).unwrap())
+            receipt = receipt_json("sha-bad", &["shape_bad_verified"], serde_json::from_str(r#"{}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "unknown"}]"#).unwrap())
         ),
     );
     assert!(resp["error"]["message"]
@@ -908,7 +910,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_callee","status":"verified","specs":[{{"hash_label":"g_old","kind":"spec","acsl":"\\result >= 0","derived_from":"proposed_ensures[0]","source":"generated","purpose":"test"}}],"wp_summary":{{"total":1,"valid":1,"unknown":0,"timeout":0,"failed":0}},"proof_receipt":{receipt},"callees":[]}}"#,
-            receipt = receipt_json("sha-callee", serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
+            receipt = receipt_json("sha-callee", &["shape_callee"], serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
         ),
     ));
     assert_eq!(payload["stored"], "shape_callee");
@@ -916,7 +918,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_caller","status":"verified","wp_summary":{{"total":1,"valid":1,"unknown":0,"timeout":0,"failed":0}},"proof_receipt":{receipt},"callees":["shape_callee"]}}"#,
-            receipt = receipt_json("sha-caller", serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
+            receipt = receipt_json("sha-caller", &["shape_caller"], serde_json::from_str(r#"{"frama_c_version": "31.0"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
         ),
     ));
     assert_eq!(payload["stored"], "shape_caller");
@@ -936,7 +938,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_env_a","status":"verified","wp_summary":{{"total":1,"valid":1,"unknown":0,"timeout":0,"failed":0}},"proof_receipt":{receipt}}}"#,
-            receipt = receipt_json("sha-a", serde_json::from_str(r#"{"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
+            receipt = receipt_json("sha-a", &["shape_env_a"], serde_json::from_str(r#"{"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
         ),
     ));
     assert_eq!(payload["stored"], "shape_env_a");
@@ -944,11 +946,15 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
 
         // The receipt as a JSON string rather than an object, which this tool
-        // also accepts. Same real receipt, escaped into a string value.
+        // also accepts. The same environment as shape_env_a above, which is
+        // what makes storing sha-b below mark that one stale; the receipt names
+        // this function rather than that one, because a receipt is only
+        // evidence about the functions WP ran over.
         &format!(
             r#"{{"function":"shape_env_b","status":"verified","wp_summary":{{"total":1,"valid":1,"unknown":0,"timeout":0,"failed":0}},"proof_receipt":{receipt}}}"#,
             receipt = serde_json::to_string(&receipt_json(
                 "sha-a",
+                &["shape_env_b"],
                 serde_json::json!({"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}),
                 vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]
             ))
@@ -960,7 +966,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         "store_function_conclusion",
         &format!(
             r#"{{"function":"shape_env_b","proof_receipt":{receipt}}}"#,
-            receipt = receipt_json("sha-b", serde_json::from_str(r#"{"frama_c_version": "32.0", "why3_provers": "Alt-Ergo"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
+            receipt = receipt_json("sha-b", &["shape_env_b"], serde_json::from_str(r#"{"frama_c_version": "32.0", "why3_provers": "Alt-Ergo"}"#).unwrap(), serde_json::from_str(r#"[{"stable_goal_id": "g0", "status": "valid"}]"#).unwrap())
         ),
     ));
     assert_eq!(payload["stored"], "shape_env_b");
@@ -969,7 +975,7 @@ fn function_conclusion_store_list_get_shapes_over_stdio() {
         r#"{"kind":"conclusions","function":"shape_env_a"}"#,
     ));
     assert_eq!(payload["status"], "in_progress");
-    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-a", serde_json::json!({"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
+    assert_eq!(payload["proof_receipt"]["sha256"], receipt_sha("sha-a", &["shape_env_a"], serde_json::json!({"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"}), vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})]));
     assert!(payload["proof_env_hash"].as_str().is_some());
     assert!(payload["stale_proof_environment"]["current_env_hash"].as_str().is_some());
 }
@@ -1787,6 +1793,15 @@ fn self_check_reports_missing_frama_c_over_stdio() {
         .expect("required_requests")
         .iter()
         .all(|r| r["status"] == "not_probed"));
+}
+
+#[test]
+fn proof_coverage_is_available_without_starting_framac() {
+    let mut mcp = McpHandle::spawn_test_binary_with_frama_c("__frama_c_mcp_missing_binary__");
+    let payload = tool_payload(&mcp.call_tool("proof_coverage", "{}"));
+    assert_eq!(payload["schema"], "frama-c-mcp.proof-coverage.v1");
+    assert_eq!(payload["function_coverage"]["total"], 0);
+    assert_eq!(payload["goal_coverage"]["total"], 0);
 }
 
 #[test]

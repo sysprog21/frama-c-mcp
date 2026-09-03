@@ -74,12 +74,15 @@ pub fn profile_evidence_error(
         ));
     }
     if let Some(receipt) = receipt {
-        let expected_load = serde_json::json!({
-            "include_paths": profile.include_paths,
-            "defines": profile.defines,
-            "force_includes": profile.force_includes,
-            "machdep": profile.machdep,
-            "compilation_database": null,
+        // Built through the same spelling the receipt writes, so a field added
+        // to the identity reaches this comparison rather than silently making
+        // every receipt look different from every target.
+        let expected_load = super::receipt::project_load_identity(&super::ProjectLoadOptions {
+            include_paths: profile.include_paths.clone(),
+            defines: profile.defines.clone(),
+            force_includes: profile.force_includes.clone(),
+            machdep: profile.machdep.clone(),
+            compilation_database: None,
         });
         if receipt.pointer("/subject/project_load") != Some(&expected_load) {
             return Some(format!(

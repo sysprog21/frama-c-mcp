@@ -15,6 +15,8 @@ mod receipt_fixture;
 mod acsl_shapes;
 #[path = "unit/check-gaps.rs"]
 mod check_gaps;
+#[path = "unit/coverage.rs"]
+mod coverage;
 #[path = "unit/repo-guards.rs"]
 mod repo_guards;
 #[path = "unit/wp-classify.rs"]
