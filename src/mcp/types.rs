@@ -517,6 +517,19 @@ pub struct GetWpGoalsParams {
     pub since: Option<String>,
 }
 
+/// Summarise the proof evidence stored for the loaded program or one declared
+/// verification target.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProofCoverageParams {
+    /// Restrict coverage to this build-system verification target. Its declared
+    /// function set is the denominator, and only conclusions recorded for this
+    /// same target count as covered.
+    pub verify_profile: Option<String>,
+    /// "summary" (default) lists functions without current verified evidence;
+    /// "full" lists every target function.
+    pub detail: Option<Detail>,
+}
+
 /// Which analyses one call to check should run.
 ///
 /// Every variant carries a plain comment rather than a doc comment, for the

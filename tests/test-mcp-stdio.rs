@@ -77,7 +77,81 @@ fn verified_conclusion_payload(function: &str) -> Value {
     })
 }
 
+#[tokio::test]
+async fn proof_coverage_lists_unrecorded_loaded_functions() {
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let report = call_tool_json(&client, "proof_coverage", json!({"detail": "full"}))
+        .await
+        .expect("proof coverage report");
+    assert_eq!(report["schema"], "frama-c-mcp.proof-coverage.v1");
+    assert!(report["function_coverage"]["total"].as_u64().unwrap_or_default() > 0);
+    assert!(report["functions"]
+        .as_array()
+        .is_some_and(|functions| functions.iter().all(|function| function["reason"] == "missing_conclusion")));
+    let _ = client.cancel().await;
+}
 
+#[tokio::test]
+async fn a_stored_conclusion_survives_a_reload_and_reports_why_it_may_not_count() {
+    // reload_project is the mandatory first call of every documented workflow,
+    // so a reload that dropped conclusions made .frama-c-mcp/ write-only: the
+    // startup restore runs once and nothing else reads the store back. It also
+    // collapsed every staleness answer proof_coverage can give into
+    // missing_conclusion, which is the one answer that cannot be checked.
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let functions = call_tool_json(&client, "list", json!({"kind": "functions"}))
+        .await
+        .expect("function list");
+    let target = functions
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .find_map(|function| function["name"].as_str())
+        .expect("a function to file a conclusion under")
+        .to_string();
+
+    let _ = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": target, "status": "in_progress", "notes": "before the reload"}),
+    )
+    .await
+    .expect("store a conclusion");
+
+    let _ = call_tool_json(&client, "reload_project", json!({}))
+        .await
+        .expect("reload");
+
+    let kept = call_tool_json(
+        &client,
+        "list",
+        json!({"kind": "conclusions", "function": target}),
+    )
+    .await
+    .expect("the conclusion is still readable after the reload");
+    assert_eq!(kept["notes"], "before the reload");
+
+    // The second half of the claim, and the reason keeping it is safe: coverage
+    // says why the kept verdict does not count, from the conclusion itself,
+    // rather than reporting the function as one nothing was ever stored for.
+    let report = call_tool_json(&client, "proof_coverage", json!({"detail": "full"}))
+        .await
+        .expect("coverage report");
+    let row = report["functions"]
+        .as_array()
+        .expect("function rows")
+        .iter()
+        .find(|row| row["function"] == target.as_str())
+        .unwrap_or_else(|| panic!("no row for {target}: {report}"));
+    assert_eq!(row["covered"], false);
+    assert_eq!(
+        row["reason"], "in_progress",
+        "a kept conclusion reports its own status, not missing_conclusion: {row}"
+    );
+    let _ = client.cancel().await;
+}
 
 /// Spawn the MCP server directly (lazy mode, Issue #95) and connect over stdio.
 ///
@@ -4676,6 +4750,32 @@ async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
     assert!(
         text.contains("frama-c-mcp.proof-receipt"),
         "and it must be the receipt object, not the bare hash: {text}"
+    );
+
+    // And coverage counts it. This is the whole claim of proof_coverage and
+    // nothing exercised it end to end: every other test builds receipts by
+    // hand, whose project_load is an empty object, so a comparison against the
+    // live load that was wrong for real receipts would have left every
+    // conclusion reporting different_project and every report reading zero,
+    // with the whole suite still green.
+    let report = call_tool_json(&client, "proof_coverage", json!({"detail": "full"}))
+        .await
+        .expect("coverage report");
+    let row = report["functions"]
+        .as_array()
+        .expect("function rows")
+        .iter()
+        .find(|row| row["function"] == "abs_int")
+        .unwrap_or_else(|| panic!("no row for abs_int: {report}"));
+    assert_eq!(
+        row["covered"], true,
+        "a conclusion stored from this session's own run_wp receipt must count: {row}"
+    );
+    assert_eq!(row["reason"], serde_json::Value::Null, "{row}");
+    assert_eq!(row["proof_receipt_sha256"], sha.as_str());
+    assert!(
+        report["goal_coverage"]["total"].as_u64().unwrap_or_default() >= 1,
+        "its goals belong to the denominator: {report}"
     );
 
     let _ = client.cancel().await;

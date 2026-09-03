@@ -757,6 +757,7 @@ const DECLARED_TOOLS: &[&str] = &[
     "inject_all_annotations",
     "list",
     "parse_surface",
+    "proof_coverage",
     "propose_annotations",
     "reload_project",
     "run_e_acsl",
@@ -1794,6 +1795,14 @@ fn self_check_reports_missing_frama_c_over_stdio() {
         .all(|r| r["status"] == "not_probed"));
 }
 
+#[test]
+fn proof_coverage_is_available_without_starting_framac() {
+    let mut mcp = McpHandle::spawn_test_binary_with_frama_c("__frama_c_mcp_missing_binary__");
+    let payload = tool_payload(&mcp.call_tool("proof_coverage", "{}"));
+    assert_eq!(payload["schema"], "frama-c-mcp.proof-coverage.v1");
+    assert_eq!(payload["function_coverage"]["total"], 0);
+    assert_eq!(payload["goal_coverage"]["total"], 0);
+}
 
 #[test]
 fn self_check_reports_capabilities_over_stdio() {
