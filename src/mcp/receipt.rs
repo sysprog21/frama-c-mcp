@@ -31,6 +31,24 @@ pub fn receipt_source_path(file: &str) -> String {
     }
 }
 
+/// The preprocessor and target settings a load was made under, as the receipt
+/// records them.
+///
+/// One spelling, because three places ask the same question and a fourth would
+/// have made it four: the receipt writes it, profile_evidence_error compares a
+/// target's declared settings against it, and proof_coverage compares the load
+/// that is current now. A receipt is only evidence about the program it was
+/// produced over, and these are the settings that decide which program that is.
+pub fn project_load_identity(options: &super::ProjectLoadOptions) -> serde_json::Value {
+    json!({
+        "include_paths": options.include_paths,
+        "defines": options.defines,
+        "force_includes": options.force_includes,
+        "machdep": options.machdep,
+        "compilation_database": options.compilation_database,
+    })
+}
+
 fn proof_receipt_source_files(files: &[String]) -> Vec<serde_json::Value> {
     let mut entries = files
         .iter()
@@ -762,15 +780,7 @@ impl FramaCMcpServer {
             .await
             .as_ref()
             .filter(|state| state.files == source_files)
-            .map(|state| {
-                json!({
-                    "include_paths": state.project_options.include_paths,
-                    "defines": state.project_options.defines,
-                    "force_includes": state.project_options.force_includes,
-                    "machdep": state.project_options.machdep,
-                    "compilation_database": state.project_options.compilation_database,
-                })
-            })
+            .map(|state| project_load_identity(&state.project_options))
             .unwrap_or(serde_json::Value::Null);
         let receipt = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool,
