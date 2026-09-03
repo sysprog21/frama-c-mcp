@@ -38,9 +38,10 @@ fn valid_wp_summary() -> WpGoalSummary {
 }
 
 /// A receipt shaped the way this build writes them.
-fn proof_receipt() -> serde_json::Value {
+fn proof_receipt(function: &str) -> serde_json::Value {
     receipt_fixture::fixture_receipt(
         "receipt-sha",
+        &[function],
         serde_json::json!({"frama_c_version": "31.0"}),
         vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
     )
@@ -77,11 +78,11 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     // real name rather than spelled out, so the case stays about "not ours"
     // instead of naming a version to point at.
     write("stale", {
-        let mut receipt = proof_receipt();
+        let mut receipt = proof_receipt("stale");
         receipt["schema"] = serde_json::json!(format!("{RECEIPT_SCHEMA}-from-another-build"));
         receipt
     });
-    write("current", proof_receipt());
+    write("current", proof_receipt("current"));
 
     // A receipt with this build's field set and nothing believable in it. The
     // loader used to check the name and the shape only, so this loaded as
@@ -97,14 +98,16 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     // Bound before writing, so the reason asserted below is the reason for
     // these exact bytes rather than for a similar receipt built beside them.
     let env = || serde_json::json!({"frama_c_version": "31.0"});
-    let hollow = receipt_fixture::fixture_receipt("hollow", env(), vec![]);
+    let hollow = receipt_fixture::fixture_receipt("hollow", &["hollow"], env(), vec![]);
     let wrong_status = receipt_fixture::fixture_receipt(
         "wrong_status",
+        &["wrong_status"],
         env(),
         vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
     );
     let wrong_count = receipt_fixture::fixture_receipt(
         "wrong_count",
+        &["wrong_count"],
         env(),
         vec![serde_json::json!({"stable_goal_id": "g0", "status": "valid"})],
     );
@@ -114,6 +117,7 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
         "wrong_status",
         receipt_fixture::fixture_receipt(
             "wrong_status",
+            &["wrong_status"],
             env(),
             vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
         ),
@@ -147,11 +151,11 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     // wp_summary above says one goal, which is what makes the counts
     // meaningful.
     assert_eq!(
-        proof_receipt_evidence_error(&hollow, 1).as_deref(),
+        proof_receipt_evidence_error(&hollow, 1, "hollow").as_deref(),
         Some("proof_receipt has no goals")
     );
     assert_eq!(
-        proof_receipt_evidence_error(&wrong_status, 1).as_deref(),
+        proof_receipt_evidence_error(&wrong_status, 1, "wrong_status").as_deref(),
         Some("proof_receipt goals are not all valid")
     );
 
@@ -159,12 +163,12 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     // wp_summary disagrees with its own receipt is a different defect from the
     // two above. It is named here so the branch is not the only one untested.
     assert_eq!(
-        proof_receipt_evidence_error(&wrong_count, 2).as_deref(),
+        proof_receipt_evidence_error(&wrong_count, 2, "wrong_count").as_deref(),
         Some("proof_receipt goal count does not match wp_summary")
     );
 
     // And the receipt this build did write passes every one of them.
-    assert_eq!(proof_receipt_evidence_error(&proof_receipt(), 1), None);
+    assert_eq!(proof_receipt_evidence_error(&proof_receipt("current"), 1, "current"), None);
 
     // A receipt this build did write is untouched.
     let current = loaded.get("current").expect("current conclusion loads");
@@ -208,7 +212,7 @@ fn persist_does_not_touch_long_text() {
         status: Some(VerificationStatus::Verified),
         notes: Some("hello".into()),
         wp_summary: Some(valid_wp_summary()),
-        proof_receipt: Some(proof_receipt()),
+        proof_receipt: Some(proof_receipt(func)),
         ..Default::default()
     }).unwrap();
 
@@ -254,7 +258,7 @@ fn legacy_json_ignored() {
         function: "bar".into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary()),
-        proof_receipt: Some(proof_receipt()),
+        proof_receipt: Some(proof_receipt("bar")),
         ..Default::default()
     }).unwrap();
     persist_conclusion_at(tmp.path(), "bar", state.get_conclusion("bar").unwrap()).unwrap();
@@ -282,7 +286,7 @@ fn meta_json_excludes_long_text_keys_manifest_only_existing() {
         function: func.into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary()),
-        proof_receipt: Some(proof_receipt()),
+        proof_receipt: Some(proof_receipt(func)),
         ..Default::default()
     }).unwrap();
     persist_conclusion_at(tmp.path(), func, state.get_conclusion(func).unwrap()).unwrap();
@@ -333,7 +337,7 @@ fn handler_workflow_long_plus_short() {
         status: Some(VerificationStatus::Verified),
         notes: Some("ok".into()),
         wp_summary: Some(valid_wp_summary()),
-        proof_receipt: Some(proof_receipt()),
+        proof_receipt: Some(proof_receipt(func)),
         ..Default::default()
     }).unwrap();
 
@@ -347,7 +351,7 @@ fn handler_workflow_long_plus_short() {
     // recomputes it and refuses a receipt that disagrees with itself.
     assert_eq!(
         loaded.proof_receipt.as_ref().unwrap()["sha256"],
-        proof_receipt()["sha256"]
+        proof_receipt(func)["sha256"]
     );
     assert!(loaded.proof_env_hash.is_some());
 
@@ -382,7 +386,7 @@ fn traversing_function_name_cannot_escape_base_dir() {
             function: "victim".into(),
             status: Some(VerificationStatus::Verified),
             wp_summary: Some(valid_wp_summary()),
-            proof_receipt: Some(proof_receipt()),
+            proof_receipt: Some(proof_receipt("victim")),
             ..Default::default()
         })
         .unwrap();

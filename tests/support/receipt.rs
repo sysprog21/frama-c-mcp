@@ -27,8 +27,15 @@ use frama_c_mcp::mcp::server::receipt::{
 /// The label reaches the body through the source file name, so two fixtures
 /// that differ only by label still get different hashes and the tests that tell
 /// two conclusions apart by their receipt keep working.
+///
+/// "functions" names what WP ran over, because a receipt this build writes
+/// always records it: wp_config is the run's effective configuration and both
+/// builders of one name the functions. A fixture that omitted it modelled a
+/// receipt no run produces, which is the drift this file exists to prevent, and
+/// it hid the check that a receipt has to name the function it is filed under.
 pub fn fixture_receipt(
     label: &str,
+    functions: &[&str],
     environment: serde_json::Value,
     goals: Vec<serde_json::Value>,
 ) -> serde_json::Value {
@@ -40,7 +47,7 @@ pub fn fixture_receipt(
         ast_digest_unavailable_reason: serde_json::json!(null),
         contracts: serde_json::json!({}),
         environment,
-        wp_config: serde_json::json!({}),
+        wp_config: serde_json::json!({"functions": functions}),
         eva_config: serde_json::json!({}),
         goals,
         goals_status_source: "wp_fetch_goals",
@@ -51,8 +58,9 @@ pub fn fixture_receipt(
 /// The same receipt as a compact JSON string, for payloads built as raw text.
 pub fn fixture_receipt_json(
     label: &str,
+    functions: &[&str],
     environment: serde_json::Value,
     goals: Vec<serde_json::Value>,
 ) -> String {
-    serde_json::to_string(&fixture_receipt(label, environment, goals)).unwrap()
+    serde_json::to_string(&fixture_receipt(label, functions, environment, goals)).unwrap()
 }

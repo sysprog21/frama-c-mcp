@@ -23,6 +23,7 @@ use crate::mcp::server::receipt::RECEIPT_SCHEMA;
 pub fn proof_receipt_evidence_error(
     receipt: &serde_json::Value,
     goal_total: u32,
+    function: &str,
 ) -> Option<String> {
     let schema = receipt.get("schema").and_then(|v| v.as_str());
     let shape = crate::mcp::server::receipt::schema_of(receipt);
@@ -88,6 +89,46 @@ pub fn proof_receipt_evidence_error(
         .any(|goal| goal.get("status").and_then(|v| v.as_str()) != Some("valid"))
     {
         return Some("proof_receipt goals are not all valid".to_string());
+    }
+
+    // A sandbox proves an extracted copy of the function whose uncontracted
+    // callees are stubs, so it is a proof about a different program and never
+    // evidence for a main-project conclusion. run_wp refuses a profile-named
+    // run in a sandbox outright, so no sandbox receipt ever carries a profile
+    // and the profile path never had to ask; without one there was no check at
+    // all, and the rule held only by accident of the prefixed names below
+    // failing to match, which reported the refusal as a function nobody can
+    // find. The scope is recorded; read it and say what is actually wrong.
+    if receipt.pointer("/wp/scope").and_then(|v| v.as_str()) == Some("sandbox") {
+        return Some(
+            "proof_receipt comes from a sandbox, which proves an extracted copy with stubbed \
+             callees rather than this program. Merge the annotations back and re-run WP on the \
+             main project, then store that receipt."
+                .to_string(),
+        );
+    }
+
+    // Which functions WP ran over, and this must be one of them. Nothing tied a
+    // receipt to the conclusion it supported: the goal count matched
+    // wp_summary, every goal was valid, and one run could therefore be filed as
+    // evidence for any number of functions it never proved.
+    //
+    // Required rather than checked when present. Every receipt this build
+    // writes with goals in it carries the list, because wp_config is the run's
+    // effective configuration and both builders of one name the functions; a
+    // receipt that reached here without it did not come from a WP run this
+    // build made.
+    let Some(names) = receipt.pointer("/wp/functions").and_then(|v| v.as_array()) else {
+        return Some("proof_receipt does not record which functions WP ran over".to_string());
+    };
+    if !names.iter().any(|name| name.as_str() == Some(function)) {
+        return Some(format!(
+            "proof_receipt proves {:?}, not {function}",
+            names
+                .iter()
+                .filter_map(|name| name.as_str())
+                .collect::<Vec<_>>()
+        ));
     }
     None
 }
@@ -1133,7 +1174,8 @@ impl SessionState {
         // server never wrote must not be storable as evidence", and checking
         // the name alone did not do it: a hand-assembled four-key object
         // wearing the right name stored fine.
-        if let Some(reason) = proof_receipt_evidence_error(receipt, summary.total) {
+        if let Some(reason) = proof_receipt_evidence_error(receipt, summary.total, &entry.function)
+        {
             return Err(format!(
                 "cannot store verified conclusion for '{}': {reason}",
                 entry.function

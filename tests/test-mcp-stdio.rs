@@ -70,11 +70,14 @@ fn verified_conclusion_payload(function: &str) -> Value {
         "wp_summary": {"total": 1, "valid": 1, "unknown": 0, "timeout": 0, "failed": 0},
         "proof_receipt": receipt_fixture::fixture_receipt(
             &format!("sha-{function}"),
+            &[function],
             json!({"frama_c_version": "test"}),
             vec![json!({"stable_goal_id": "g0", "status": "valid"})],
         )
     })
 }
+
+
 
 /// Spawn the MCP server directly (lazy mode, Issue #95) and connect over stdio.
 ///

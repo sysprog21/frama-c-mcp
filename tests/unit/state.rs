@@ -94,19 +94,20 @@ fn valid_wp_summary(total: u32) -> WpGoalSummary {
 }
 
 /// A receipt shaped the way this build writes them.
-fn proof_receipt_with_goals(env: &str, total: u32) -> serde_json::Value {
+fn proof_receipt_with_goals(env: &str, function: &str, total: u32) -> serde_json::Value {
     let goals: Vec<_> = (0..total)
         .map(|i| serde_json::json!({"stable_goal_id": format!("g{i}"), "status": "valid"}))
         .collect();
     crate::receipt_fixture::fixture_receipt(
         &format!("sha-{env}"),
+        &[function],
         serde_json::json!({"frama_c_version": env, "why3_provers": "Alt-Ergo"}),
         goals,
     )
 }
 
-fn proof_receipt(env: &str) -> serde_json::Value {
-    proof_receipt_with_goals(env, 1)
+fn proof_receipt(env: &str, function: &str) -> serde_json::Value {
+    proof_receipt_with_goals(env, function, 1)
 }
 
 #[test]
@@ -313,7 +314,7 @@ fn store_and_get_conclusion() {
         }]),
         notes: None,
         wp_summary: Some(valid_wp_summary(3)),
-        proof_receipt: Some(proof_receipt_with_goals("env-a", 3)),
+        proof_receipt: Some(proof_receipt_with_goals("env-a", "abs", 3)),
         ..Default::default()
     }).unwrap();
     let c = state.get_conclusion("abs").unwrap();
@@ -353,7 +354,7 @@ fn upsert_preserves_none_fields() {
         specs: None,
         notes: None,
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "f")),
         ..Default::default()
     }).unwrap();
     let c = state.get_conclusion("f").unwrap();
@@ -375,7 +376,7 @@ fn list_conclusions_filter() {
             specs: None,
             notes: None,
             wp_summary: if verified { Some(valid_wp_summary(1)) } else { None },
-            proof_receipt: if verified { Some(proof_receipt("env-a")) } else { None },
+            proof_receipt: if verified { Some(proof_receipt("env-a", name)) } else { None },
             ..Default::default()
         }).unwrap();
     }
@@ -557,7 +558,7 @@ fn round_trip_reachable_conclusion_fields() {
         wp_summary: Some(valid_wp_summary(1)),
         notes: Some("ok".into()),
         callees: Some(vec!["g".into(), "h".into()]),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "F")),
         verify_profile: None,
         reproduce: None,
     }).unwrap();
@@ -573,7 +574,7 @@ fn round_trip_reachable_conclusion_fields() {
     // fixture carries the real one and the assertion has to ask the receipt.
     assert_eq!(
         stored.proof_receipt.as_ref().unwrap()["sha256"],
-        proof_receipt("env-a")["sha256"]
+        proof_receipt("env-a", "F")["sha256"]
     );
     assert!(stored.proof_env_hash.is_some());
 
@@ -611,6 +612,7 @@ fn verified_requires_auditable_proof_evidence() {
         // first and this case would pass for the wrong reason.
         proof_receipt: Some(crate::receipt_fixture::fixture_receipt(
             "bad",
+            &["F"],
             serde_json::json!({"frama_c_version": "env-a"}),
             vec![serde_json::json!({"stable_goal_id": "g0", "status": "unknown"})],
         )),
@@ -622,7 +624,7 @@ fn verified_requires_auditable_proof_evidence() {
         function: "F".into(),
         status: Some(VerificationStatus::Verified),
         wp_summary: Some(valid_wp_summary(2)),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "F")),
         ..Default::default()
     });
     assert!(mismatched_summary.unwrap_err().contains("goal count"));
@@ -630,7 +632,7 @@ fn verified_requires_auditable_proof_evidence() {
 
     // The one version this build writes, taken from the constant the writer
     // uses, so a bump cannot make the writer and this test disagree.
-    let mut receipt = proof_receipt("env-a");
+    let mut receipt = proof_receipt("env-a", "F");
     receipt["schema"] = serde_json::json!(RECEIPT_SCHEMA);
     state
         .store_conclusion(FunctionConclusionUpdate {
@@ -688,7 +690,7 @@ fn verified_requires_auditable_proof_evidence() {
         serde_json::json!(""),
         serde_json::json!(null),
     ] {
-        let mut receipt = proof_receipt("env-a");
+        let mut receipt = proof_receipt("env-a", "G");
         receipt["schema"] = version.clone();
         let stored = state.store_conclusion(FunctionConclusionUpdate {
             function: "G".into(),
@@ -758,7 +760,7 @@ fn proof_receipt_environment_change_flags_and_refresh_clears_stale() {
             function: function.into(),
             status: Some(VerificationStatus::Verified),
             wp_summary: Some(valid_wp_summary(1)),
-            proof_receipt: Some(proof_receipt("env-a")),
+            proof_receipt: Some(proof_receipt("env-a", function)),
             ..Default::default()
         }).unwrap();
     }
@@ -766,7 +768,7 @@ fn proof_receipt_environment_change_flags_and_refresh_clears_stale() {
     let recorded_env_hash = state.get_conclusion("F").unwrap().proof_env_hash.clone().unwrap();
     state.store_conclusion(FunctionConclusionUpdate {
         function: "G".into(),
-        proof_receipt: Some(proof_receipt("env-b")),
+        proof_receipt: Some(proof_receipt("env-b", "G")),
         ..Default::default()
     }).expect("store_conclusion");
 
@@ -778,7 +780,7 @@ fn proof_receipt_environment_change_flags_and_refresh_clears_stale() {
 
     state.store_conclusion(FunctionConclusionUpdate {
         function: "F".into(),
-        proof_receipt: Some(proof_receipt("env-b")),
+        proof_receipt: Some(proof_receipt("env-b", "F")),
         ..Default::default()
     }).expect("store_conclusion");
     assert!(state.get_conclusion("F").unwrap().stale_proof_environment.is_none());
@@ -792,7 +794,7 @@ fn callee_spec_change_flags_and_refresh_clears_stale_dependency() {
         status: Some(VerificationStatus::Verified),
         specs: Some(vec![generated_spec("g_old", "\\result >= 0")]),
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "G")),
         ..Default::default()
     }).unwrap();
     state.store_conclusion(FunctionConclusionUpdate {
@@ -800,7 +802,7 @@ fn callee_spec_change_flags_and_refresh_clears_stale_dependency() {
         status: Some(VerificationStatus::Verified),
         callees: Some(vec!["G".into()]),
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "F")),
         ..Default::default()
     }).unwrap();
 
@@ -1148,7 +1150,7 @@ fn annotation_count_unchanged_when_specs_none() {
         status: Some(VerificationStatus::Verified),
         specs: None, // Do not update specs
         wp_summary: Some(valid_wp_summary(1)),
-        proof_receipt: Some(proof_receipt("env-a")),
+        proof_receipt: Some(proof_receipt("env-a", "f")),
         ..Default::default()
     }).unwrap();
     let c = state.get_conclusion("f").unwrap();
@@ -1510,4 +1512,160 @@ fn a_conclusion_written_before_profiles_still_loads() {
     assert_eq!(loaded.function, "swap");
     assert_eq!(loaded.verify_profile, None);
     assert_eq!(loaded.reproduce, None);
+}
+
+#[test]
+fn a_receipt_that_proves_another_function_is_not_this_one_s_evidence() {
+    // profile_evidence_error asks this, and only when a verify_profile is in
+    // play. Without one, a receipt from proving "g" satisfied every other check
+    // when filed under "f": the goal count matched wp_summary, every goal was
+    // valid, and nothing tied the receipt to the function it was stored for.
+    let receipt = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
+        frama_c_mcp::mcp::server::receipt::proof_receipt_body(
+            frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
+                tool: "run_wp",
+                source_files: vec![json!({"path": "g.c", "sha256": "h"})],
+                project_load: json!({}),
+                ast_digest: json!("ast"),
+                ast_digest_unavailable_reason: json!(null),
+                contracts: json!({}),
+                environment: json!({"frama_c_version": "33.0"}),
+                wp_config: json!({"functions": ["g"]}),
+                eva_config: json!({}),
+                goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+                goals_status_source: "wp_fetch_goals",
+                reported: json!({}),
+            },
+        ),
+    );
+    let mut state = SessionState::default();
+    let error = state
+        .store_conclusion(FunctionConclusionUpdate {
+            function: "f".into(),
+            status: Some(VerificationStatus::Verified),
+            wp_summary: Some(valid_wp_summary(1)),
+            proof_receipt: Some(receipt.clone()),
+            ..Default::default()
+        })
+        .expect_err("a receipt proving g is not evidence about f");
+    assert!(error.contains("proves"), "unexpected refusal: {error}");
+
+    // And the same receipt still stores for the function it does prove.
+    state
+        .store_conclusion(FunctionConclusionUpdate {
+            function: "g".into(),
+            status: Some(VerificationStatus::Verified),
+            wp_summary: Some(valid_wp_summary(1)),
+            proof_receipt: Some(receipt),
+            ..Default::default()
+        })
+        .expect("store_conclusion for the function the receipt names");
+}
+
+#[test]
+fn a_receipt_recording_no_functions_is_refused_and_the_loader_agrees() {
+    // The check lives in proof_receipt_evidence_error rather than beside the
+    // store path, because the loader calls that predicate and not
+    // validate_verified_conclusion. A copy in the store path alone would let a
+    // conclusion load as verified and then never be storable again, which is
+    // the divergence store.rs was rewritten to remove. Built through the
+    // receipt builder with an empty wp config, which is what an older build of
+    // this server wrote. A hand-assembled object would fail the shape and hash
+    // checks first and never reach the branch under test.
+    let anonymous = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
+        frama_c_mcp::mcp::server::receipt::proof_receipt_body(
+            frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
+                tool: "run_wp",
+                source_files: vec![json!({"path": "anon.c", "sha256": "h"})],
+                project_load: json!({}),
+                ast_digest: json!("ast"),
+                ast_digest_unavailable_reason: json!(null),
+                contracts: json!({}),
+                environment: json!({"frama_c_version": "33.0"}),
+                wp_config: json!({}),
+                eva_config: json!({}),
+                goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+                goals_status_source: "wp_fetch_goals",
+                reported: json!({}),
+            },
+        ),
+    );
+    assert_eq!(
+        proof_receipt_evidence_error(&anonymous, 1, "f").as_deref(),
+        Some("proof_receipt does not record which functions WP ran over")
+    );
+
+    // An empty list is refused too, by the branch that names what it proves.
+    let empty = crate::receipt_fixture::fixture_receipt(
+        "anon",
+        &[],
+        json!({"frama_c_version": "33.0"}),
+        vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+    );
+    assert_eq!(
+        proof_receipt_evidence_error(&empty, 1, "f").as_deref(),
+        Some("proof_receipt proves [], not f")
+    );
+
+    let elsewhere = crate::receipt_fixture::fixture_receipt(
+        "elsewhere",
+        &["g"],
+        json!({"frama_c_version": "33.0"}),
+        vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+    );
+    assert!(proof_receipt_evidence_error(&elsewhere, 1, "f")
+        .is_some_and(|reason| reason.contains("proves") && reason.contains("not f")));
+    assert_eq!(proof_receipt_evidence_error(&elsewhere, 1, "g"), None);
+
+    // And the store path answers the same way, through the same predicate.
+    let mut state = SessionState::default();
+    let error = state
+        .store_conclusion(FunctionConclusionUpdate {
+            function: "f".into(),
+            status: Some(VerificationStatus::Verified),
+            wp_summary: Some(valid_wp_summary(1)),
+            proof_receipt: Some(elsewhere),
+            ..Default::default()
+        })
+        .expect_err("a receipt proving g is not evidence about f");
+    assert!(error.contains("not f"), "unexpected refusal: {error}");
+}
+
+#[test]
+fn a_sandbox_receipt_is_never_evidence_for_a_main_project_conclusion() {
+    // A sandbox extracts the function with stubbed uncontracted callees, so its
+    // proof is about a different program. run_wp refuses a profile-named run in
+    // a sandbox, so the profile path never had to ask this; without a profile
+    // there was no check, and once receipts had to name their function the rule
+    // held only because sandbox names carry a prefix, which reported the
+    // refusal as a function nobody can find.
+    let sandboxed = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
+        frama_c_mcp::mcp::server::receipt::proof_receipt_body(
+            frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
+                tool: "run_wp",
+                source_files: vec![json!({"path": "sandbox.c", "sha256": "h"})],
+                project_load: json!({}),
+                ast_digest: json!("ast"),
+                ast_digest_unavailable_reason: json!(null),
+                contracts: json!({}),
+                environment: json!({"frama_c_version": "33.0"}),
+
+                // Both as the sandbox path writes them: the scope it ran under,
+                // and the caller's prefixed names.
+                wp_config: json!({"scope": "sandbox", "functions": ["exp42:f"]}),
+                eva_config: json!({}),
+                goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+                goals_status_source: "wp_fetch_goals",
+                reported: json!({}),
+            },
+        ),
+    );
+
+    // Refused for the reason that is true, not for the prefix that happens to
+    // differ, and refused under the sandbox's own name for the function too.
+    for function in ["f", "exp42:f"] {
+        let reason = proof_receipt_evidence_error(&sandboxed, 1, function)
+            .expect("a sandbox receipt is not evidence about the main project");
+        assert!(reason.contains("sandbox"), "unexpected refusal: {reason}");
+    }
 }
