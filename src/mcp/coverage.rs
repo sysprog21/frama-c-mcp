@@ -632,6 +632,7 @@ pub fn proof_coverage_report(
             "A source file a receipt named but that cannot be read now is counted under unchecked_sources rather than judged, so evidence from a deleted sandbox is reported as unverifiable rather than as unchanged.",
             "Functions this project declares without defining are listed under scope.declared_not_defined and are outside both denominators.",
             "WP only. EVA alarms are not read here, so a complete verdict is a statement about proof obligations rather than about every analysis this server can run.",
+            "A target's own command may run checks this server does not, such as a floor on obligations generated or a separate script over the same sources. A profile declares them under build_gates and coverage does not run them, so complete here is not the build's verdict. The list is the profile author's declaration rather than anything this server can verify, so an empty one means none were declared, not that none exist.",
             "Whether a covered function declares an assigns clause is not checked, because the conclusion's specs are supplied by the caller and may be absent for a function that has one.",
         ],
     })

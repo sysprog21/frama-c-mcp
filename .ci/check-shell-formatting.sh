@@ -34,8 +34,8 @@
 # restoration.
 set -euo pipefail
 
-curl -sSfL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64
-echo "fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1  /tmp/shfmt" | sha256sum -c -
+curl -sSfL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.14.0/shfmt_v3.14.0_linux_amd64
+echo "fe42021c7272ef2d67ea36cbc3031683c625d0badec733ef3a57b567246a0b66  /tmp/shfmt" | sha256sum -c -
 chmod +x /tmp/shfmt
 
 git ls-files -z '*.sh' '*.hook' | xargs -0 /tmp/shfmt -d

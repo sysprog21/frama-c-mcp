@@ -67,9 +67,10 @@ fn classify_failure_reason(
     goal_kind: &str,
     name: &str,
     text: &str,
+    from_cache: bool,
     push_evidence: &mut impl FnMut(&str, serde_json::Value),
 ) -> (&'static str, &'static str, &'static str) {
-    if crate::mcp::status::status_is_timeout(normalized_status)
+    let classification = if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
         push_evidence("normalized_status", json!(normalized_status));
@@ -280,6 +281,21 @@ fn classify_failure_reason(
             "low",
             "Inspect the VC details before changing annotations.",
         )
+    };
+
+    if from_cache {
+        push_evidence("from_cache", json!(true));
+
+        // Scored down here and explained in wp_timeout_triage, which is the
+        // per-goal field a caller already reads for "why is this verdict weak".
+        // Appending the sentence to the reason instead cost 471 bytes on every
+        // classified goal, twice, and for a replayed timeout it was duplicating
+        // a string the same payload already carried; the stdio payload budget
+        // caught it. A constant repeated per goal belongs in neither half of a
+        // split classification.
+        (classification.0, "low", classification.2)
+    } else {
+        classification
     }
 }
 
@@ -323,6 +339,7 @@ pub fn classify_wp_failure_from_goal(
         goal_kind,
         name,
         &text,
+        goal_is_from_cache(goal),
         &mut push_evidence,
     );
     let failure_kind = wp_failure_kind(category, triage_kind);
@@ -736,19 +753,7 @@ fn proofread_finding_from_wp_failure(
     // name is the only field left that points a reader at the code. Reading it
     // from the run target instead left findings rendering as "unknown:?" with
     // an empty function, which names nothing.
-    //
-    // "scope" and "function_marker" are declaration markers such as "#F24", not
-    // names, so they are read only as a last resort and a marker is rejected: a
-    // finding whose function field says "#F24" points at less than the run
-    // target does, and the marker is reallocated on the next reload anyway.
-    let owner = goal
-        .get("fct")
-        .or_else(|| goal.get("scope"))
-        .or_else(|| goal.get("function_marker"))
-        .and_then(|value| value.as_str())
-        .filter(|owner| !owner.is_empty() && !owner.starts_with('#'))
-        .or(function)
-        .unwrap_or("");
+    let owner = goal_owner_name(goal).or(function).unwrap_or("");
     json!({
         "id": format!("wp_failure:{stable_id}:{category}"),
         "severity": severity,
@@ -1021,20 +1026,9 @@ fn stable_goal_id_for(
         return label.to_string();
     }
 
-    // `fct` before `scope`, because `scope` and `function_marker` are `#F<vid>`
-    // markers that Frama-C reallocates on every reload. A caller that passes no
-    // function name (`check` does not) would otherwise get a different id for
-    // the same goal after a reload in the same session, while two fresh
-    // processes agreed and hid it.
-    let scope = stable_scope.map(str::to_string).unwrap_or_else(|| {
-        goal
-            .get("fct")
-            .or_else(|| goal.get("scope"))
-            .or_else(|| goal.get("function_marker"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string()
-    });
+    // A caller that passes no scope (check does not) gets the goal's own, which
+    // is why goal_scope_key keeps a marker rather than rejecting one.
+    let scope = stable_scope.unwrap_or_else(|| goal_scope_key(goal));
     let payload = json!({
         "scope": scope,
         "goal_kind": goal_kind,
@@ -1047,6 +1041,34 @@ fn stable_goal_id_for(
     // Sixteen characters, which is the first eight bytes: the same id the
     // eight-way format string produced before this shared a helper.
     format!("sg_{}", &sha256_hex(payload.to_string().as_bytes())[..16])
+}
+
+/// The raw scope string a goal hashes under.
+///
+/// "fct" before "scope", because "scope" and "function_marker" are "#F<vid>"
+/// markers that Frama-C reallocates on every reload. A caller that passes no
+/// function name would otherwise get a different id for the same goal after a
+/// reload in the same session, while two fresh processes agreed and hid it.
+/// Markers are kept here rather than rejected: this answer is a hash input, so
+/// a reallocated marker is better than an empty key.
+pub fn goal_scope_key(goal: &serde_json::Value) -> &str {
+    goal.get("fct")
+        .or_else(|| goal.get("scope"))
+        .or_else(|| goal.get("function_marker"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+/// The function a goal belongs to, when the goal names one a reader can use.
+///
+/// The same three fields as goal_scope_key and the opposite decision about
+/// markers: a finding whose function field says "#F24" points at less than the
+/// run target does, and the marker is reallocated on the next reload anyway.
+/// Both rules used to be spelled out at each of the four call sites, which is
+/// how "is a marker an owner" came to be answered differently at each.
+pub fn goal_owner_name(goal: &serde_json::Value) -> Option<&str> {
+    let owner = goal_scope_key(goal);
+    (!owner.is_empty() && !owner.starts_with('#')).then_some(owner)
 }
 
 /// Whether WP replayed this goal's verdict from its cache instead of proving
@@ -1227,6 +1249,7 @@ pub fn host_load() -> HostLoad {
     // both platforms this runs on, so there is no subprocess to block a Tokio
     // worker, no PATH to resolve, and no output format to parse.
     let mut avg = [0.0f64; 1];
+
     // Safety: getloadavg writes at most nelem doubles, and the buffer holds
     // exactly that many.
     if unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) } != 1 {
@@ -1307,6 +1330,7 @@ pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
         // The module that owns "is this goal proved" answers it. Spelling the
         // test here was how the two callers of its sibling drifted apart.
         let unproved = !crate::mcp::status::own_status_is_proved(goal);
+
         // The goal's own verdict, like the line above it. Reading the
         // consolidated one asked what the property it hangs off decided, which
         // answers "valid" for a timed-out goal under a property that
@@ -1350,6 +1374,50 @@ pub fn wp_timeout_triage_none() -> serde_json::Value {
     )
 }
 
+/// Why a goal this run replayed cannot carry a confident verdict.
+///
+/// A cached verdict was not attempted here, so nothing this run did explains
+/// it: not the goal's difficulty, not the prover budget, not the machine. Every
+/// verdict in this module rests on the run having measured what it reports, and
+/// this is the one input that makes that false for a single goal.
+///
+/// Stated once because it was stated in one place and contradicted in two:
+/// prover_timeout_triage withdrew confidence for a replayed run while
+/// wp_timeout_triage_from_goal answered "high, a higher prover timeout may
+/// help" about the same goal.
+pub const REPLAYED_GOAL_REASON: &str =
+    "This goal's verdict came back from WP's cache rather than being attempted on this run, so \
+     nothing here measured it. WP's cache defaults to Update and stores timeout verdicts too. \
+     Re-run with cache: \"None\" before treating it as a property of the goal.";
+
+/// The same fact about a whole run rather than about one goal.
+///
+/// Beside its sibling rather than inline at the one call site, because the
+/// doc above claims the rule is stated once and that was not true while a
+/// second wording of it sat a hundred lines away. Two constants, because the
+/// scopes really do differ: one goal's verdict was replayed, or every timed-out
+/// goal in the run was. Composing one from the other would save a sentence and
+/// cost the reader the difference.
+pub const REPLAYED_RUN_REASON: &str =
+    "Every timed-out goal in this run came back from WP's cache rather than being attempted, so \
+     this run measured nothing about them. WP's cache defaults to Update and stores timeout \
+     verdicts too. Re-run with cache: \"None\" before drawing any conclusion.";
+
+/// The triage for a goal this run replayed rather than attempted.
+///
+/// One call shape, two kinds. Written twice it was two five-argument literals
+/// differing in one word, whose evidence arrays had to be kept identical by
+/// hand.
+fn replayed_goal_triage(kind: &str) -> serde_json::Value {
+    wp_timeout_triage(
+        kind,
+        false,
+        "low",
+        REPLAYED_GOAL_REASON,
+        json!([{"field": "from_cache", "value": true}]),
+    )
+}
+
 pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Value {
     let normalized_status = crate::mcp::status::consolidated_status(goal)
         .unwrap_or("unknown");
@@ -1358,6 +1426,9 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
     if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
+        if goal_is_from_cache(goal) {
+            return replayed_goal_triage("prover_timeout");
+        }
         return wp_timeout_triage(
             "prover_timeout",
             true,
@@ -1385,6 +1456,22 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
                 {"field": "raw_status", "value": raw_status},
             ]),
         );
+    }
+
+    // A replayed goal that did not time out. The branches above already say
+    // this for a replayed timeout; without this one, a cached prover_unknown
+    // scored its confidence down to low and nothing in the payload said why,
+    // which is the half of the rule that was still missing after the timeout
+    // half was fixed.
+    //
+    // The kind stays "none", because it is what this field means and
+    // wp_failure_kind maps it: there is no timeout evidence here, and what the
+    // goal needs said is why its verdict is thin. Written into the reason
+    // rather than appended to the classification's, because the reason on a
+    // classification is per goal by design and a constant repeated per goal
+    // belongs in neither half of the split.
+    if goal_is_from_cache(goal) {
+        return replayed_goal_triage("none");
     }
     wp_timeout_triage_none()
 }
@@ -1454,8 +1541,8 @@ pub fn prover_timeout_triage(
         // it in every payload; what the verdict below rests on is this bool.
         {"field": "every_timed_out_goal_was_replayed", "value": all_replayed},
 
-        // Categorized, never the reading: this payload is hashed into the
-        // proof receipt. See HostLoad::category.
+        // Categorized, never the reading: this payload is hashed into the proof
+        // receipt. See HostLoad::category.
         {"field": "host_load", "value": host_load.category()},
     ]);
 
@@ -1466,9 +1553,7 @@ pub fn prover_timeout_triage(
     // sends the caller to re-run with cache "None" on the machine that will
     // grind to the budget again.
     let withdrawn: Vec<&str> = [
-        all_replayed.then_some(
-            "Every timed-out goal in this run came back from WP's cache rather than being attempted, so this run measured nothing about them. WP's cache defaults to Update and stores timeout verdicts too. Re-run with cache: \"None\" before drawing any conclusion.",
-        ),
+        all_replayed.then_some(REPLAYED_RUN_REASON),
         host_load.timeout_caveat(),
     ]
     .into_iter()

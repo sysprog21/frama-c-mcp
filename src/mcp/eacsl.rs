@@ -117,6 +117,21 @@ fn compile_args(
     driver: Option<&str>,
     output_exec: &Path,
 ) -> Result<Vec<String>, serde_json::Value> {
+    // Exhaustive so a field added later is a compile error here. The two named
+    // below are decisions this function makes; the rest reach both -E and -e
+    // through cpp_extra_args, which is given the whole struct and so carries a
+    // new one without being told.
+    let ProjectLoadOptions {
+        machdep,
+        compilation_database,
+        include_paths: _,
+        defines: _,
+        force_includes: _,
+        isystem_paths: _,
+        nostdinc: _,
+        rte: _,
+    } = project_options;
+
     let mut args = vec![
         "-c".to_string(),
         "-q".to_string(),
@@ -151,7 +166,7 @@ fn compile_args(
         args.push("-e".to_string());
         args.push(compile_flags);
     }
-    if let Some(machdep) = &project_options.machdep {
+    if let Some(machdep) = machdep {
         match machdep.as_str() {
             "gcc_x86_64" => {
                 args.push("--mbits".to_string());
@@ -172,7 +187,7 @@ fn compile_args(
         args.push("-F".to_string());
         args.push(format!("-machdep {machdep}"));
     }
-    if let Some(compilation_database) = &project_options.compilation_database {
+    if let Some(compilation_database) = compilation_database {
         args.push("-F".to_string());
         args.push(format!("-compilation-db={compilation_database}"));
     }

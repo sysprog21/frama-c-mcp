@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Fail when the stdio suite hit a connect refusal that nothing diagnosed.
 #
-# The window between bind and listen is the known flake, and connect_when_listening
-# retries it. Its deadline says so in words, "frama-c never listened on <path>
-# within <timeout>: Connection refused", with both halves on one line, so the
-# qualifier is what separates the covered race from everything else. A refusal
-# without it came from a path the retry does not reach, and has to go red rather
-# than pass quietly as one more green run.
+# The window between bind and listen is the known flake, and
+# connect_when_listening retries it. Its deadline says so in words, "frama-c
+# never listened on <path> within <timeout>: Connection refused", with both
+# halves on one line, so the qualifier is what separates the covered race from
+# everything else. A refusal without it came from a path the retry does not
+# reach, and has to go red rather than pass quietly as one more green run.
 #
-# The recovered count is the other half. A race the retry absorbs leaves no trace
-# in any tool result or exit status, so a suite drifting back toward the flake
-# looks exactly like a healthy one until the deadline is finally exceeded. That
-# needs RUST_LOG to admit warn; see the stdio step in .github/workflows/ci.yml.
+# The recovered count is the other half. A race the retry absorbs leaves no
+# trace in any tool result or exit status, so a suite drifting back toward the
+# flake looks exactly like a healthy one until the deadline is finally exceeded.
+# That needs RUST_LOG to admit warn; see the stdio step in
+# .github/workflows/ci.yml.
 #
 # The log path arrives in the environment rather than as an argument because
 # tests/unit/repo-guards.rs keys a gate on the whole command string, and CI and

@@ -905,6 +905,8 @@ impl FramaCMcpServer {
         let mut payload = json!({
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
+
+                "build_commit": env!("BUILD_COMMIT"),
                 "frama_c_path": self.frama_c_path,
                 "max_sandboxes": self.max_sandboxes,
             },

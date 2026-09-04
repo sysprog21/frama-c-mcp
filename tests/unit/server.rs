@@ -1558,6 +1558,7 @@ chmod +x "$out.e-acsl"
             "{flag} did not carry the preprocessor flags"
         );
     }
+
     // -nostdinc is the one flag that goes to the analyzer and not to the
     // compiler behind it. Frama-C's modeled libc exists to be analyzed:
     // dropping the real system headers from the gcc that builds the

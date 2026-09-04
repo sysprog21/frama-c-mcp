@@ -1620,7 +1620,9 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         machdep: _,
         compilation_database: _,
 
-        // Not a flag at all: it selects whether Frama-C is started with -rte.
+        // Not a preprocessor flag, and no longer any flag here: run_wp
+        // generates WP's own RTE guards rather than the spawn asking the kernel
+        // for its larger set.
         rte: _,
     } = options;
 
@@ -1681,6 +1683,46 @@ impl FramaCMcpServer {
     }
 }
 
+/// The argv for the long-lived main Frama-C process.
+///
+/// A free function so a test can assert it. It is the only place kernel "-rte"
+/// could be added back to the main load, and the reason it must not be is in
+/// project_cli_args: the kernel's RTE generator and WP's own are different
+/// analyses over the same code, the kernel emitting pointer_alignment
+/// assertions that WP's does not. A build that proves runtime errors does it
+/// with -wp-rte, so a load started under kernel -rte proves a strictly larger
+/// set than the target it claims to be. Measured on one 3-function target:
+/// -wp-rte alone generates 40 obligations and discharges all of them, while
+/// -rte alongside it generates 42 and leaves the two extra alignment goals
+/// open. run_wp implements the load's rte flag through WP's generator instead.
+///
+/// The options-derived arguments come from project_cli_args rather than being
+/// spelled again here. They were spelled again until the -rte line went, which
+/// was the only difference between the two, and the copy carried its own
+/// exhaustive destructure: two assertions that neither copy forgets a field,
+/// and nothing at all that they agree on what to emit.
+pub fn main_frama_c_args(
+    frama_c_path: &str,
+    files: &[String],
+    options: &ProjectLoadOptions,
+    socket_path: &Path,
+) -> Vec<String> {
+    let mut command_line = vec![frama_c_path.to_string()];
+    command_line.extend(project_cli_args(options));
+    command_line.extend(files.iter().cloned());
+    command_line.extend([
+        "-load-module".to_string(),
+        "ast_utils_plugin".to_string(),
+        "-server-socket".to_string(),
+        socket_path.display().to_string(),
+        "-wp-prover".to_string(),
+        default_wp_provers().to_string(),
+        "-wp-model".to_string(),
+        default_wp_model().to_string(),
+    ]);
+    command_line
+}
+
 pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
     // Destructured exhaustively, as cpp_extra_args is and for the reason given
     // on ProjectLoadOptions: a field added there is a compile error here rather
@@ -1696,11 +1738,11 @@ pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
         isystem_paths: _,
         nostdinc: _,
 
-        // Not emitted here. These arguments serve short-lived CLI runs that
-        // generate their own obligations, and each already decides for itself:
-        // wpcli passes -wp-rte where the run needs it, and parse_surface runs
-        // no proof at all. Emitting -rte here would add obligations to runs
-        // whose callers pass the flag a second time.
+        // Not emitted here, by anyone. The short-lived CLI runs each decide for
+        // themselves: wpcli passes -wp-rte where the run needs it, and
+        // parse_surface runs no proof at all. The main spawn reaches this
+        // through main_frama_c_args, whose doc carries the measurement for why
+        // the kernel's generator is the wrong one.
         rte: _,
     } = options;
 
@@ -1757,12 +1799,23 @@ pub struct WpModelSupport {
     source: &'static str,
 }
 
+/// Memory models Frama-C's -wp-model parser accepts and its help text omits.
+///
+/// Caveat is the one measured so far: the parser takes it, -wp-h names it
+/// nowhere, and a project proved under it was told its own model was invalid.
+/// One of elfuse's 21 targets uses it. The advertised set is what Frama-C
+/// documents; this server validates against what it accepts.
+pub const ACCEPTED_BUT_UNDOCUMENTED_BASES: &[&str] = &["Caveat"];
+
 impl WpModelSupport {
-    fn fallback() -> Self {
+    /// Public so a test can assert the list reflects what Frama-C accepts
+    /// rather than what its help text documents.
+    pub fn fallback() -> Self {
         Self {
             bases: ["Hoare", "Typed", "Bytes", "Region", "Eva"]
                 .into_iter()
                 .map(String::from)
+                .chain(ACCEPTED_BUT_UNDOCUMENTED_BASES.iter().map(|base| base.to_string()))
                 .collect(),
             modifiers: [
                 "nocast", "cast", "raw", "ref", "nat", "int", "real", "float",
@@ -1784,7 +1837,19 @@ impl WpModelSupport {
     fn validate_one(&self, model: &str) -> Result<(), String> {
         let mut parts = model.split('+');
         let base = parts.next().unwrap_or_default();
-        if base.is_empty() || !self.bases.iter().any(|known| known == base) {
+
+        // Case-insensitively, because Frama-C is: "-wp-model typed" and
+        // "-wp-model Typed" are the same invocation to it, and a build system
+        // that writes the lowercase spelling is not making a different claim.
+        // Comparing exactly refused 19 of one project's 21 targets, every one
+        // of them a profile emitted faithfully from the command that proves it,
+        // which is the drift these profiles exist to prevent, inverted.
+        if base.is_empty()
+            || !self
+                .bases
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(base))
+        {
             return Err(format!(
                 "invalid WP model '{}'; bases: {}; modifiers: {}; examples: {}",
                 model,
@@ -1794,7 +1859,12 @@ impl WpModelSupport {
             ));
         }
         for modifier in parts {
-            if modifier.is_empty() || !self.modifiers.iter().any(|known| known == modifier) {
+            if modifier.is_empty()
+                || !self
+                    .modifiers
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(modifier))
+            {
                 return Err(format!(
                     "invalid WP model '{}'; bases: {}; modifiers: {}; examples: {}",
                     model,
@@ -1892,6 +1962,20 @@ pub fn parse_wp_model_support(help: &str) -> WpModelSupport {
     if bases.is_empty() || modifiers.is_empty() {
         WpModelSupport::fallback()
     } else {
+        // Parsed from the help text, which lists what Frama-C documents rather
+        // than what it accepts. Added here as well as to the fallback so the
+        // parsed path is not the stricter of the two, and from the same list,
+        // because two literals encoding one fact about the installed Frama-C
+        // means the next one is added to whichever path the author was reading.
+        for accepted_but_undocumented in ACCEPTED_BUT_UNDOCUMENTED_BASES {
+            if !bases
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(accepted_but_undocumented))
+            {
+                bases.push(accepted_but_undocumented.to_string());
+            }
+        }
+
         WpModelSupport {
             bases,
             modifiers,
@@ -2256,9 +2340,16 @@ pub struct ProjectLoadOptions {
 
     /// Whether this load generates runtime-error obligations.
     ///
-    /// Part of the load identity, not a run setting: -wp-rte is applied when
-    /// Frama-C starts, and it changes which obligations exist, so two loads
-    /// differing only here are different programs to prove.
+    /// Part of the load identity, not a run setting: it says whether the
+    /// target's own command proves them, which decides which obligations a
+    /// receipt is about, so two loads differing only here are not comparable.
+    ///
+    /// Nothing on the command line carries it any more. The kernel's -rte was
+    /// dropped because it emits pointer_alignment assertions WP's generator
+    /// does not, and run_wp generates WP's guards for every main-instance run,
+    /// which is what a -wp-rte build proves. So this flag reaches Frama-C
+    /// through the isolated CLI payloads and the reproduce line rather than
+    /// through the spawn.
     pub rte: bool,
 
     /// System include directories, as `-isystem <dir>`.
@@ -2410,8 +2501,10 @@ impl SandboxRegistry {
 /// Seven locks, one order, and it is the whole rule. Take them in this
 /// sequence and never in any other:
 ///
-///     main_wp_lock -> main_eva_lock -> main_spawn_lock -> main_frama_c_state
-///         -> client -> state -> sandboxes
+/// ```text
+/// main_wp_lock -> main_eva_lock -> main_spawn_lock -> main_frama_c_state
+///     -> client -> state -> sandboxes
+/// ```
 ///
 /// It is written here rather than beside each lock because it used to be
 /// exactly that: four doc comments each stating its own fragment, two of them
@@ -3070,43 +3163,16 @@ impl FramaCMcpServer {
 
     /// The argv for a new main instance.
     ///
-    /// RTE is read off project_options rather than passed beside it. It used to
-    /// be both, and nothing made the two agree: a caller that passed one value
-    /// and an options struct carrying the other started a process the receipt
-    /// did not describe.
+    /// A thin wrapper so the spawn path has one caller-facing name; the argv
+    /// itself is main_frama_c_args, which is a free function so a test can
+    /// assert what this process is started with.
     fn main_frama_c_command_line(
         &self,
         files: &[String],
         project_options: &ProjectLoadOptions,
         socket_path: &Path,
     ) -> Vec<String> {
-        let mut command_line = vec![self.frama_c_path.clone()];
-        if let Some(cpp_args) = cpp_extra_args(project_options) {
-            command_line.push(format!("-cpp-extra-args={cpp_args}"));
-        }
-        if let Some(machdep) = &project_options.machdep {
-            command_line.push("-machdep".to_string());
-            command_line.push(machdep.clone());
-        }
-        if let Some(compilation_database) = &project_options.compilation_database {
-            command_line.push("-compilation-db".to_string());
-            command_line.push(compilation_database.clone());
-        }
-        command_line.extend(files.iter().cloned());
-        command_line.extend([
-            "-load-module".to_string(),
-            "ast_utils_plugin".to_string(),
-            "-server-socket".to_string(),
-            socket_path.display().to_string(),
-            "-wp-prover".to_string(),
-            default_wp_provers().to_string(),
-            "-wp-model".to_string(),
-            default_wp_model().to_string(),
-        ]);
-        if project_options.rte {
-            command_line.push("-rte".to_string());
-        }
-        command_line
+        main_frama_c_args(&self.frama_c_path, files, project_options, socket_path)
     }
 
     /// Starts without a Frama-C process: `client` and `main_frama_c_state`
@@ -3369,6 +3435,7 @@ impl FramaCMcpServer {
                     .ok_or_else(|| McpError::from(FramaCError::FunctionNotFound(function.clone())))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         // Read before any proof is scheduled: after the drain the average is
         // largely this run's own provers. See host_load_per_cpu.
         let host_load = crate::mcp::server::wpclass::host_load();
@@ -4216,6 +4283,10 @@ impl FramaCMcpServer {
         json!({
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
+
+                // The commit, because the version has read 0.1.0 throughout and
+                // cannot tell an installed binary from the source beside it.
+                "build_commit": env!("BUILD_COMMIT"),
 
                 // Counted off the router rather than written down. A number in
                 // a constant is one a person edits to make a build green, which

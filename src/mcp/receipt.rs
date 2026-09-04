@@ -109,8 +109,7 @@ pub fn proof_receipt_goals(
                 // The receipt spells the normalized verdict under "status",
                 // which is why a receipt reader is right to read that name
                 // directly and must not be routed through the goal accessors.
-                "status": own_status(&goal).map(|status| json!(status))
-                    .unwrap_or_else(|| json!(null)),
+                "status": own_status(&goal),
 
                 // Part of the receipt's identity on purpose: two runs whose
                 // receipts match are supposed to be comparable, and a replayed
@@ -123,6 +122,16 @@ pub fn proof_receipt_goals(
                 // "not cached", which is the direction that hides a replayed
                 // verdict, on the payload the receipt hashes.
                 "from_cache": json!(crate::mcp::server::wpclass::goal_is_from_cache(&goal)),
+                "fct": crate::mcp::server::wpclass::goal_owner_name(&goal),
+
+                // The function this goal belongs to, so a reader of the receipt
+                // can scope a count to a target the way run_wp does. Without it
+                // the receipt recorded ids and statuses only, and the goal
+                // floor at the conclusion door had to count the whole array: a
+                // receipt from a whole-project run carries every function's
+                // goals, so an emptied target cleared its floor on its
+                // neighbours' obligations. Null for a goal that names none.
+
             })
         })
         .collect::<Vec<_>>();
@@ -138,6 +147,20 @@ pub fn proof_receipt_goals(
         a_key.cmp(&b_key)
     });
     receipt_goals
+}
+
+/// Whether these receipt goals come from a build that records goal owners.
+///
+/// A shape question, not a content one. Asking whether any goal names an owner
+/// answered "no" for a receipt this build wrote whose goals are all WP globals,
+/// since those carry "fct": null, and sent it down the path meant for receipts
+/// written before the field existed. The key's presence is what separates the
+/// two, and an unowned goal carries the key with a null in it.
+///
+/// Beside proof_receipt_goals because that is what writes the field: the reader
+/// and the writer of this contract are three screens apart otherwise.
+pub fn receipt_goals_record_owner(goals: &[serde_json::Value]) -> bool {
+    goals.iter().all(|goal| goal.get("fct").is_some())
 }
 
 pub fn proof_receipt_with_hash(mut body: serde_json::Value) -> serde_json::Value {

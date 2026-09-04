@@ -378,7 +378,28 @@ function set there is nothing for the coverage check to compare against, and
 `rte` and `nostdinc` each decide which obligations exist at all, so a run
 missing either discharges a different set than the target's own command does.
 A profile written before those two were required still loads; it is refused only
-where it would have become evidence, and stating them restores it. Emit the JSON from the build system that defines the targets
+where it would have become evidence, and stating them restores it.
+
+Two further fields are optional, and say what this server cannot otherwise
+know. `min_goals` is the floor on obligations the target requires WP to
+*generate*, and a run that generates fewer is refused: "N of N discharged" is
+not evidence on its own, since an emptied function body or a dropped contract
+discharges 0 of 0 and reports success. Counted over the target's own
+obligations, not over the goal table, which also holds goals from functions
+proved earlier in the session; otherwise an unrelated function's leftovers
+would clear the floor. A floor of `0` is refused as well, because omitting the
+field already says the target declares none. The same floor is applied to a
+receipt handed to `store_function_conclusion` under the profile's name, since a
+receipt arrives there from the caller rather than from the run that made it,
+but only to one whose `wp.functions` covers the profile's whole function set:
+a receipt from `check {function: "a"}` is scoped to `a`, so asking a
+three-function target's floor of it would refuse evidence that is correct.
+`build_gates` names checks the target's own command runs that this server does
+not, such as a separate script over the same sources; they come back under
+`declared_build_gates_not_run_here`. That list is the profile author's
+declaration and nothing here can verify it, so an empty one means none were
+declared rather than that none exist: it bounds a verdict downward, never
+upward. Emit the JSON from the build system that defines the targets
 rather than writing it by hand, so it cannot drift from the command that
 decides. An unknown key is refused rather than ignored. A profile
 whose model key is misspelled as `models` would otherwise register with no
@@ -387,11 +408,20 @@ report it as that target's evidence, which is the failure profiles exist to
 prevent. Naming a profile nobody registered is refused too, rather than
 falling back to the default.
 
-Passing `model`, `prover`, `provers` or `timeout` alongside `verify_profile` is
-refused rather than allowed to win. A run labelled as a target's evidence has
-to be the target's settings, and letting an override through produced exactly
-the mislabelling profiles exist to prevent: proving under one model while the
-response named another. Omit `verify_profile` to deviate on purpose.
+Passing `model`, `prover`, `provers`, `timeout`, `prop` or `retry_unproved`
+alongside `verify_profile` is refused rather than allowed to win. A run
+labelled as a target's evidence has to be the target's settings, and letting
+an override through produced exactly the mislabelling profiles exist to
+prevent: proving under one model while the response named another. `prop` is refused for the same reason and before the
+run rather than after it: a filtered run attempts the obligations the filter
+selects and leaves the rest, so its goal count and its summary agree with each
+other while describing a subset, and nothing downstream can tell that from a
+whole run. `retry_unproved` is the timeout's version of the same thing: it
+re-proves at double the profile's timeout and the flipped goals replace the
+reported set, receipt included, while the receipt records the declared timeout.
+Omit `verify_profile` to deviate on purpose. Through `check`, which forwards
+both, these refusals and the goal floor arrive as an error inside the `wp`
+field rather than as a failed call, since `check` reports each stage it ran.
 Evidence profiles must declare all five settings that decide what gets proved
 and over what: `model`, non-empty `provers`, `timeout_seconds`, `rte` and
 `nostdinc`; an incomplete profile may be registered for loading, but cannot
@@ -430,6 +460,19 @@ smoke tests.
 `self_check` reports `tool_surface`: the tool count, the byte size of the
 `tools/list` result that is resent on every agent turn, and the three heaviest
 tools. Computed from the running server, so it cannot be quoted stale.
+
+It also reports `build_commit`, the commit the running binary was built from,
+with `-dirty` appended when that build had uncommitted changes to tracked
+files, or when git could not say: "do not compare this sha to a tree" is what a
+reader must do with either answer. `version` reads `0.1.0` and always has, so
+it cannot tell an installed binary from the source sitting beside it: a caller
+comparing this server's behaviour against the code they are reading needs to
+know when the two are not the same thing, and this is the field that says so. Compare it with `git rev-parse HEAD`, which is the
+full object id: the abbreviation that `--short` picks grows with the object
+database, so it is not a function of the commit alone. A build
+with no git available, or one made from a copy of these sources vendored into
+another repository, reports `unknown` rather than guessing: a confident wrong
+sha is worse than none, because it is the value a caller compares against.
 
 It parses the `frama-c -version` banner rather than only checking that the
 command exited zero. `frama_c.major`, `frama_c.minor`, `frama_c.supported`

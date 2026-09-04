@@ -688,6 +688,53 @@ fn an_assumed_property_with_a_goal_reports_on_both_channels() {
 /// "nothing wrong". An axiom leaves every goal valid, so neither the alarm nor
 /// the goal path offers a call, and the old wording read as all clear next to
 /// a verdict of incomplete naming that axiom.
+// The gap names the half of the check it is about. run_wp generates WP's own
+// RTE guards for every main-instance run, so a load with rte off still gets
+// runtime-error goals; EVA ran before them and its alarms do not cover them.
+// Saying both were excluded told a caller to discard a WP verdict that is
+// sound, and it was only ever true while the kernel's -rte at load was the
+// single source of these annotations.
+#[test]
+fn the_rte_gap_says_which_half_of_the_check_it_is_about() {
+    let gaps = |wp: serde_json::Value, wanted| {
+        check_incomplete_items(
+            Some(false),
+            &json!({"status": "success"}),
+            &json!({"status": "success"}),
+            &json!({"status": "success"}),
+            &wp,
+            &json!([]),
+            wanted,
+        )
+        .into_iter()
+        .find(|item| item["code"] == "RTE_DISABLED")
+        .map(|item| item["reason"].as_str().unwrap_or_default().to_string())
+        .expect("a load with rte off always leaves an RTE gap")
+    };
+
+    let guarded = gaps(
+        json!({"status": "success", "effective_wp_config": {"rte": true}}),
+        WantedAnalyses::BOTH,
+    );
+    assert!(guarded.contains("EVA's alarms exclude"), "{guarded}");
+    assert!(guarded.contains("goals do cover them"), "{guarded}");
+
+    // WP not asked for, so nothing generated the guards and the wider reading
+    // is the true one.
+    let unguarded = gaps(
+        json!({"status": "success", "effective_wp_config": {"rte": true}}),
+        WantedAnalyses { eva: true, wp: false },
+    );
+    assert!(unguarded.contains("absence of alarms/goals"), "{unguarded}");
+
+    // WP ran but reported no RTE obligations, which is the same reading.
+    let no_guards = gaps(
+        json!({"status": "success", "effective_wp_config": {"rte": false}}),
+        WantedAnalyses::BOTH,
+    );
+    assert!(no_guards.contains("absence of alarms/goals"), "{no_guards}");
+}
+
 #[test]
 fn the_fallback_recommendation_names_what_is_blocking() {
     assert_eq!(

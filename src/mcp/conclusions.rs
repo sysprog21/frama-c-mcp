@@ -2,14 +2,15 @@ use super::*;
 
 /// Why a receipt is not evidence about the target a conclusion names, or None.
 ///
-/// Five questions, and deliberately not seven. The target and receipt have to
+/// Six questions, and deliberately not eight. The target and receipt have to
 /// prove this function; the run has to have been made under the model and load
-/// settings the target declares; and it has to have been made over the sources
-/// the target names. A
-/// receipt records provers and timeout as "effective" and Frama-C leaves those
-/// null whenever it does not report them back, so comparing them would refuse
-/// runs that were correct. Model and sources are on every receipt this server
-/// writes.
+/// settings the target declares; it has to have been made over the sources
+/// the target names; and it has to clear the target's goal floor, because a
+/// receipt arrives here from the caller rather than from the run that made it.
+/// A receipt records provers and timeout as "effective" and Frama-C leaves
+/// those null whenever it does not report them back, so comparing them would
+/// refuse runs that were correct. Model and sources are on every receipt this
+/// server writes.
 ///
 /// Absent halves are skipped rather than refused. A conclusion can be stored
 /// before any proof exists, and a check that treated a missing receipt as a
@@ -102,6 +103,64 @@ pub fn profile_evidence_error(
             return Some(format!(
                 "verify_profile \"{name}\" declares different project load settings than this receipt, so it is not evidence about that target"
             ));
+        }
+
+        // The goal floor again, because run_wp is not the only way in. A
+        // conclusion takes a caller-supplied receipt, so a run made without the
+        // profile over a gutted target could be stored under the profile's name
+        // and the floor would never have run. The conclusion is durable and
+        // names the target, which makes this the more expensive miss of the
+        // two.
+        //
+        // Asked only of a receipt that covers the whole target, and counted by
+        // the same rule run_wp uses.
+        //
+        // The first half is a false refusal this check caused on its own. The
+        // floor is a claim about the target, and a receipt need not be: check
+        // {function: "a"} builds one from the goals scoped to a, so an honest
+        // receipt for one function of a three function profile records a
+        // fraction of the floor and was refused for it. Worse, proof_coverage
+        // runs this against every stored conclusion, so adding min_goals to a
+        // profile retroactively flipped conclusions already stored that way to
+        // a mismatch and dropped them from its denominator.
+        //
+        // The second half is the other direction. Counting the whole array let
+        // an emptied target clear its floor on its neighbours' obligations,
+        // because a whole-project run's receipt carries every function's goals,
+        // so the two doors enforced different floors and the durable one was
+        // the looser. Receipt goals record "fct" for this.
+        //
+        // A receipt written before that field carries none, and falls back to
+        // the array length rather than counting zero and refusing evidence that
+        // was correct when it was stored. receipt_goals_record_owner asks for
+        // the key rather than for a usable name, because a goal WP owns
+        // globally carries the key with a null in it and is not an old receipt.
+        let covers_whole_target = receipt
+            .pointer("/wp/functions")
+            .and_then(|functions| functions.as_array())
+            .is_some_and(|proved| {
+                profile.functions.iter().all(|declared| {
+                    proved.iter().any(|f| f.as_str() == Some(declared.as_str()))
+                })
+            });
+        if let Some(min_goals) = profile.min_goals.filter(|_| covers_whole_target) {
+            let goals = receipt
+                .get("goals")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let recorded = if super::receipt::receipt_goals_record_owner(goals) {
+                super::analysis::goals_owned_by(goals, &profile.functions)
+            } else {
+                goals.len()
+            };
+            if recorded < min_goals as usize {
+                return Some(format!(
+                    "verify_profile \"{name}\" requires at least {min_goals} obligations and \
+                     this receipt records {recorded}, so it is not evidence about that target \
+                     however many discharged"
+                ));
+            }
         }
     }
     None

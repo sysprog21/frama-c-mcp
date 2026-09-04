@@ -289,6 +289,26 @@ pub struct VerificationProfile {
     /// profile does not speak to it.
     pub nostdinc: Option<bool>,
 
+    /// The floor on obligations this target's own command requires WP to
+    /// generate.
+    ///
+    /// "N of N discharged" is not evidence on its own: an emptied function body
+    /// or a dropped contract discharges 0 of 0 and reports success. A build
+    /// system that carries such a floor is carrying the only check that catches
+    /// that, and a run here that generated fewer obligations than the target
+    /// requires is not that target's evidence however green it looks.
+    pub min_goals: Option<u32>,
+
+    /// Checks the target's own command runs that this server does not.
+    ///
+    /// Named rather than imported. A profile can express what Frama-C is
+    /// invoked with, but a build gate may be a separate script over the same
+    /// sources, and nothing here can run it. Listing them is what keeps a
+    /// verdict from reading as the build's verdict: the response repeats the
+    /// list so a caller sees which of the target's checks did not happen.
+    #[serde(default)]
+    pub build_gates: Vec<String>,
+
     /// Whether the target's own command generates runtime-error obligations.
     ///
     /// Pinned like the model and the provers, and for the same reason: -wp-rte
@@ -344,6 +364,16 @@ pub fn parse_verification_profiles(
         let mut profile: VerificationProfile = serde_json::from_value(body.clone())
             .map_err(|e| format!("profile \"{name}\": {e}"))?;
 
+        // A floor of zero passes every run, and None already says the target
+        // declares none. Accepting it would let a profile carry the field while
+        // checking nothing, which reads as a floor to anyone who sees the key
+        // present.
+        if profile.min_goals == Some(0) {
+            return Err(format!(
+                "profile \"{name}\": min_goals 0 checks nothing; omit it to declare no floor"
+            ));
+        }
+
         // Function and prover names are trimmed, and one that is nothing but
         // padding is refused. The remaining lists contain command arguments or
         // paths, whose spelling must be left for their later validation.
@@ -357,6 +387,14 @@ pub fn parse_verification_profiles(
         for (field, entries) in [
             ("functions", &mut profile.functions),
             ("provers", &mut profile.provers),
+
+            // A gate name is only ever printed back, never matched, so the
+            // padding costs nothing on its own. A blank one does not: it
+            // becomes an empty string in declared_build_gates_not_run_here,
+            // where a reader counts entries to see what did not run, and an
+            // accidental empty from a build system inflates that count with a
+            // gate that has no name.
+            ("build_gates", &mut profile.build_gates),
         ] {
             for entry in entries.iter_mut() {
                 let trimmed = entry.trim();
