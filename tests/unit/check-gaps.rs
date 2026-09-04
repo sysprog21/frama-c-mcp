@@ -17,7 +17,7 @@ use frama_c_mcp::mcp::server::checkgaps::{
     check_variants_summary,
     gap_guidance,
     incomplete_guidance,
-    check_next_call, incomplete_code, NextCallInputs,
+    check_next_call, incomplete_code, wp_goal_gaps, NextCallInputs,
     WantedAnalyses,
 };
 use frama_c_mcp::mcp::server::selfcheck::{
@@ -1498,4 +1498,53 @@ fn the_fallback_separates_a_clean_run_from_a_blocked_one() {
         function: None,
     });
     assert_eq!(skipped["tool"], "check", "{skipped:?}");
+}
+
+/// A proof that leaned on an impossible hypothesis is a gap, not a proof.
+///
+/// Frama-C spells this "valid_under_false_hypothesis" on the property while the
+/// goal's own status stays "valid". It is neither of the two states
+/// proved_goal_gap used to test for: property_is_dead matches only "_but_dead",
+/// and goal_is_valid_under_hypotheses matches "valid_under_hyp". A goal in this
+/// state answered both false and produced no gap, so check reported "proved"
+/// over a proof that holds over no execution, while get_wp_goals reported it
+/// through goal_needs_failure_classification. The two paths disagreed.
+#[test]
+fn a_vacuously_discharged_property_is_reported_rather_than_counted_as_proved() {
+    let vacuous = json!([{
+        "wpo": "w1",
+        "stable_goal_id": "g1",
+        "normalized_status": "valid",
+        "normalized_property_status": "valid_under_false_hypothesis",
+        "counts_as_progress": false,
+        "vacuous": true,
+        "vacuity_reason": "an earlier instance of the same property did not prove",
+    }]);
+    let mut items = Vec::new();
+    wp_goal_gaps(&mut items, &json!([]), &vacuous);
+    let codes: Vec<&str> = items.iter().filter_map(|i| i["code"].as_str()).collect();
+    assert!(
+        codes.contains(&"PROPERTY_VACUOUS"),
+        "a vacuous proof produced no gap: {codes:?}"
+    );
+
+    // Not filed as dead code, which is a different finding with different
+    // advice: dead code is unreachable, this statement is reachable.
+    assert!(!codes.contains(&"PROPERTY_DEAD"), "{codes:?}");
+
+    // And a genuinely valid goal still produces nothing, so the assertion above
+    // is not just "every goal reports something".
+    let mut clean = Vec::new();
+    wp_goal_gaps(
+        &mut clean,
+        &json!([]),
+        &json!([{
+            "wpo": "w2",
+            "stable_goal_id": "g2",
+            "normalized_status": "valid",
+            "normalized_property_status": "valid",
+            "counts_as_progress": true,
+        }]),
+    );
+    assert!(clean.is_empty(), "{clean:?}");
 }

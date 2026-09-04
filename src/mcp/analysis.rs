@@ -1668,15 +1668,17 @@ pub fn profile_matches_loaded_project(
         // does can be proof evidence, which the evidence gate enforces.
         && profile.rte.is_none_or(|want| want == *rte)
 
-        // Same argument as rte: these decide which declarations the file is
-        // compiled against, so a load differing here is a different program.
-        // Unset means the profile does not speak to it, and only a profile that
-        // does can be proof evidence, which the evidence gate enforces. An
-        // empty isystem_paths is serde's default for a profile that never
-        // mentioned the field, so it has to mean "unset" here for the same
-        // reason None does beside it; a profile that constrains the list to
-        // empty is not expressible and is not worth a second spelling.
-        && (profile.isystem_paths.is_empty() || &profile.isystem_paths == isystem_paths)
+        // Compared exactly, like the three lists above it and unlike the two
+        // Option flags beside it. It was briefly loosened to treat an empty
+        // list as "unset", for symmetry with nostdinc, and that was the wrong
+        // symmetry: rte and nostdinc are Option, so they can say "unset", while
+        // a Vec cannot, and the evidence gate requires the two flags but not
+        // this list. A profile omitting it would therefore have matched a load
+        // carrying any -isystem at all, and run_wp would have labelled that run
+        // as the target's evidence under a load identity that is not the
+        // target's. Omission means the target passes no -isystem, which is what
+        // include_paths and defines have always meant here.
+        && &profile.isystem_paths == isystem_paths
         && profile.nostdinc.is_none_or(|want| want == *nostdinc)
 }
 
@@ -2234,7 +2236,11 @@ impl FramaCMcpServer {
                 return Ok(self
                     .check_reload_failed_payload(
                         &error,
-                        params.rte,
+
+                        // The resolved value, not the caller's. A profile
+                        // stating rte:false loads without RTE, and reporting
+                        // the caller's None here left the gap unsaid.
+                        Some(rte),
                         params.function.as_deref(),
                         wanted,
                         receipt_files,
@@ -2306,7 +2312,11 @@ impl FramaCMcpServer {
         };
 
         let mut incomplete = check_incomplete_items(
-            params.rte,
+            // The value this call actually loaded under, which is the caller's
+            // only when the caller gave one. A profile stating rte:false loads
+            // without RTE, and passing the caller's None here reported no
+            // RTE_DISABLED gap for a load that had RTE off.
+            Some(rte),
             &reload,
             &eva,
             &eva_alarms,

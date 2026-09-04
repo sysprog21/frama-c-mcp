@@ -10166,4 +10166,47 @@ async fn naming_a_profile_does_not_turn_off_the_runtime_error_checks() {
         .await,
         false
     );
+
+    // A load without RTE says so in incomplete[], whichever of the three
+    // decided it. check resolves rte before reload_project sees it, and the
+    // gap list used to be handed the caller's unresolved value, so naming a
+    // profile that turns RTE off produced a load with no runtime-error
+    // obligations and no RTE_DISABLED gap to say so.
+    let gap_codes = |args: serde_json::Value| {
+        let client = &client;
+        async move {
+            let result = call_tool_json(client, "check", args).await.unwrap();
+            result["incomplete"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item["code"].as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    };
+
+    let via_profile =
+        gap_codes(json!({"function": "swap", "timeout": 1, "verify_profile": "no_rte"})).await;
+    assert!(
+        via_profile.iter().any(|code| code == "RTE_DISABLED"),
+        "a profile turned RTE off without saying so: {via_profile:?}"
+    );
+
+    let via_caller =
+        gap_codes(json!({"function": "swap", "timeout": 1, "rte": false})).await;
+    assert!(
+        via_caller.iter().any(|code| code == "RTE_DISABLED"),
+        "{via_caller:?}"
+    );
+
+    // And RTE on reports no such gap, so the assertion above is not vacuous.
+    let with_rte =
+        gap_codes(json!({"function": "swap", "timeout": 1, "verify_profile": "with_rte"})).await;
+    assert!(
+        !with_rte.iter().any(|code| code == "RTE_DISABLED"),
+        "{with_rte:?}"
+    );
 }

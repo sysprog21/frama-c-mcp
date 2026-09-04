@@ -40,7 +40,7 @@ pub struct NextCallInputs<'a> {
 }
 
 pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
-        // Ordered after "incomplete" so the fallback can name the gaps it
+    // Ordered after "incomplete" so the fallback can name the gaps it
     // found. Not every gap has an alarm or a goal to point at: an axiom
     // leaves every one of them valid, and a fallback that cannot name it
     // reads as all clear next to a verdict of incomplete.
@@ -53,13 +53,13 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
     // that cost no goal its verdict should not displace the call that
     // targets a goal which is still open.
     let NextCallInputs {
-    backend_diagnosis,
-    anomaly_left_goals_unjudged,
-    eva_alarms,
-    wp_goals,
-    incomplete,
-    wanted,
-    function,
+        backend_diagnosis,
+        anomaly_left_goals_unjudged,
+        eva_alarms,
+        wp_goals,
+        incomplete,
+        wanted,
+        function,
     } = inputs;
 
     backend_diagnosis
@@ -156,6 +156,7 @@ pub mod incomplete_code {
     pub const GOAL_NOT_VALID: &str = "GOAL_NOT_VALID";
     pub const PROVER_TIMEOUT: &str = "PROVER_TIMEOUT";
     pub const PROPERTY_DEAD: &str = "PROPERTY_DEAD";
+    pub const PROPERTY_VACUOUS: &str = "PROPERTY_VACUOUS";
     pub const PROPERTY_DISPROVED: &str = "PROPERTY_DISPROVED";
     pub const PROPERTY_INCONSISTENT: &str = "PROPERTY_INCONSISTENT";
     pub const LEMMA_NOT_PROVED: &str = "LEMMA_NOT_PROVED";
@@ -186,6 +187,7 @@ pub mod incomplete_code {
         GOAL_NOT_VALID,
         PROVER_TIMEOUT,
         PROPERTY_DEAD,
+        PROPERTY_VACUOUS,
         PROPERTY_DISPROVED,
         PROPERTY_INCONSISTENT,
         LEMMA_NOT_PROVED,
@@ -348,6 +350,14 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
              go. Do not strengthen the annotation: a property of unreachable code is vacuous \
              whatever it says."
         }
+        incomplete_code::PROPERTY_VACUOUS => {
+            "Frama-C discharged this property only because the path reaching it carries a \
+             contradictory hypothesis, so the proof holds over no execution. This is not dead \
+             code: the statement is reachable, and an earlier instance of the same property in \
+             the function did not prove, which is what makes the later valid status suspect. \
+             Prove that earlier instance, or find the requires that excludes the path, before \
+             reading this one as evidence."
+        }
         incomplete_code::PROPERTY_INCONSISTENT => {
             "Two emitters ruled opposite ways on this property, so the consolidated verdict cannot \
              be trusted in either direction. Find the disagreement before writing any annotation \
@@ -479,6 +489,33 @@ fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json:
             "property_status": field("normalized_property_status"),
         }));
     }
+    // Before the hypotheses test, and separate from the dead test above it.
+    // "valid_under_false_hypothesis" is a proof leaning on a hypothesis that
+    // cannot hold, which is neither unreachable code nor a conditional proof:
+    // property_is_dead matches only "_but_dead", and goal_is_valid_under_hypotheses
+    // matches "valid_under_hyp", so a goal in this state answered both tests
+    // false and produced no gap at all. check then read "proved" over a proof
+    // that holds over no execution. get_wp_goals already reported it, through
+    // goal_needs_failure_classification, so the two paths disagreed.
+    if status_is_vacuous(
+        goal.get("normalized_property_status")
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| property_normalized_status(goal)),
+    ) {
+        return Some(json!({
+            "code": incomplete_code::PROPERTY_VACUOUS,
+            "reason": "WP proved this goal, but Frama-C discharged its property only under a hypothesis that cannot hold, so the proof holds over no execution.",
+            "stable_goal_id": field("stable_goal_id"),
+            "frama_c_goal_name": field("frama_c_goal_name"),
+            "goal_kind": field("goal_kind"),
+            "normalized_status": status,
+            "property_status": field("normalized_property_status"),
+
+            // Why Frama-C called it vacuous, when the property row says.
+            "vacuity_reason": field("vacuity_reason"),
+            "vacuity_dependency": field("vacuity_dependency"),
+        }));
+    }
     if goal_is_valid_under_hypotheses(goal) {
         return Some(json!({
             "code": incomplete_code::VALID_UNDER_HYP,
@@ -500,7 +537,7 @@ fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json:
     None
 }
 
-fn wp_goal_gaps<'a>(
+pub fn wp_goal_gaps<'a>(
     incomplete: &mut Vec<serde_json::Value>,
     eva_alarms: &'a serde_json::Value,
     wp_goals: &'a serde_json::Value,

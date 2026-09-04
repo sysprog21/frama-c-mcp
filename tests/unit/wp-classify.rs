@@ -2539,3 +2539,39 @@ fn a_timeout_under_a_valid_property_still_counts_as_a_timeout() {
     let valid = json!({"normalized_status": "valid", "raw_status": "VALID"});
     assert_eq!(run_measurement(std::slice::from_ref(&valid)).timed_out, 0);
 }
+
+// A profile that names no system include directories does not match a load
+// that carries some.
+//
+// isystem_paths is a Vec, so omission and "explicitly empty" are the same
+// value, and the evidence gate requires rte and nostdinc but not this list.
+// Treating an empty list as "unset" therefore let a profile match a load
+// carrying any -isystem at all, and run_wp would label that run as the
+// target's evidence under a load identity that is not the target's. The three
+// Vec fields beside it have always compared exactly; only the two Option flags
+// can say "unset".
+#[test]
+fn a_profile_that_names_no_system_includes_does_not_match_a_load_that_has_them() {
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        rte: Some(false),
+        nostdinc: Some(false),
+        ..Default::default()
+    };
+    let files = ["src/target.c".to_string()];
+
+    assert!(profile_matches_loaded_project(
+        &profile,
+        &files,
+        &ProjectLoadOptions::default()
+    ));
+
+    let with_isystem = ProjectLoadOptions {
+        isystem_paths: vec!["/opt/frama-c/libc".into()],
+        ..Default::default()
+    };
+    assert!(
+        !profile_matches_loaded_project(&profile, &files, &with_isystem),
+        "an omitted isystem_paths matched a load that passes one"
+    );
+}

@@ -1786,7 +1786,9 @@ fn a_profile_silent_on_rte_or_nostdinc_cannot_check_a_receipt() {
     for (rte, nostdinc) in [(None, Some(false)), (Some(false), None), (None, None)] {
         let err = profile_evidence_error("t", &profile(rte, nostdinc), "f", Some(&receipt))
             .unwrap_or_else(|| panic!("accepted a profile silent on one of them"));
-        assert!(err.contains("rte or nostdinc"), "{err}");
+        // Names both, because the guard fires when either is unset and
+        // "rte or nostdinc" reads as though only one of them were missing.
+        assert!(err.contains("must state both rte and nostdinc"), "{err}");
     }
 
     // Stating both gets past this check and on to the load comparison, which is

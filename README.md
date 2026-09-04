@@ -548,6 +548,7 @@ payload contract and the change rule. The full set:
 | `GOAL_NOT_VALID` | WP has a non-valid goal |
 | `PROVER_TIMEOUT` | A prover timed out on a goal |
 | `PROPERTY_DEAD` | EVA proved the code unreachable, so nothing proved about it constrains a run |
+| `PROPERTY_VACUOUS` | Frama-C discharged the property only under a hypothesis that cannot hold, so the proof holds over no execution |
 | `PROPERTY_DISPROVED` | Frama-C disproved a property and WP emits no goal for one that already has a status |
 | `PROPERTY_INCONSISTENT` | Frama-C consolidated contradictory statuses, so the verdict cannot be trusted |
 | `LEMMA_NOT_PROVED` | WP assumed a lemma everywhere without discharging it |

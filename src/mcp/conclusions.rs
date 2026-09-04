@@ -81,7 +81,7 @@ pub fn profile_evidence_error(
         // whichever setting happened to match it.
         let (Some(rte), Some(nostdinc)) = (profile.rte, profile.nostdinc) else {
             return Some(format!(
-                "verify_profile \"{name}\" does not state rte or nostdinc, so a receipt cannot be checked against it"
+                "verify_profile \"{name}\" must state both rte and nostdinc for a receipt to be checked against it"
             ));
         };
 
