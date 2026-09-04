@@ -35,7 +35,7 @@ When several files fail that way, ask what the ceiling is before working
 around it one file at a time:
 
 ```text
-parse_surface {files, include_paths?, defines?, force_includes?, machdep?, detail?}
+parse_surface {files, include_paths?, isystem_paths?, nostdinc?, defines?, force_includes?, machdep?, detail?}
 ```
 
 It reports how many of a set parse and ranks what blocks the rest, with
@@ -344,9 +344,14 @@ not evidence about the one it is filed under.
 `store_function_conclusion {verify_profile}` is what carries the target into
 the stored verdict, along with the `reproduce` command. Without it a conclusion
 records what was proved and not what it settles. It is refused on the same
-grounds a run is: the profile must declare `model`, `provers` and
-`timeout_seconds`, it must prove this function, and the receipt must have been
-produced under that model and over those sources. Because the tool is
+grounds a run is: the profile must declare `model`, `provers`,
+`timeout_seconds`, `rte` and `nostdinc`, it must prove this function, and the
+receipt must have been produced under that model and over those sources. The
+last two are there for different reasons. `rte` decides whether runtime-error
+obligations exist at all, so a receipt made without it covers a strictly
+smaller set than the target's own command does. `nostdinc` decides which
+declarations the file is compiled against, so a receipt made without it is
+about a different program rather than a smaller part of the same one. Because the tool is
 incremental, the comparison is against the conclusion as it will stand, so a
 later call that replaces the receipt is rechecked against the name already
 stored.

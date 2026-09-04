@@ -10,8 +10,45 @@ pub fn workspace_path(rel: &str) -> PathBuf {
     PathBuf::from(crate_dir).join(rel)
 }
 
+/// The server binary these tests drive.
+///
+/// The fresher of the release build and the one Cargo built for this run,
+/// compared by modification time. Integration tests get CARGO_BIN_EXE_<name>
+/// for free and Cargo builds the bin as a dependency of the test target, so
+/// that one is always present and always current.
+///
+/// Preferring release unconditionally was the trap. A stale
+/// target/release/frama-c-mcp is still a file, so an exists() check still chose
+/// it, and the whole suite then exercised the code as it was before the change
+/// under test. That is the failure CLAUDE.md records for
+/// McpHandle::spawn, and a green run said nothing about the edit that had just
+/// been made. Release is still preferred when it is the newer of the two,
+/// because it is what a developer has usually just built and what the
+/// timing-sensitive lifecycle tests were written against.
+///
+/// Neither branch asserts the binary exists. A plain `cargo test` on a tree
+/// with no release build used to fail thirteen tests at once on a missing
+/// file, which reads like a defect in the code under test rather than a
+/// missing prerequisite. Building it from inside the test was the first fix
+/// and the wrong one: a nested Cargo waits on the target-directory lock the
+/// parent `cargo test` may still hold.
 pub fn release_binary() -> PathBuf {
-    workspace_path("target/release/frama-c-mcp")
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp"));
+    let release = workspace_path("target/release/frama-c-mcp");
+
+    let modified = |path: &PathBuf| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+
+    // Only when release is strictly newer. Everything else, including equal
+    // timestamps and an absent or unreadable release build, falls to the binary
+    // Cargo just produced, which is the answer that cannot be stale.
+    match (modified(&release), modified(&built)) {
+        (Some(release_at), Some(built_at)) if release_at > built_at => release,
+        _ => built,
+    }
 }
 
 /// Conclusions and sandbox metadata for one test binary, kept out of the repo.
@@ -86,12 +123,6 @@ fn path_segment(name: &str) -> String {
 /// times is one that gets changed four times, and the two spellings then differ
 /// in a way nothing reports.
 pub fn server_command(binary: &Path, frama_c: &str, cwd: Option<&Path>) -> StdCommand {
-    assert!(
-        binary.exists(),
-        "MCP binary missing: {}\nRun `cargo build --release` first.",
-        binary.display()
-    );
-
     let mut cmd = StdCommand::new(binary);
     cmd.arg("--frama-c").arg(frama_c);
 

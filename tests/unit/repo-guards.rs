@@ -3,7 +3,7 @@ use serde_json::json;
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::strip_generated_label;
-use frama_c_mcp::mcp::server::analysis::{
+use frama_c_mcp::mcp::server::checkgaps::{
     ast_diagnostic_gaps, incomplete_code, AST_WARNING_ALLOWLIST, CHECK_SCHEMA,
 };
 use frama_c_mcp::mcp::server::selfcheck;

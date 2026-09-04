@@ -133,6 +133,18 @@ pub fn status_is_failed(status: &str) -> bool {
     status.eq_ignore_ascii_case("failed")
 }
 
+/// Whether a status says the prover ran out of its wall-clock budget.
+///
+/// The sibling of status_is_failed, here for the reason spelled out above it:
+/// four callers arrived at this predicate independently. classify_failure_reason
+/// and wp_timeout_triage_from_goal compare the normalized and the raw spelling,
+/// run_measurement counts goals at timeout, and the proofread report categorizes
+/// them, which is four answers available to one question. Which status to read
+/// stays the call site's decision; the comparison itself lives here.
+pub fn status_is_timeout(status: &str) -> bool {
+    status.eq_ignore_ascii_case("timeout")
+}
+
 /// The derived flags every status-bearing payload carries next to its
 /// normalized status.
 pub fn insert_status_flags(
@@ -207,4 +219,16 @@ pub fn is_proved(status: &str) -> bool {
 /// proved, which is the safe direction: a row nobody judged has not been.
 pub fn own_status_is_proved(row: &Value) -> bool {
     own_status(row).is_some_and(is_proved)
+}
+
+/// Whether WP's prover ran out of its budget on this goal.
+///
+/// own_status, not consolidated_status, and the distinction is the whole point
+/// of this module: a goal at TIMEOUT can hang off a property that consolidated
+/// to valid, and the consolidated reader answers "valid" for it. run_measurement
+/// asked the property's verdict for a question about the goal, beside a line
+/// asking the goal's own verdict for whether it was proved, so one loop asked
+/// two different questions about the same row.
+pub fn own_status_is_timeout(row: &Value) -> bool {
+    own_status(row).is_some_and(status_is_timeout)
 }

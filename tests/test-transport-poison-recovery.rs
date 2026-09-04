@@ -47,6 +47,8 @@ fn reload_params(files: Option<Vec<String>>) -> Parameters<ReloadProjectParams> 
         include_paths: None,
         defines: None,
         force_includes: None,
+        isystem_paths: None,
+        nostdinc: None,
         machdep: None,
         detail: None,
         compilation_database: None,

@@ -1128,7 +1128,7 @@ pub fn buggy_fixture_reason(
         return Some(format!("verdict {verdict}, expected incomplete"));
     }
     let names_the_alarm = incomplete.iter().any(|item| {
-        item["code"].as_str() == Some(super::analysis::incomplete_code::ALARM_NOT_VALID)
+        item["code"].as_str() == Some(super::checkgaps::incomplete_code::ALARM_NOT_VALID)
             && item["descr"].as_str().is_some_and(|d| d.contains("signed_overflow"))
     });
     if !names_the_alarm {

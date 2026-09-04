@@ -1,6 +1,36 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Tolerant bool deserializer, for the same client that makes the Vec one
+/// necessary: a parameter schema carrying no "type" lets a caller send "true"
+/// where true was meant. Only the two JSON spellings are accepted, so a typo
+/// is still refused rather than read as false, which is the confident
+/// direction for every flag this is applied to.
+///
+/// Usage: `#[serde(default, deserialize_with = "deserialize_bool_or_string")]`
+pub fn deserialize_bool_or_string<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
+        Some(serde_json::Value::String(s)) => match s.trim() {
+            // An empty string is the shape that client sends for "unset".
+            "" => Ok(None),
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            other => Err(D::Error::custom(format!(
+                "expected true or false, got the string {other:?}"
+            ))),
+        },
+        Some(other) => Err(D::Error::custom(format!(
+            "expected a boolean, got {other}"
+        ))),
+    }
+}
+
 /// Tolerant Vec deserializer: accepts standard JSON arrays, and also accepts
 /// stringify JSON arrays
 /// (Claude Code's MCP client sometimes serializes nested arrays into strings).
@@ -122,6 +152,17 @@ pub struct ParseSurfaceParams {
     /// them.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub force_includes: Option<Vec<String>>,
+    /// System include directories passed as `-isystem <dir>`, searched after
+    /// include_paths and before the compiler's own. Pair with nostdinc to put
+    /// a modeled libc where the real system headers would otherwise be found.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub isystem_paths: Option<Vec<String>>,
+    /// Drop the preprocessor's default system include directories, as
+    /// `-nostdinc`. On a platform whose real headers shadow Frama-C's modeled
+    /// libc this decides which program is loaded, not merely how fast it
+    /// parses, so it is part of the load identity rather than a convenience.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub nostdinc: Option<bool>,
     /// Target machine model, as reload_project takes it.
     pub machdep: Option<String>,
     /// Response size. "summary" (default) reports the counts and the causes,
@@ -157,6 +198,17 @@ pub struct ReloadProjectParams {
     /// argument types for the same name.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub force_includes: Option<Vec<String>>,
+    /// System include directories passed as `-isystem <dir>`, searched after
+    /// include_paths and before the compiler's own. Pair with nostdinc to put
+    /// a modeled libc where the real system headers would otherwise be found.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub isystem_paths: Option<Vec<String>>,
+    /// Drop the preprocessor's default system include directories, as
+    /// `-nostdinc`. On a platform whose real headers shadow Frama-C's modeled
+    /// libc this decides which program is loaded, not merely how fast it
+    /// parses, so it is part of the load identity rather than a convenience.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub nostdinc: Option<bool>,
     /// Target machine model passed to Frama-C as `-machdep <machine>`.
     pub machdep: Option<String>,
     /// Response size. "summary" (default) lists each function's name and
@@ -185,18 +237,29 @@ pub struct ReloadProjectParams {
     pub compilation_database: Option<String>,
     /// Enable generated RTE annotations by restarting Frama-C with `-rte`.
     /// Default: false.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte: Option<bool>,
     /// Register what the project's build system proves each target under, as an
     /// object keyed by target name. Emit it from the build system rather than
     /// writing it here, so it cannot drift from the command that decides:
     /// "make print-verify-profiles" or the equivalent. An entry used only to
-    /// load may carry sources, machdep, include_paths, defines, force_includes
-    /// and reproduce. One that a run or a conclusion will name additionally
-    /// needs functions, model, provers and timeout_seconds, and is refused
-    /// without them: the proof settings because it would otherwise prove under
-    /// this server's defaults while reporting the target's name, and the
-    /// function set because there would be nothing to check coverage against.
+    /// load may carry sources, machdep, include_paths, isystem_paths, nostdinc,
+    /// defines, force_includes and reproduce. One that a run or a conclusion
+    /// will name additionally needs functions, model, provers,
+    /// timeout_seconds, rte and nostdinc, and is refused without them: the
+    /// proof settings because it would otherwise prove under this server's
+    /// defaults while reporting the target's name, the function set because
+    /// there would be nothing to check coverage against, and rte and nostdinc
+    /// because each decides which obligations exist at all. A profile written
+    /// before those two were required loads as before and is refused only
+    /// where it would have become evidence; state them to restore it.
     /// Registered for the session; passing it again replaces the set.
+    ///
+    /// Tolerant of the JSON text of the object as well as the object, like the
+    /// other Value-typed parameters: a client whose schema for this carries no
+    /// "type" sends the quoted form, and refusing it fails a payload that says
+    /// exactly what it means.
+    #[serde(default, deserialize_with = "deserialize_value_or_string")]
     pub verify_profiles: Option<serde_json::Value>,
     /// Where verify_profiles came from, recorded so a later reader can re-run
     /// it
@@ -400,6 +463,17 @@ pub struct CheckParams {
     /// resolved through include_paths. Applied after include_paths and defines.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub force_includes: Option<Vec<String>>,
+    /// System include directories passed as `-isystem <dir>`, searched after
+    /// include_paths and before the compiler's own. Pair with nostdinc to put
+    /// a modeled libc where the real system headers would otherwise be found.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub isystem_paths: Option<Vec<String>>,
+    /// Drop the preprocessor's default system include directories, as
+    /// `-nostdinc`. On a platform whose real headers shadow Frama-C's modeled
+    /// libc this decides which program is loaded, not merely how fast it
+    /// parses, so it is part of the load identity rather than a convenience.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub nostdinc: Option<bool>,
     /// Target machine model passed to Frama-C as `-machdep <machine>`.
     pub machdep: Option<String>,
     /// Configurations to check instead of one. Each entry may carry `defines`,
@@ -428,6 +502,7 @@ pub struct CheckParams {
     #[serde(alias = "compilation_db")]
     pub compilation_database: Option<String>,
     /// Enable RTE annotation generation before EVA/WP. Default: true.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte: Option<bool>,
     /// Response size. "summary" (default) returns counts plus the first few
     /// non-valid goals and undischarged alarms; "full" returns every goal and

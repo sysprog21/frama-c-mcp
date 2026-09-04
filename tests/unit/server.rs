@@ -9,12 +9,13 @@ use frama_c_mcp::mcp::server::contracts::{result_unconstrained_findings, unconst
 use frama_c_mcp::mcp::server::eacsl::run_e_acsl_counterexample;
 use frama_c_mcp::mcp::server::wpclass::*;
 use frama_c_mcp::mcp::server::analysis::unproved_assumption_findings;
+use frama_c_mcp::mcp::server::checkgaps::{check_incomplete_items, WantedAnalyses};
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
     append_to_error_message, assumed_callee_contract_findings,
-    check_incomplete_items, finish_verify_program_step_response, goal_status_matches, present_statuses, reject_unknown_status,
-    wp_timed_out, WantedAnalyses,
+    finish_verify_program_step_response, goal_status_matches, present_statuses, reject_unknown_status,
+    wp_timed_out,
     GOAL_STATUS_UNPROVED, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
 };
 use frama_c_mcp::mcp::server::contracts::int_literal_before;
@@ -1515,6 +1516,7 @@ chmod +x "$out.e-acsl"
             force_includes: vec!["builtins.h".to_string()],
             machdep: Some("gcc_x86_64".to_string()),
             compilation_database: Some("compile-commands.json".to_string()),
+            ..Default::default()
         },
         None,
         &[],
@@ -1535,20 +1537,73 @@ chmod +x "$out.e-acsl"
     // the two copies is dropped, and one copy is exactly the failure this pins:
     // a project that needs a -D to parse needs the same -D to compile, so half
     // the flags means it analyzes and then fails to instrument.
-    let flags_follow = |flag: &str| {
-        payload["compile"]["command"].as_array().is_some_and(|command| {
-            command.windows(2).any(|pair| {
-                pair[0] == flag && pair[1] == "-Iinclude -DNDEBUG -include builtins.h"
+    let flags_after = |flag: &str| {
+        payload["compile"]["command"]
+            .as_array()
+            .and_then(|command| {
+                command
+                    .windows(2)
+                    .find(|pair| pair[0] == flag)
+                    .and_then(|pair| pair[1].as_str())
+                    .map(str::to_string)
             })
-        })
+            .unwrap_or_else(|| {
+                panic!("{flag} missing from {:?}", payload["compile"]["command"])
+            })
     };
     for flag in ["-E", "-e"] {
-        assert!(
-            flags_follow(flag),
-            "{flag} did not carry the preprocessor flags: {:?}",
-            payload["compile"]["command"]
+        assert_eq!(
+            flags_after(flag),
+            "-Iinclude -DNDEBUG -include builtins.h",
+            "{flag} did not carry the preprocessor flags"
         );
     }
+    // -nostdinc is the one flag that goes to the analyzer and not to the
+    // compiler behind it. Frama-C's modeled libc exists to be analyzed:
+    // dropping the real system headers from the gcc that builds the
+    // instrumented program leaves it without stdio, stdlib or the E-ACSL
+    // runtime headers, so a project that loads with nostdinc analyzes cleanly
+    // and then fails to build.
+    let with_nostdinc = run_e_acsl_counterexample(
+        "frama-c",
+        &[source.display().to_string()],
+        &ProjectLoadOptions {
+            include_paths: vec!["include".to_string()],
+            isystem_paths: vec!["/opt/frama-c/libc".to_string()],
+            nostdinc: true,
+            machdep: Some("gcc_x86_64".to_string()),
+            ..Default::default()
+        },
+        None,
+        &[],
+        5,
+        Some(tool.to_str().unwrap()),
+    )
+    .await;
+    let nostdinc_flags_after = |flag: &str| {
+        with_nostdinc["compile"]["command"]
+            .as_array()
+            .and_then(|command| {
+                command
+                    .windows(2)
+                    .find(|pair| pair[0] == flag)
+                    .and_then(|pair| pair[1].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                panic!("{flag} missing from {:?}", with_nostdinc["compile"]["command"])
+            })
+    };
+    assert_eq!(
+        nostdinc_flags_after("-E"),
+        "-nostdinc -Iinclude -isystem /opt/frama-c/libc"
+    );
+    assert_eq!(
+        nostdinc_flags_after("-e"),
+        "-Iinclude -isystem /opt/frama-c/libc",
+        "-nostdinc reached the C compiler"
+    );
+
     assert!(payload["compile"]["command"]
         .as_array()
         .is_some_and(|command| command.iter().any(|arg| arg == "--mbits")

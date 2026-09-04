@@ -1449,14 +1449,32 @@ fn profile_paths_are_not_normalized() {
             "defines": ["TARGET=1"],
             "force_includes": ["target.h"],
             "machdep": "gcc_x86_64",
+            "rte": false,
+            "isystem_paths": [],
+            "nostdinc": false,
             "provers": ["alt-ergo"],
             "timeout_seconds": 10
         }))
         .unwrap();
 
+        // Built through the function that writes it, so a field added to
+        // ProjectLoadOptions reaches these fixtures rather than making every
+        // one of them differ from the receipt for a reason no assertion names.
+        let target_load = || {
+            frama_c_mcp::mcp::server::receipt::project_load_identity(
+                &frama_c_mcp::mcp::server::ProjectLoadOptions {
+                    include_paths: vec!["include".into()],
+                    defines: vec!["TARGET=1".into()],
+                    force_includes: vec!["target.h".into()],
+                    machdep: Some("gcc_x86_64".into()),
+                    ..Default::default()
+                },
+            )
+        };
+
         let wrong_function = json!({
             "wp": {"functions": ["order_3"], "model": "Typed+cast"},
-            "subject": {"files": [{"path": "swap-frame.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+            "subject": {"files": [{"path": "swap-frame.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": target_load()}
         });
         assert!(
             profile_evidence_error("target", &profile, "swap", Some(&wrong_function))
@@ -1466,7 +1484,7 @@ fn profile_paths_are_not_normalized() {
 
         let wrong_source = json!({
             "wp": {"functions": ["swap"], "model": "Typed+cast"},
-            "subject": {"files": [{"path": "other.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+            "subject": {"files": [{"path": "other.c", "sha256": "h"}, {"path": "support.c", "sha256": "h"}], "project_load": target_load()}
         });
         assert!(
             profile_evidence_error("target", &profile, "swap", Some(&wrong_source))
@@ -1476,7 +1494,7 @@ fn profile_paths_are_not_normalized() {
 
         let matching_sources = json!({
             "wp": {"functions": ["swap"], "model": "Typed+cast"},
-            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": {"include_paths": ["include"], "defines": ["TARGET=1"], "force_includes": ["target.h"], "machdep": "gcc_x86_64", "compilation_database": null}}
+            "subject": {"files": [{"path": "support.c", "sha256": "h"}, {"path": "swap-frame.c", "sha256": "h"}], "project_load": target_load()}
         });
         assert_eq!(
             profile_evidence_error("target", &profile, "swap", Some(&matching_sources)),
@@ -1668,4 +1686,117 @@ fn a_sandbox_receipt_is_never_evidence_for_a_main_project_conclusion() {
             .expect("a sandbox receipt is not evidence about the main project");
         assert!(reason.contains("sandbox"), "unexpected refusal: {reason}");
     }
+}
+
+/// The quoted-object form, decoded where every other Value-typed parameter
+/// decodes it.
+///
+/// A client whose schema for verify_profiles carries no "type" may send the
+/// JSON text of the map rather than the map. Decoding that is unambiguous, so
+/// it is accepted; the alternative is such a caller failing on a payload that
+/// says exactly what it means. It used to be decoded a second time inside
+/// parse_verification_profiles, and the two copies disagreed on the empty
+/// string, so the test drives the boundary rather than the parser.
+fn profiles_param(raw: serde_json::Value) -> Result<serde_json::Value, String> {
+    let params: frama_c_mcp::mcp::types::ReloadProjectParams =
+        serde_json::from_value(json!({"verify_profiles": raw})).map_err(|e| e.to_string())?;
+    Ok(params.verify_profiles.unwrap_or(serde_json::Value::Null))
+}
+
+#[test]
+fn a_profile_map_sent_as_json_text_is_decoded() {
+    let decoded = profiles_param(json!(r#"{"align": {"sources": ["src/proved/align.h"]}}"#))
+        .expect("a stringified profile map decodes");
+    let profiles = parse_verification_profiles(&decoded).expect("and then parses");
+    assert!(profiles.contains_key("align"));
+
+    // The object form is untouched on the way through.
+    let direct = json!({"align": {"sources": ["src/proved/align.h"]}});
+    assert_eq!(profiles_param(direct.clone()).unwrap(), direct);
+}
+
+// An empty string means "unset", not "a malformed set".
+//
+// A behavior change, and a deliberate one: the whole tolerant-deserializer
+// family reads "" as absent because that is what a schema-less client sends for
+// a parameter it is not using, and verify_profiles used to be the one that
+// answered "not valid JSON" instead. Pinned so it stays a decision.
+#[test]
+fn an_empty_profiles_string_is_absent_rather_than_malformed() {
+    assert_eq!(profiles_param(json!("")).unwrap(), serde_json::Value::Null);
+    assert_eq!(profiles_param(json!("   ")).unwrap(), serde_json::Value::Null);
+
+    // Absent stays absent, and a real set still arrives.
+    assert_eq!(profiles_param(json!(null)).unwrap(), serde_json::Value::Null);
+}
+
+#[test]
+fn a_string_that_is_not_json_is_refused_at_the_boundary() {
+    let err = profiles_param(json!("not json at all")).unwrap_err();
+    assert!(err.contains("not valid JSON"), "{err}");
+}
+
+// The old message said only "must be an object", which gave a caller who sent
+// a string no way to tell that from a malformed object.
+#[test]
+fn a_wrong_type_names_what_arrived() {
+    let err = parse_verification_profiles(&json!([])).unwrap_err();
+    assert!(err.contains("an array"), "{err}");
+    let err = parse_verification_profiles(&json!(7)).unwrap_err();
+    assert!(err.contains("a number"), "{err}");
+}
+
+// Text that decodes to something other than a map is refused by what it decoded
+// to, since that is the value the parser is handed.
+#[test]
+fn json_text_of_a_non_object_is_refused_by_its_decoded_type() {
+    for (text, want) in [("[]", "an array"), ("true", "a boolean"), ("7", "a number")] {
+        let decoded = profiles_param(json!(text)).expect("valid JSON decodes");
+        let err = parse_verification_profiles(&decoded).unwrap_err();
+        assert!(err.contains(want), "{text}: {err}");
+    }
+
+    // One layer of quoting is unwrapped, not two: text that decodes to another
+    // string arrives at the parser as a string and is named as one.
+    let decoded = profiles_param(json!(r#""still text""#)).expect("valid JSON decodes");
+    let err = parse_verification_profiles(&decoded).unwrap_err();
+    assert!(err.contains("a string"), "{err}");
+}
+
+// run_wp refuses a profile that leaves rte or nostdinc unset, so the conclusion
+// path must refuse it too. Defaulting them to false here would check a receipt
+// against an invented load and pass for whichever setting happened to match.
+#[test]
+fn a_profile_silent_on_rte_or_nostdinc_cannot_check_a_receipt() {
+    let profile = |rte, nostdinc| crate::state::VerificationProfile {
+        functions: vec!["f".into()],
+        sources: vec!["a.c".into()],
+        model: Some("Typed".into()),
+        provers: vec!["alt-ergo".into()],
+        timeout_seconds: Some(10),
+        rte,
+        nostdinc,
+        ..Default::default()
+    };
+    let receipt = json!({
+        "wp": {"functions": ["f"], "model": "Typed"},
+        "subject": {"files": [{"path": "a.c", "sha256": "h"}], "project_load": {}}
+    });
+
+    for (rte, nostdinc) in [(None, Some(false)), (Some(false), None), (None, None)] {
+        let err = profile_evidence_error("t", &profile(rte, nostdinc), "f", Some(&receipt))
+            .unwrap_or_else(|| panic!("accepted a profile silent on one of them"));
+        // Names both, because the guard fires when either is unset and
+        // "rte or nostdinc" reads as though only one of them were missing.
+        assert!(err.contains("must state both rte and nostdinc"), "{err}");
+    }
+
+    // Stating both gets past this check and on to the load comparison, which is
+    // a different refusal: the point is that silence is not one of the answers.
+    let stated = profile(Some(false), Some(false));
+    let err = profile_evidence_error("t", &stated, "f", Some(&receipt));
+    assert!(
+        err.as_deref().is_none_or(|e| !e.contains("rte or nostdinc")),
+        "{err:?}"
+    );
 }
