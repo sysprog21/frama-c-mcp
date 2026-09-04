@@ -186,13 +186,7 @@ async fn spawn_mcp_client_inner(
     cwd: Option<&Path>,
     env: &[(&str, &str)],
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let binary = workspace_path("target/release/frama-c-mcp");
-    if !binary.exists() {
-        panic!(
-            "MCP binary missing: {}\nRun `cargo build --release` first.",
-            binary.display()
-        );
-    }
+    let binary = harness::release_binary();
     let frama_c = std::env::var("FRAMA_C_BIN").unwrap_or_else(|_| "frama-c".into());
 
     let mut cmd = Command::new(&binary);
@@ -9728,6 +9722,8 @@ async fn a_named_profile_decides_the_model_wp_proves_under() {
                     "model": "Typed+cast",
                     "provers": ["alt-ergo"],
                     "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
                     "reproduce": "make verify-demo"
                 },
                 "incomplete": {
@@ -9787,7 +9783,7 @@ async fn a_named_profile_decides_the_model_wp_proves_under() {
     )
     .await
     .expect_err("incomplete profile is not evidence");
-    assert!(format!("{error:?}").contains("missing functions, model, provers, or timeout_seconds"));
+    assert!(format!("{error:?}").contains("missing functions, model, provers, timeout_seconds, rte, or nostdinc"));
 
     let sandbox = call_tool_json(&client, "create_sandbox", json!({
         "function": "swap",
@@ -9855,6 +9851,8 @@ async fn a_profile_refuses_a_project_and_a_function_set_that_are_not_its_own() {
                     "model": "Typed+cast",
                     "provers": ["alt-ergo"],
                     "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
                     "reproduce": "make verify-swap"
                 }
             }
@@ -9917,6 +9915,8 @@ async fn a_conclusion_can_name_the_target_it_settles() {
                     "model": "Typed+cast",
                     "provers": ["alt-ergo"],
                     "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
                     "reproduce": "make verify-swap"
                 },
 
@@ -9929,6 +9929,8 @@ async fn a_conclusion_can_name_the_target_it_settles() {
                     "model": "Typed+nocast",
                     "provers": ["alt-ergo"],
                     "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
                     "reproduce": "make verify-swap-nocast"
                 }
             },
@@ -10032,4 +10034,136 @@ async fn a_conclusion_can_name_the_target_it_settles() {
     let text = format!("{listed:?}");
     assert!(text.contains("\"verify_profile\": String(\"swap\")"), "{text}");
     assert!(text.contains("make verify-swap"), "{text}");
+}
+
+/// The load settings a receipt is hashed over have to be visible in the load.
+///
+/// isystem_paths and nostdinc decide which headers the files were compiled
+/// against, so they are part of project_load_identity and therefore part of the
+/// proof receipt digest. The response echoed every other load setting and not
+/// these two, which left a caller unable to check what program it had actually
+/// loaded against the target it meant to load.
+#[tokio::test]
+async fn reload_echoes_the_header_settings_its_receipt_is_hashed_over() {
+    let c_file = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let stubs = c_file.parent().unwrap().to_str().unwrap().to_string();
+
+    let plain = call_tool_json(
+        &client,
+        "reload_project",
+        json!({"files": [c_file.to_str().unwrap()]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plain["isystem_paths"], json!([]), "{plain:?}");
+    assert_eq!(plain["nostdinc"], false, "{plain:?}");
+
+    let with_headers = call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [c_file.to_str().unwrap()],
+            "isystem_paths": [stubs.clone()],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(with_headers["isystem_paths"], json!([stubs]), "{with_headers:?}");
+    assert_eq!(with_headers["nostdinc"], false, "{with_headers:?}");
+}
+
+/// Naming a target must not quietly change what gets loaded.
+///
+/// check's RTE default is on. reload_project resolves an unset rte through the
+/// named profile and then to false, which is right for a load and wrong here: a
+/// profile silent on rte turned RTE off the moment a target was named, so the
+/// call README documents as the way to check a target parsed a program with no
+/// runtime-error obligations in it, and reported EVA and the parse against
+/// that. The profile still decides when it states a value, and the caller
+/// still decides over both.
+#[tokio::test]
+async fn naming_a_profile_does_not_turn_off_the_runtime_error_checks() {
+    let c_file = tutorial_c("swap-frame.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let complete = |rte: bool| {
+        json!({
+            "sources": [c_file.to_str().unwrap()],
+            "functions": ["swap"],
+            "model": "Typed+cast",
+            "provers": ["alt-ergo"],
+            "timeout_seconds": 10,
+            "rte": rte,
+            "nostdinc": false,
+            "reproduce": "make verify"
+        })
+    };
+
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [c_file.to_str().unwrap()],
+            "verify_profiles": {
+                // Registered for loading only: it says nothing about rte, so it
+                // cannot be proof evidence and run_wp refuses it. What it must
+                // not do is quietly decide the load.
+                "silent": {
+                    "sources": [c_file.to_str().unwrap()],
+                    "functions": ["swap"],
+                    "model": "Typed+cast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "reproduce": "make verify-silent"
+                },
+                "no_rte": complete(false),
+                "with_rte": complete(true),
+            },
+            "verify_profiles_source": "make print-verify-profiles"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let loaded_rte = |args: serde_json::Value| {
+        let client = &client;
+        async move {
+            let result = call_tool_json(client, "check", args).await.unwrap();
+            result["reload"]["rte"].clone()
+        }
+    };
+
+    // No profile named: check's own default, which is on.
+    assert_eq!(
+        loaded_rte(json!({"function": "swap", "timeout": 1})).await,
+        true
+    );
+
+    // A profile that says nothing about rte must not overrule that default.
+    assert_eq!(
+        loaded_rte(json!({"function": "swap", "timeout": 1, "verify_profile": "silent"})).await,
+        true,
+        "naming a target turned RTE off"
+    );
+
+    // One that does say so still decides, in both directions: that is the
+    // target's own setting and the run is labelled as its evidence.
+    assert_eq!(
+        loaded_rte(json!({"function": "swap", "timeout": 1, "verify_profile": "no_rte"})).await,
+        false
+    );
+    assert_eq!(
+        loaded_rte(json!({"function": "swap", "timeout": 1, "verify_profile": "with_rte"})).await,
+        true
+    );
+
+    // And the caller wins over both.
+    assert_eq!(
+        loaded_rte(json!({
+            "function": "swap", "timeout": 1, "verify_profile": "with_rte", "rte": false
+        }))
+        .await,
+        false
+    );
 }

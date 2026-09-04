@@ -409,10 +409,69 @@ impl FramaCMcpServer {
                 "sources": profile.sources,
                 "model": profile.model,
                 "machdep": profile.machdep,
+
+                // What the profile had to say about the load, so a reader can
+                // see that these came from the target rather than from a
+                // default. Each of them changes which obligations exist, which
+                // makes them the settings most worth attributing.
+                "rte": profile.rte,
+                "isystem_paths": profile.isystem_paths,
+                "nostdinc": profile.nostdinc,
                 "reproduce": profile.reproduce,
             })
         });
         Ok((profile, profile_used))
+    }
+
+    /// What this call loads: the file set it names and the flags it loads them
+    /// under.
+    ///
+    /// Split out of reload_project because it is the one part that answers from
+    /// its arguments alone: no lock, no client, no process. The rest of that
+    /// function is a sequence over the live instance, which is why the length
+    /// ceiling had nowhere else to give.
+    ///
+    /// The caller wins in every field, then the profile, then the type's own
+    /// default. That order is what makes loading a target by name bring the
+    /// target's settings with it rather than silently defaulting to a load the
+    /// target was never proved under.
+    fn requested_load(
+        params: &mut ReloadProjectParams,
+        profile: Option<&crate::state::VerificationProfile>,
+    ) -> Result<(Option<Vec<String>>, ProjectLoadOptions), McpError> {
+        // The profile's sources are what "load this target" means, and they
+        // stand in only where the caller named none.
+        let requested_files = params.files.clone().or_else(|| {
+            profile
+                .filter(|profile| !profile.sources.is_empty())
+                .map(|profile| profile.sources.clone())
+        });
+
+        let flag = |explicit: Option<bool>,
+                    pick: fn(&crate::state::VerificationProfile) -> Option<bool>| {
+            explicit.or_else(|| profile.and_then(pick)).unwrap_or(false)
+        };
+        let list = |explicit: Option<Vec<String>>,
+                    pick: fn(&crate::state::VerificationProfile) -> &Vec<String>| {
+            explicit
+                .unwrap_or_else(|| profile.map(|profile| pick(profile).clone()).unwrap_or_default())
+        };
+
+        let options = ProjectLoadOptions {
+            include_paths: list(params.include_paths.take(), |p| &p.include_paths),
+            defines: list(params.defines.take(), |p| &p.defines),
+            force_includes: list(params.force_includes.take(), |p| &p.force_includes),
+            machdep: params
+                .machdep
+                .take()
+                .or_else(|| profile.and_then(|profile| profile.machdep.clone())),
+            compilation_database: params.compilation_database.take(),
+            rte: flag(params.rte, |p| p.rte),
+            isystem_paths: list(params.isystem_paths.take(), |p| &p.isystem_paths),
+            nostdinc: flag(params.nostdinc, |p| p.nostdinc),
+        };
+        validate_project_options(&options)?;
+        Ok((requested_files, options))
     }
 
     #[tool(
@@ -421,7 +480,7 @@ impl FramaCMcpServer {
     )]
     pub async fn reload_project(
         &self,
-        Parameters(params): Parameters<ReloadProjectParams>,
+        Parameters(mut params): Parameters<ReloadProjectParams>,
     ) -> Result<CallToolResult, McpError> {
         // Check project lock
         if *self.project_locked.read().await {
@@ -435,31 +494,9 @@ impl FramaCMcpServer {
 
         let (profile, profile_used) = self.resolve_verify_profile(&params).await?;
 
-        // The profile's sources are what "load this target" means, and they
-        // stand in only where the caller named none.
-        let requested_files = params.files.clone().or_else(|| {
-            profile
-                .as_ref()
-                .filter(|profile| !profile.sources.is_empty())
-                .map(|profile| profile.sources.clone())
-        });
-
-        let rte = params.rte.unwrap_or(false);
-        let from_profile = |explicit: Option<Vec<String>>, pick: fn(&crate::state::VerificationProfile) -> &Vec<String>| {
-            explicit.unwrap_or_else(|| {
-                profile.as_ref().map(|profile| pick(profile).clone()).unwrap_or_default()
-            })
-        };
-        let project_options = ProjectLoadOptions {
-            include_paths: from_profile(params.include_paths, |p| &p.include_paths),
-            defines: from_profile(params.defines, |p| &p.defines),
-            force_includes: from_profile(params.force_includes, |p| &p.force_includes),
-            machdep: params
-                .machdep
-                .or_else(|| profile.as_ref().and_then(|profile| profile.machdep.clone())),
-            compilation_database: params.compilation_database,
-        };
-        validate_project_options(&project_options)?;
+        let (requested_files, project_options) =
+            Self::requested_load(&mut params, profile.as_ref())?;
+        let rte = project_options.rte;
 
         // Serialized with run_wp on the main instance: the steps below read the
         // live instance (marker snapshot) and ensure_main_spawned can respawn
@@ -470,8 +507,10 @@ impl FramaCMcpServer {
 
         // And the EVA transaction, because a re-parse swaps the AST that a
         // concurrent check's alarms are read against. Taken after the WP lock
-        // and never before it: this is the only site that holds both, so the
-        // order here is the whole ordering rule.
+        // and never before it. This is the only site that holds more than two
+        // of the server's locks, so it is where the order documented on
+        // FramaCMcpServer comes from; changing the sequence here changes the
+        // rule for everything.
         let _eva_op_guard = self.main_eva_lock.lock().await;
         if *self.project_locked.read().await {
             return Err(project_locked_error(
@@ -554,7 +593,7 @@ impl FramaCMcpServer {
         };
 
         // Spawns, respawns, or reloads in place as the options require.
-        self.ensure_main_spawned(files.clone(), rte, project_options.clone())
+        self.ensure_main_spawned(files.clone(), project_options.clone())
             .await?;
 
         // ast_reload_health resets the fetch cursors before fetching. Skipping
@@ -665,6 +704,14 @@ impl FramaCMcpServer {
             "include_paths": project_options.include_paths,
             "defines": project_options.defines,
             "force_includes": project_options.force_includes,
+
+            // Echoed like every sibling here, and for a stronger reason than
+            // most: these two decide which headers the files were compiled
+            // against, so they are part of the load identity a receipt is
+            // hashed over. A caller could not otherwise see which program this
+            // load actually built.
+            "isystem_paths": project_options.isystem_paths,
+            "nostdinc": project_options.nostdinc,
             "machdep": project_options.machdep,
             "compilation_database": project_options.compilation_database,
             "source_location_stability": {
@@ -996,6 +1043,16 @@ impl FramaCMcpServer {
             force_includes: params.force_includes.unwrap_or_default(),
             machdep: params.machdep,
             compilation_database: None,
+
+            // This path measures whether files parse; it never runs WP, so no
+            // obligations are generated either way.
+            rte: false,
+
+            // These two do change the answer: they decide which headers a file
+            // is compiled against, and a survey run without the flags the build
+            // passes measures a different program than the build parses.
+            isystem_paths: params.isystem_paths.unwrap_or_default(),
+            nostdinc: params.nostdinc.unwrap_or(false),
         };
         validate_project_options(&options)?;
         let args = project_cli_args(&options);
@@ -1241,15 +1298,43 @@ pub fn classify_parse_failure(output: &str) -> ParseBlock {
         // Matched case-insensitively. Frama-C writes "User Error:" as often as
         // "user error", and a case-sensitive search left the one branch whose
         // job is to quote what it could not classify returning an empty string.
-        message: output
-            .lines()
-            .find(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower.contains("user error") || lower.contains("error:")
-            })
-            .map(|line| line.trim().to_string())
-            .unwrap_or_default(),
+        message: unclassified_message(output),
     }
+}
+
+/// The error line plus the body under it.
+///
+/// Frama-C puts the location on the line carrying "User Error:" and the reason
+/// on the indented lines after it, so quoting one line yields
+/// "src/syscall/sys.c:86: User Error:" and names nothing. That is the branch
+/// whose whole job is to say what it could not classify, and it was the half
+/// that mattered: the line below it read "Cannot find field ru_maxrss in type
+/// struct rusage", which identifies the cause outright.
+///
+/// Bounded, because the echoed source that follows can run long and this is a
+/// diagnostic rather than a transcript.
+fn unclassified_message(output: &str) -> String {
+    const MAX_BODY_LINES: usize = 4;
+
+    let mut lines = output.lines().skip_while(|line| {
+        let lower = line.to_ascii_lowercase();
+        !(lower.contains("user error") || lower.contains("error:"))
+    });
+    let Some(head) = lines.next() else {
+        return String::new();
+    };
+
+    // Continuation is indentation: the next unindented line is a new message,
+    // not more of this one.
+    let body = lines
+        .take_while(|line| line.starts_with(char::is_whitespace) && !line.trim().is_empty())
+        .take(MAX_BODY_LINES);
+
+    std::iter::once(head)
+        .chain(body)
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether a line is an include directive naming this header.
@@ -1457,12 +1542,12 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
         "force_includes entries must be non-empty header names of [A-Za-z0-9_./+-] \
          without a leading dash (write \"builtins.h\", not \"-include builtins.h\")",
     )?;
+    validate_cpp_entries(
+        &options.isystem_paths,
+        "isystem_paths entries must be non-empty directories of [A-Za-z0-9_./+-] \
+         without a leading dash (write \"include\", not \"-isystem include\")",
+    )?;
 
-    // These two land in the same argv as the three lists above, as their own
-    // tokens, so the leading-dash rule applies to them for the same reason it
-    // applies there. It used to stop at the three, and the gap read as
-    // deliberate because the error text above teaches the rule.
-    //
     // compilation_database gets only the dash rule, because it is a path the
     // caller chose and a real one can hold a character the preprocessor
     // allowlist was never written for. Refusing those would be this validator

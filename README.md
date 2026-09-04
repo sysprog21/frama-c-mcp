@@ -54,9 +54,13 @@ The server holds one project: `reload_project` or the first `check` loads it,
 and later calls operate on that AST. Sandboxes are separate processes,
 addressed as `experiment_id:function`.
 
-The preprocessor surface is `include_paths`, `defines`, `force_includes`, and
-`machdep`, applied in that order. Each value is written without its compiler
-flag.
+The preprocessor surface is `nostdinc`, `include_paths`, `isystem_paths`,
+`defines`, `force_includes`, and `machdep`, applied in that order. Each value is
+written without its compiler flag. `nostdinc` drops the preprocessor's default
+system directories and `isystem_paths` are searched after `include_paths`; pair
+them to put a modeled libc where the real system headers would otherwise be
+found. Both are part of the load identity a proof receipt is hashed over,
+because they decide which declarations a file is compiled against.
 
 ## Quick start
 
@@ -365,12 +369,16 @@ reparse. A malformed set is refused before anything is replaced; a set that
 parses is registered even if the load that follows it fails.
 
 A profile that is only used to load may carry `sources`, `machdep`,
-`include_paths`, `defines`, `force_includes` and `reproduce`. One you intend to
-prove under additionally needs `functions`, `model`, `provers` and
-`timeout_seconds`, and a run naming it is refused unless all four are there:
-without the proof settings it would fall back to this server's defaults and
-report the target's name over them, and without a function set there is nothing
-for the coverage check to compare against. Emit the JSON from the build system that defines the targets
+`include_paths`, `isystem_paths`, `nostdinc`, `defines`, `force_includes` and
+`reproduce`. One you intend to prove under additionally needs `functions`,
+`model`, `provers`, `timeout_seconds`, `rte` and `nostdinc`, and a run naming it
+is refused unless all six are there: without the proof settings it would fall
+back to this server's defaults and report the target's name over them, without a
+function set there is nothing for the coverage check to compare against, and
+`rte` and `nostdinc` each decide which obligations exist at all, so a run
+missing either discharges a different set than the target's own command does.
+A profile written before those two were required still loads; it is refused only
+where it would have become evidence, and stating them restores it. Emit the JSON from the build system that defines the targets
 rather than writing it by hand, so it cannot drift from the command that
 decides. An unknown key is refused rather than ignored. A profile
 whose model key is misspelled as `models` would otherwise register with no
@@ -384,9 +392,10 @@ refused rather than allowed to win. A run labelled as a target's evidence has
 to be the target's settings, and letting an override through produced exactly
 the mislabelling profiles exist to prevent: proving under one model while the
 response named another. Omit `verify_profile` to deviate on purpose.
-Evidence profiles must declare all three proof settings: `model`, non-empty
-`provers`, and `timeout_seconds`; an incomplete profile may be registered for
-loading, but cannot label a proof result. Sandboxes are likewise excluded:
+Evidence profiles must declare all five settings that decide what gets proved
+and over what: `model`, non-empty `provers`, `timeout_seconds`, `rte` and
+`nostdinc`; an incomplete profile may be registered for loading, but cannot
+label a proof result. Sandboxes are likewise excluded:
 their generated source is not the registered build target.
 
 The load settings behave the same way by a different route. `reload_project`
@@ -399,8 +408,8 @@ target's evidence either.
 accelerator: goals discharging here are progress, and the project's own command
 is the verdict.
 
-`reload_project {include_paths, defines, force_includes}` become preprocessor
-flags, and Frama-C hands those to a shell (its `-cpp-extra-args` is "unsafe in
+`reload_project {include_paths, isystem_paths, defines, force_includes}` become
+preprocessor flags, and Frama-C hands those to a shell (its `-cpp-extra-args` is "unsafe in
 sandbox mode"). Each entry is therefore restricted to `[A-Za-z0-9_./+-]`, plus
 `=` for defines, with no leading dash, so a value cannot carry a command
 substitution or the `${IFS}` space trick into that shell. A define needing a

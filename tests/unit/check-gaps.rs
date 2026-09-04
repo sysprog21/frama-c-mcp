@@ -4,14 +4,21 @@ use frama_c_mcp::error::FramaCError;
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
+    goal_needs_failure_classification,
+    property_is_dead, render_sequent,
+    wp_backend_anomaly_left_goal_unjudged,
+};
+
+// The band this file was named after now has a module of its own in src/, for
+// the same reason this file came out of tests/unit/server.rs.
+use frama_c_mcp::mcp::server::checkgaps::{
     check_blocked_reason,
-    gap_guidance,
-    incomplete_guidance,
     check_incomplete_items,
     check_variants_summary,
-    goal_needs_failure_classification,
-    property_is_dead, render_sequent, WantedAnalyses,
-    wp_backend_anomaly_left_goal_unjudged,
+    gap_guidance,
+    incomplete_guidance,
+    check_next_call, incomplete_code, NextCallInputs,
+    WantedAnalyses,
 };
 use frama_c_mcp::mcp::server::selfcheck::{
     buggy_fixture_reason, fixed_fixture_reason,
@@ -1407,4 +1414,88 @@ fn variant_summary_will_not_call_an_unchecked_matrix_proved() {
     assert_eq!(partial["verdict"], "incomplete", "{partial:?}");
     assert_eq!(partial["ast_digest_unavailable_count"], 1);
     assert_eq!(partial["distinct_asts"], 1);
+}
+
+/// A crashed backend is read before the goal it left behind.
+///
+/// Extracted from check_payload as check_next_call, which is what made this
+/// testable at all: the ordering used to be a 67-line fallback chain inside a
+/// 296-line method, and breaking the first link failed nothing.
+///
+/// The order matters in both directions. A Why3 abort stamps goals FAILED with
+/// no prover having answered, so pointing the caller at such a goal sends them
+/// to rewrite an annotation that was never judged. But an abort that cost no
+/// goal its verdict must not displace a call targeting a goal still open,
+/// which is what anomaly_left_goals_unjudged gates.
+#[test]
+fn a_crashed_backend_outranks_the_goal_it_left_unjudged() {
+    let diagnosis = json!({
+        "next_action": {"tool": "run_wp", "args": {"model": "Typed+cast"}, "reason": "backend"}
+    });
+    let alarms = json!([{
+        "marker": "#p1",
+        "normalized_status": "unknown",
+        "kind": "mem_access",
+    }]);
+    let goals = json!([{"stable_goal_id": "g1", "normalized_status": "unknown"}]);
+
+    let next = |unjudged: bool| {
+        check_next_call(NextCallInputs {
+            backend_diagnosis: &diagnosis,
+            anomaly_left_goals_unjudged: unjudged,
+            eva_alarms: &alarms,
+            wp_goals: &goals,
+            incomplete: &[],
+            wanted: WantedAnalyses::BOTH,
+            function: None,
+        })
+    };
+
+    // The abort left something unjudged, so it is what the caller is sent at.
+    assert_eq!(next(true)["reason"], "backend", "{:?}", next(true));
+
+    // It cost no goal its verdict, so the open goal wins instead.
+    assert_ne!(next(false)["reason"], "backend", "{:?}", next(false));
+}
+
+/// With nothing to point at, the fallback says which sentence it means.
+///
+/// "Nothing to target" and "nothing wrong" are different, and a clean run is
+/// exactly when vacuity is worth raising: check runs no smoke tests, so an
+/// over-strong requires proves everything and silently excludes the branch it
+/// forbids.
+#[test]
+fn the_fallback_separates_a_clean_run_from_a_blocked_one() {
+    let empty = json!([]);
+    let next = |incomplete: &[serde_json::Value]| {
+        check_next_call(NextCallInputs {
+            backend_diagnosis: &json!({}),
+            anomaly_left_goals_unjudged: false,
+            eva_alarms: &empty,
+            wp_goals: &empty,
+            incomplete,
+            wanted: WantedAnalyses::BOTH,
+            function: None,
+        })
+    };
+
+    let clean = next(&[]);
+    assert_eq!(clean["tool"], "get_wp_goals", "{clean:?}");
+    assert!(clean["reason"].as_str().unwrap().contains("vacuity"), "{clean:?}");
+
+    let blocked = next(&[json!({"code": incomplete_code::WP_NOT_RUN, "reason": "x"})]);
+    assert!(!blocked["reason"].as_str().unwrap().contains("vacuity"), "{blocked:?}");
+
+    // An analysis the caller left out is answered by asking for it, not by
+    // reading the table nothing filled.
+    let skipped = check_next_call(NextCallInputs {
+        backend_diagnosis: &json!({}),
+        anomaly_left_goals_unjudged: false,
+        eva_alarms: &empty,
+        wp_goals: &empty,
+        incomplete: &[],
+        wanted: WantedAnalyses { eva: true, wp: false },
+        function: None,
+    });
+    assert_eq!(skipped["tool"], "check", "{skipped:?}");
 }

@@ -74,6 +74,17 @@ pub fn profile_evidence_error(
         ));
     }
     if let Some(receipt) = receipt {
+        // Stated, never defaulted. run_wp refuses a profile that leaves either
+        // unset, so accepting one here would let a conclusion rest on evidence
+        // that same profile could not have produced: the comparison below would
+        // run against an invented "false" and pass for a receipt made under
+        // whichever setting happened to match it.
+        let (Some(rte), Some(nostdinc)) = (profile.rte, profile.nostdinc) else {
+            return Some(format!(
+                "verify_profile \"{name}\" does not state rte or nostdinc, so a receipt cannot be checked against it"
+            ));
+        };
+
         // Built through the same spelling the receipt writes, so a field added
         // to the identity reaches this comparison rather than silently making
         // every receipt look different from every target.
@@ -83,6 +94,9 @@ pub fn profile_evidence_error(
             force_includes: profile.force_includes.clone(),
             machdep: profile.machdep.clone(),
             compilation_database: None,
+            rte,
+            isystem_paths: profile.isystem_paths.clone(),
+            nostdinc,
         });
         if receipt.pointer("/subject/project_load") != Some(&expected_load) {
             return Some(format!(

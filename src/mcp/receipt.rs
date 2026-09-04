@@ -40,13 +40,13 @@ pub fn receipt_source_path(file: &str) -> String {
 /// that is current now. A receipt is only evidence about the program it was
 /// produced over, and these are the settings that decide which program that is.
 pub fn project_load_identity(options: &super::ProjectLoadOptions) -> serde_json::Value {
-    json!({
-        "include_paths": options.include_paths,
-        "defines": options.defines,
-        "force_includes": options.force_includes,
-        "machdep": options.machdep,
-        "compilation_database": options.compilation_database,
-    })
+    // The struct's own Serialize, so the identity covers every field by
+    // construction. This was an exhaustive destructure feeding a json! that
+    // restated all eight names, which is a third hand-maintained copy of the
+    // field list guarding a property the derive gives outright. Forgetting one
+    // left two different programs sharing a receipt digest, and nothing
+    // downstream could detect it.
+    serde_json::to_value(options).unwrap_or(serde_json::Value::Null)
 }
 
 fn proof_receipt_source_files(files: &[String]) -> Vec<serde_json::Value> {
@@ -116,7 +116,13 @@ pub fn proof_receipt_goals(
                 // receipts match are supposed to be comparable, and a replayed
                 // verdict was not computed by the run claiming it, so it cannot
                 // hash the same as one that was.
-                "from_cache": goal.get("from_cache").cloned().unwrap_or_else(|| json!(false)),
+                //
+                // Read through the accessor rather than off the key.
+                // enrich_goal_stable_id omits the field on a goal that had no
+                // summary to project, so a raw read defaults such a goal to
+                // "not cached", which is the direction that hides a replayed
+                // verdict, on the payload the receipt hashes.
+                "from_cache": json!(crate::mcp::server::wpclass::goal_is_from_cache(&goal)),
             })
         })
         .collect::<Vec<_>>();

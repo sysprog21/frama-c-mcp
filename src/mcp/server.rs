@@ -1266,15 +1266,45 @@ pub fn default_wp_model() -> &'static str {
     "Typed+nocast"
 }
 
-pub fn wp_run_response(
-    tasks: serde_json::Value,
-    params: &RunWpParams,
-    functions: Vec<String>,
-    scope: &str,
-    rte_enabled: bool,
-    frama_c_protocol: Vec<serde_json::Value>,
-    proofread_report: Option<serde_json::Value>,
-) -> serde_json::Value {
+/// One WP run, as the thing that renders its response sees it.
+///
+/// A struct rather than nine positional arguments, for the reason
+/// ProofReceiptRequest beside it is one. Nine of anything past a call site is
+/// unreadable, and clippy refuses it at seven. The fields do all have distinct
+/// types, so the compiler would catch a swap either way; what the names buy is
+/// a reader who can see which argument is which without counting commas
+/// against the declaration.
+pub struct WpRunResponse<'a> {
+    pub tasks: serde_json::Value,
+    pub params: &'a RunWpParams,
+    pub functions: Vec<String>,
+    pub scope: &'a str,
+    pub rte_enabled: bool,
+    pub frama_c_protocol: Vec<serde_json::Value>,
+    pub proofread_report: Option<serde_json::Value>,
+
+    /// This run's goals, so the response can say how much of its own evidence
+    /// was measured here rather than replayed from WP's cache.
+    pub goals: Option<&'a [serde_json::Value]>,
+
+    /// The host load as it was before this run scheduled anything. Carried
+    /// rather than read at render time: read then, it is mostly this run's own
+    /// provers. See host_load.
+    pub host_load: crate::mcp::server::wpclass::HostLoad,
+}
+
+pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
+    let WpRunResponse {
+        tasks,
+        params,
+        functions,
+        scope,
+        rte_enabled,
+        frama_c_protocol,
+        proofread_report,
+        goals,
+        host_load,
+    } = run;
     let model = params.model.as_deref().unwrap_or(default_wp_model());
 
     // Reported as the list it names, in either spelling. Echoing the singular
@@ -1355,15 +1385,34 @@ pub fn wp_run_response(
         "split_strategy": serde_json::Value::Null,
         "raw_task_ids": collect_json_string_fields(&tasks, &["id", "task_id", "taskId"]),
     });
-    let timeout_triage =
-        wp_timeout_triage_from_tasks_and_report(&tasks, proofread_report.as_ref());
+    let measurement = goals.map(crate::mcp::server::wpclass::run_measurement);
+    let timeout_triage = wp_timeout_triage_from_tasks_and_report(
+        &tasks,
+        proofread_report.as_ref(),
+        measurement.as_ref(),
+        host_load,
+    );
     let failure_kind = wp_failure_kind_from_tasks(&tasks, &timeout_triage);
+
+    // The reading itself, beside the response and never inside the triage. The
+    // triage is hashed into the proof receipt, so it carries only the category;
+    // a caller that wants to see how loaded the machine actually was reads it
+    // here, where two runs differing by nothing else still compare equal.
+    let host_load = json!({
+        "per_cpu": host_load.per_cpu(),
+        "category": host_load.category(),
+        "saturated_above": crate::mcp::server::wpclass::HOST_SATURATED_LOAD_PER_CPU,
+    });
 
     match tasks {
         serde_json::Value::Object(mut object) => {
             object.insert("effective_wp_config".to_string(), config);
             object.insert("frama_c_options".to_string(), json!(frama_c_options));
             object.insert("frama_c_protocol".to_string(), json!(frama_c_protocol));
+            if let Some(measurement) = &measurement {
+                object.insert("measurement".to_string(), measurement.to_json());
+            }
+            object.insert("host_load".to_string(), host_load);
             object.insert("wp_timeout_triage".to_string(), timeout_triage);
             object.insert("failure_kind".to_string(), json!(failure_kind));
             if let Some(report) = proofread_report {
@@ -1377,9 +1426,17 @@ pub fn wp_run_response(
                 "effective_wp_config": config,
                 "frama_c_options": frama_c_options,
                 "frama_c_protocol": frama_c_protocol,
+                "host_load": host_load,
                 "wp_timeout_triage": timeout_triage,
                 "failure_kind": failure_kind,
             });
+
+            // Both arms, because drain_wp_tasks returns whatever Frama-C sent
+            // whenever it cannot count the queue, and a response missing the
+            // counts reads as a run with nothing replayed.
+            if let Some(measurement) = &measurement {
+                response["measurement"] = measurement.to_json();
+            }
             if let Some(report) = proofread_report {
                 response["proofread_report"] = report;
             }
@@ -1545,17 +1602,35 @@ pub fn validate_wp_cache_mode(requested: &str) -> Result<&'static str, McpError>
 /// path and the defines already in effect; a header force-included before its
 /// own -I would not resolve its own includes.
 pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
-    let flags = options
-        .include_paths
-        .iter()
-        .map(|path| format!("-I{path}"))
-        .chain(options.defines.iter().map(|define| format!("-D{define}")))
-        .chain(
-            options
-                .force_includes
-                .iter()
-                .map(|header| format!("-include {header}")),
-        )
+    // -nostdinc leads, because it removes search directories the flags after it
+    // then put back deliberately. -isystem follows the -I set, which is the
+    // order the preprocessor searches them in, so the modeled libc is found
+    // only where the project's own headers do not answer first.
+    //
+    // Destructured exhaustively, for the reason given on ProjectLoadOptions.
+    let ProjectLoadOptions {
+        include_paths,
+        defines,
+        force_includes,
+        isystem_paths,
+        nostdinc,
+
+        // Not preprocessor flags: they reach Frama-C as its own arguments, in
+        // project_cli_args.
+        machdep: _,
+        compilation_database: _,
+
+        // Not a flag at all: it selects whether Frama-C is started with -rte.
+        rte: _,
+    } = options;
+
+    let flags = nostdinc
+        .then(|| "-nostdinc".to_string())
+        .into_iter()
+        .chain(include_paths.iter().map(|path| format!("-I{path}")))
+        .chain(isystem_paths.iter().map(|path| format!("-isystem {path}")))
+        .chain(defines.iter().map(|define| format!("-D{define}")))
+        .chain(force_includes.iter().map(|header| format!("-include {header}")))
         .collect::<Vec<_>>();
     if flags.is_empty() {
         return None;
@@ -1607,15 +1682,37 @@ impl FramaCMcpServer {
 }
 
 pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
+    // Destructured exhaustively, as cpp_extra_args is and for the reason given
+    // on ProjectLoadOptions: a field added there is a compile error here rather
+    // than a Frama-C invocation that quietly loads a different program.
+    let ProjectLoadOptions {
+        machdep,
+        compilation_database,
+
+        // Preprocessor flags, folded into one -cpp-extra-args below.
+        include_paths: _,
+        defines: _,
+        force_includes: _,
+        isystem_paths: _,
+        nostdinc: _,
+
+        // Not emitted here. These arguments serve short-lived CLI runs that
+        // generate their own obligations, and each already decides for itself:
+        // wpcli passes -wp-rte where the run needs it, and parse_surface runs
+        // no proof at all. Emitting -rte here would add obligations to runs
+        // whose callers pass the flag a second time.
+        rte: _,
+    } = options;
+
     let mut args = Vec::new();
     if let Some(cpp_args) = cpp_extra_args(options) {
         args.push(format!("-cpp-extra-args={cpp_args}"));
     }
-    if let Some(machdep) = &options.machdep {
+    if let Some(machdep) = machdep {
         args.push("-machdep".to_string());
         args.push(machdep.clone());
     }
-    if let Some(compilation_database) = &options.compilation_database {
+    if let Some(compilation_database) = compilation_database {
         args.push("-compilation-db".to_string());
         args.push(compilation_database.clone());
     }
@@ -2042,13 +2139,15 @@ async fn source_identity(files: Vec<String>, machdep: Option<String>) -> (String
 /// **Known limitation**: SIGKILL/OOM/crash bypass Drop, so the Frama-C child
 /// can still be orphaned
 /// until a kernel-level PR_SET_PDEATHSIG fix is added.
-/// `socket_path` / `files` / `with_rte` / project options drive
-/// ensure_main_spawned's in-place-vs-respawn decision.
+/// The socket path, the file set and the project options drive
+/// ensure_main_spawned's
+/// in-place-vs-respawn decision. RTE lives in the options rather than beside
+/// them, so there is one spelling for a setting that decides which obligations
+/// the process generates.
 pub struct MainFramaCState {
     pub child: tokio::process::Child,
     pub socket_path: PathBuf,
     pub files: Vec<String>,
-    pub with_rte: bool,
     pub project_options: ProjectLoadOptions,
     pub pid: u32,
     pub command_line: Vec<String>,
@@ -2127,13 +2226,51 @@ impl Drop for MainFramaCState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// What was loaded, and under which flags.
+///
+/// Serialize is derived rather than written, and project_load_identity is that
+/// derive. The identity has to cover every field, which is exactly what the
+/// derive means, so a field added here reaches the receipt with no discipline
+/// to remember. The hand-written version was three copies of the field list
+/// away from that guarantee and enforced it by an exhaustive destructure whose
+/// only job was to fail to compile.
+///
+/// Field order is the identity's key order, because serde_json is built with
+/// preserve_order and the identity is hashed. Inserting a field in the middle
+/// moves the digest of every receipt; append instead.
+///
+/// The functions that consume these fields selectively (cpp_extra_args,
+/// project_cli_args, names_bytes_outside_the_file_set,
+/// profile_matches_loaded_project) destructure exhaustively rather than reading
+/// field by field, so a field added here is a compile error at each of them
+/// instead of a silently weaker answer. Every one of them fails open when a
+/// field is forgotten, which is why the discipline is stated once here rather
+/// than argued four times.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectLoadOptions {
     pub include_paths: Vec<String>,
     pub defines: Vec<String>,
     pub force_includes: Vec<String>,
     pub machdep: Option<String>,
     pub compilation_database: Option<String>,
+
+    /// Whether this load generates runtime-error obligations.
+    ///
+    /// Part of the load identity, not a run setting: -wp-rte is applied when
+    /// Frama-C starts, and it changes which obligations exist, so two loads
+    /// differing only here are different programs to prove.
+    pub rte: bool,
+
+    /// System include directories, as `-isystem <dir>`.
+    pub isystem_paths: Vec<String>,
+
+    /// Whether the preprocessor's default system directories are dropped.
+    ///
+    /// Part of the load identity for the same reason the include paths are: on
+    /// a platform whose real headers shadow the modeled libc, this decides
+    /// which declarations a file is compiled against, so two loads differing
+    /// only here are different programs to prove.
+    pub nostdinc: bool,
 }
 
 impl ProjectLoadOptions {
@@ -2145,13 +2282,28 @@ impl ProjectLoadOptions {
     /// path is a decision to take here, and taking it anywhere else means the
     /// author of that field never sees the question.
     ///
-    /// include_paths and defines are not in it. They reach the preprocessor,
-    /// but only a source with a directive can act on them, and such a source is
-    /// already refused. Nor is machdep: it names bytes, but loaded_source_state
-    /// hashes them, so the identity answers for it rather than this predicate
-    /// refusing every project that sets one.
+    /// include_paths, isystem_paths and defines are not in it. They reach the
+    /// preprocessor, but only a source with a directive can act on them, and
+    /// such a source is already refused. Nor is machdep: it names bytes, but
+    /// loaded_source_state hashes them, so the identity answers for it rather
+    /// than this predicate refusing every project that sets one. nostdinc and
+    /// rte name no bytes at all: one removes search directories, the other adds
+    /// obligations to the AST.
     fn names_bytes_outside_the_file_set(&self) -> bool {
-        !self.force_includes.is_empty() || self.compilation_database.is_some()
+        // Destructured for the reason the doc gives: the answer is a property
+        // of the fields, so a new one has to be answered for here rather than
+        // silently inheriting whichever verdict the expression happens to give.
+        let ProjectLoadOptions {
+            force_includes,
+            compilation_database,
+            include_paths: _,
+            isystem_paths: _,
+            defines: _,
+            machdep: _,
+            nostdinc: _,
+            rte: _,
+        } = self;
+        !force_includes.is_empty() || compilation_database.is_some()
     }
 }
 
@@ -2251,6 +2403,40 @@ impl SandboxRegistry {
     }
 }
 
+/// The MCP server, and the locks that serialize the one Frama-C process.
+///
+/// # Lock order
+///
+/// Seven locks, one order, and it is the whole rule. Take them in this
+/// sequence and never in any other:
+///
+///     main_wp_lock -> main_eva_lock -> main_spawn_lock -> main_frama_c_state
+///         -> client -> state -> sandboxes
+///
+/// It is written here rather than beside each lock because it used to be
+/// exactly that: four doc comments each stating its own fragment, two of them
+/// calling themselves the outermost lock. Both claims were locally true and
+/// together they described no order at all, while the full chain, which
+/// reload_project walks end to end, appeared nowhere. A fragment cannot be
+/// checked against the others by reading; a sequence can.
+///
+/// Where the sequence comes from, so a new holder can tell whether it is
+/// adding an edge or breaking one:
+///
+/// - reload_project (project.rs) takes main_wp_lock, then main_eva_lock, then
+///   calls ensure_main_spawned. It is the only site that holds more than two,
+///   and it is therefore the site that fixes the order.
+/// - ensure_main_spawned (this file) is reached only from reload_project. It
+///   takes main_spawn_lock, then main_frama_c_state, then client.
+/// - check's EVA half (analysis.rs) takes main_eva_lock alone; run_wp,
+///   proof_coverage and verify_program_step take main_wp_lock alone. Nothing
+///   takes eva before wp.
+///
+/// Not machine-checked. A lock-order test needs either instrumented guards or
+/// a run that actually contends, and neither is worth its weight against seven
+/// locks whose every acquisition site is in the list above. What keeps this
+/// honest is that the sites are few and named: grep for the transaction locks
+/// and the answer should be the eight acquisitions this paragraph accounts for.
 #[derive(Clone)]
 pub struct FramaCMcpServer {
     /// Main Frama-C client. Lazy mode starts with None.
@@ -2307,12 +2493,10 @@ pub struct FramaCMcpServer {
     /// the next inline-source check, which is also when the session stops
     /// referring to the old one.
     current_check_source_dir: Arc<AsyncMutex<Option<tempfile::TempDir>>>,
-    /// Main Frama-C process state (child + socket + files + rte).
-    /// Replaces the old `main_frama_c_child: Option<Child>` - multiple
-    /// sockets/files/rte to support
-    /// ensure_main_spawned's in-place vs respawn judgment.
-    /// Lock sequence: main_frame_c_state → client → state → sandboxes (to avoid
-    /// deadlock).
+    /// Main Frama-C process state (child + socket + files + project options).
+    /// Replaces the old main_frama_c_child field: multiple sockets and files,
+    /// to support ensure_main_spawned's in-place vs respawn judgment. See the
+    /// lock order on this struct.
     main_frama_c_state: Arc<AsyncMutex<Option<MainFramaCState>>>,
     /// Held for the whole of ensure_main_spawned, decision through assignment.
     ///
@@ -2324,7 +2508,8 @@ pub struct FramaCMcpServer {
     /// did not ask for. The window used to be the couple of seconds Frama-C
     /// took to bind its socket, and is now up to SPAWN_CONNECT_BACKSTOP.
     ///
-    /// Outermost lock: taken before main_frama_c_state, never inside it.
+    /// Taken inside the two transaction locks and outside main_frama_c_state.
+    /// See the lock order on this struct.
     main_spawn_lock: Arc<AsyncMutex<()>>,
     /// Project lock: when true, reload_project and run_wp on main instance are
     /// rejected. Sandbox operations are unaffected. verify_program_step toggles
@@ -2360,7 +2545,7 @@ pub struct FramaCMcpServer {
     /// of a run that is holding it, and taking the lock there would deadlock
     /// the escape.
     ///
-    /// Outermost lock: taken before the client lock, never inside it.
+    /// First in the lock order on this struct: nothing is taken before it.
     main_wp_lock: Arc<AsyncMutex<()>>,
 
     /// Held across a whole EVA transaction on the main instance: the parameter
@@ -2372,8 +2557,7 @@ pub struct FramaCMcpServer {
     /// covers for WP, and the same cost: a compute measured in minutes holds
     /// this the whole time.
     ///
-    /// Ordered after main_wp_lock. reload_project is the only site that holds
-    /// both, and it takes wp then eva, so that is the whole ordering rule.
+    /// Second in the lock order on this struct, directly after main_wp_lock.
     /// Nothing reached under this guard acquires the WP lock: check_eva_step
     /// holds it across run_eva_payload and eva_alarms_payload only, and neither
     /// takes a lock beyond the client mutex.
@@ -2884,10 +3068,15 @@ impl FramaCMcpServer {
         ]
     }
 
+    /// The argv for a new main instance.
+    ///
+    /// RTE is read off project_options rather than passed beside it. It used to
+    /// be both, and nothing made the two agree: a caller that passed one value
+    /// and an options struct carrying the other started a process the receipt
+    /// did not describe.
     fn main_frama_c_command_line(
         &self,
         files: &[String],
-        rte: bool,
         project_options: &ProjectLoadOptions,
         socket_path: &Path,
     ) -> Vec<String> {
@@ -2914,7 +3103,7 @@ impl FramaCMcpServer {
             "-wp-model".to_string(),
             default_wp_model().to_string(),
         ]);
-        if rte {
+        if project_options.rte {
             command_line.push("-rte".to_string());
         }
         command_line
@@ -3180,6 +3369,9 @@ impl FramaCMcpServer {
                     .ok_or_else(|| McpError::from(FramaCError::FunctionNotFound(function.clone())))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Read before any proof is scheduled: after the drain the average is
+        // largely this run's own provers. See host_load_per_cpu.
+        let host_load = crate::mcp::server::wpclass::host_load();
         let protocol_diagnostics = start_wp_proofs(&client, Some(&decl_markers)).await?;
 
         let tasks = drain_wp_tasks(&client, WP_DRAIN_BUDGET).await?;
@@ -3199,15 +3391,17 @@ impl FramaCMcpServer {
                 .unwrap_or_default()
         };
 
-        let mut response = wp_run_response(
+        let mut response = wp_run_response(WpRunResponse {
             tasks,
             params,
-            names.clone(),
-            "sandbox",
-            true,
-            protocol_diagnostics,
-            Some(proofread_report),
-        );
+            functions: names.clone(),
+            scope: "sandbox",
+            rte_enabled: true,
+            frama_c_protocol: protocol_diagnostics,
+            proofread_report: Some(proofread_report),
+            goals: Some(wp_goals.as_slice()),
+            host_load,
+        });
 
         // The property table read here is the sandbox's own, which is the only
         // difference from the main path.
@@ -3400,7 +3594,6 @@ impl FramaCMcpServer {
     async fn ensure_main_spawned(
         &self,
         new_files: Vec<String>,
-        new_rte: bool,
         new_project_options: ProjectLoadOptions,
     ) -> Result<(), McpError> {
         // Held to the end, so the respawn decision and the assignment that acts
@@ -3436,7 +3629,6 @@ impl FramaCMcpServer {
                 // source either way, so this costs process lifetime rather than
                 // anything the caller had.
                 s.poisoned
-                    || s.with_rte != new_rte
                     || s.project_options != new_project_options
                     || client_lock.as_ref().is_some_and(|c| c.is_poisoned())
                     || !parse_record_survives(s, &identity)
@@ -3548,12 +3740,8 @@ impl FramaCMcpServer {
         // parse, and that reload reuses a record for an AST nobody built.
         let ast_parse_source_digest = identity.0.clone();
 
-        let command_line = self.main_frama_c_command_line(
-            &new_files,
-            new_rte,
-            &new_project_options,
-            &socket_path,
-        );
+        let command_line =
+            self.main_frama_c_command_line(&new_files, &new_project_options, &socket_path);
         let mut child = spawn_frama_c(&command_line, &stdout_log_path, &stderr_log_path)?;
         let pid = child.id().unwrap_or_default();
 
@@ -3626,7 +3814,6 @@ impl FramaCMcpServer {
             child,
             socket_path,
             files: new_files,
-            with_rte: new_rte,
             project_options: new_project_options,
             pid,
             command_line,
@@ -4301,6 +4488,12 @@ use wpclass::*;
 #[path = "analysis.rs"]
 pub mod analysis;
 use analysis::unproved_assumption_findings;
+/// What makes a check incomplete, and the guidance behind each gap code.
+/// Split from analysis.rs, whose free functions outgrew the impl block they
+/// serve; see the module's own header.
+#[path = "checkgaps.rs"]
+pub mod checkgaps;
+
 #[path = "coverage.rs"]
 pub mod coverage;
 #[path = "annotations.rs"]

@@ -18,6 +18,13 @@ fn with_include_paths(paths: &[&str]) -> ProjectLoadOptions {
     }
 }
 
+fn with_isystem_paths(paths: &[&str]) -> ProjectLoadOptions {
+    ProjectLoadOptions {
+        isystem_paths: paths.iter().map(|p| p.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
 fn with_force_includes(headers: &[&str]) -> ProjectLoadOptions {
     ProjectLoadOptions {
         force_includes: headers.iter().map(|h| h.to_string()).collect(),
@@ -34,6 +41,14 @@ fn plain_and_valued_defines_are_accepted() {
 fn ordinary_paths_and_headers_are_accepted() {
     assert!(validate_project_options(&with_include_paths(&["include", "../vendor/inc"])).is_ok());
     assert!(validate_project_options(&with_force_includes(&["builtins.h", "sys/types.h"])).is_ok());
+}
+
+#[test]
+fn system_include_paths_use_the_same_safe_grammar() {
+    let valid = with_isystem_paths(&["include", "../vendor/inc"]);
+    let injected = with_isystem_paths(&["$(touch pwned)"]);
+    assert!(validate_project_options(&valid).is_ok());
+    assert!(validate_project_options(&injected).is_err());
 }
 
 /// The log shape is verbatim Frama-C 33: tag and location on one line, text
@@ -301,11 +316,11 @@ fn an_unreadable_parse_log_is_not_a_clean_parse() {
     // that the analyzed program is the compiled one.
     let reload = json!({"ast_reload_health": {"parse_diagnostics": record}});
     let mut items = Vec::new();
-    analysis::ast_diagnostic_gaps(&mut items, &reload, &[]);
+    checkgaps::ast_diagnostic_gaps(&mut items, &reload, &[]);
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(
         items[0]["code"],
-        analysis::incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE
+        checkgaps::incomplete_code::AST_PARSE_DIAGNOSTICS_UNAVAILABLE
     );
     assert!(
         items[0]["detail"]
@@ -320,7 +335,7 @@ fn an_unreadable_parse_log_is_not_a_clean_parse() {
         "kernel:asm:clobber": {"count": 0, "count_unit": "sites"},
     }}}});
     let mut items = Vec::new();
-    analysis::ast_diagnostic_gaps(&mut items, &clean, &[]);
+    checkgaps::ast_diagnostic_gaps(&mut items, &clean, &[]);
     assert!(items.is_empty(), "{items:?}");
 }
 
@@ -801,4 +816,32 @@ fn a_header_is_read_off_the_phrase_not_off_the_first_quote() {
         quoted.message.contains("something new here"),
         "the message must carry what could not be classified: {quoted:?}"
     );
+}
+
+// Frama-C puts the location on the "User Error:" line and the reason on the
+// indented lines under it, so quoting one line names nothing. This is the
+// branch whose whole job is to say what it could not classify.
+#[test]
+fn an_unclassified_failure_quotes_the_reason_not_just_the_location() {
+    let output = "[kernel] Parsing src/syscall/sys.c (with preprocessing)\n\
+                  [kernel] src/syscall/sys.c:86: User Error: \n  \
+                  Cannot find field ru_maxrss in type struct rusage\n        \
+                  _Static_assert(__builtin_offsetof(struct rusage,ru_maxrss) ==\n";
+    let block = frama_c_mcp::mcp::server::project::classify_parse_failure(output);
+    assert_eq!(block.cause, "other");
+    assert!(block.message.contains("sys.c:86"), "{}", block.message);
+    assert!(
+        block.message.contains("Cannot find field ru_maxrss"),
+        "the reason must survive: {}",
+        block.message
+    );
+}
+
+// The next unindented line is a new message, not more of this one.
+#[test]
+fn an_unclassified_failure_stops_at_the_next_message() {
+    let output = "[kernel] a.c:1: User Error: \n  first reason\n[kernel] b.c:2: User Error: \n  second reason\n";
+    let block = frama_c_mcp::mcp::server::project::classify_parse_failure(output);
+    assert!(block.message.contains("first reason"), "{}", block.message);
+    assert!(!block.message.contains("second reason"), "{}", block.message);
 }

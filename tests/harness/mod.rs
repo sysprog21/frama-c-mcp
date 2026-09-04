@@ -10,8 +10,26 @@ pub fn workspace_path(rel: &str) -> PathBuf {
     PathBuf::from(crate_dir).join(rel)
 }
 
+/// The server binary these tests drive.
+///
+/// The release build when there is one, because that is what a developer has
+/// usually just built and what the timing-sensitive lifecycle tests were
+/// written against. Otherwise the binary Cargo built for this test run:
+/// integration tests get `CARGO_BIN_EXE_<name>` for free, and Cargo builds the
+/// bin as a dependency of the test target, so it is always present.
+///
+/// The fallback is why nothing here has to assert the binary exists. A plain
+/// `cargo test` on a tree with no release build used to fail thirteen tests at
+/// once on a missing file, which reads like a defect in the code under test
+/// rather than a missing prerequisite. Building it from inside the test was the
+/// first fix and the wrong one: a nested Cargo waits on the target-directory
+/// lock the parent `cargo test` may still hold.
 pub fn release_binary() -> PathBuf {
-    workspace_path("target/release/frama-c-mcp")
+    let release = workspace_path("target/release/frama-c-mcp");
+    if release.exists() {
+        return release;
+    }
+    PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp"))
 }
 
 /// Conclusions and sandbox metadata for one test binary, kept out of the repo.
@@ -86,12 +104,6 @@ fn path_segment(name: &str) -> String {
 /// times is one that gets changed four times, and the two spellings then differ
 /// in a way nothing reports.
 pub fn server_command(binary: &Path, frama_c: &str, cwd: Option<&Path>) -> StdCommand {
-    assert!(
-        binary.exists(),
-        "MCP binary missing: {}\nRun `cargo build --release` first.",
-        binary.display()
-    );
-
     let mut cmd = StdCommand::new(binary);
     cmd.arg("--frama-c").arg(frama_c);
 

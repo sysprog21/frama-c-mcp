@@ -5,10 +5,40 @@ use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
 use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
+use frama_c_mcp::mcp::server::WpRunResponse;
+
+/// One wp_run_response call, with the six fields no case here varies.
+///
+/// Eight literals repeated `params`, `functions`, `scope`, `rte_enabled`,
+/// `frama_c_protocol` and the host load identically; the next field added to
+/// WpRunResponse would have been eight edits.
+struct WpRun<'a> {
+    tasks: serde_json::Value,
+    report: Option<serde_json::Value>,
+    goals: Option<&'a [serde_json::Value]>,
+}
+
+fn wp_response(run: WpRun<'_>) -> serde_json::Value {
+    let params = RunWpParams::default();
+    wp_run_response(WpRunResponse {
+        tasks: run.tasks,
+        params: &params,
+        functions: vec![],
+        scope: "main",
+        rte_enabled: false,
+        frama_c_protocol: vec![],
+        proofread_report: run.report,
+        goals: run.goals,
+
+        // A quiet host, so nothing here turns on the machine it runs on.
+        host_load: HostLoad::Load(0.1),
+    })
+}
+
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::{
-    eva_config_absent, incomplete_digest, proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of,
+    eva_config_absent, incomplete_digest, project_load_identity, proof_receipt_body, proof_receipt_with_hash, receipt_shape, schema_of,
     ProofReceiptBody, RECEIPT_SCHEMA,
 };
 
@@ -650,7 +680,6 @@ fn classify_wp_failure_rte_report_points_to_precondition_or_assertion() {
 
 #[test]
 fn wp_run_response_preserves_top_level_proofread_report() {
-    let params = RunWpParams::default();
     let report = proofread_report(vec![json!({
         "id": "x",
         "severity": "high",
@@ -658,95 +687,38 @@ fn wp_run_response_preserves_top_level_proofread_report() {
         "file": "x.c",
         "line": 1
     })]);
-    let object_response = wp_run_response(
-        json!({"done": 0, "total": 1}),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        Some(report.clone()),
-    );
+    let object_response = wp_response(WpRun { tasks: json!({"done": 0, "total": 1}), report: Some(report.clone()), goals: None });
     assert_eq!(object_response["proofread_report"], report);
 
-    let array_response = wp_run_response(
-        json!([]),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        Some(report.clone()),
-    );
+    let array_response = wp_response(WpRun { tasks: json!([]), report: Some(report.clone()), goals: None });
     assert_eq!(array_response["proofread_report"], report);
 }
 
 #[test]
 fn wp_run_response_reports_task_failure_kind() {
-    let params = RunWpParams::default();
-    let timeout = wp_run_response(
-        json!({"status": "timeout"}),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        None,
-    );
+    let timeout = wp_response(WpRun { tasks: json!({"status": "timeout"}), report: None, goals: None });
     assert_eq!(timeout["failure_kind"], "mcp_timeout");
 
-    let rejected = wp_run_response(
-        json!(["rejected task"]),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        None,
-    );
+    let rejected = wp_response(WpRun { tasks: json!(["rejected task"]), report: None, goals: None });
     assert_eq!(rejected["failure_kind"], "request_rejected");
 
-    let missing_prover = wp_run_response(
-        json!({"message": "prover Alt-Ergo not found"}),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        None,
-    );
+    let missing_prover = wp_response(WpRun { tasks: json!({"message": "prover Alt-Ergo not found"}), report: None, goals: None });
     assert_eq!(missing_prover["failure_kind"], "missing_prover");
 
     // A crashed backend, as the payload actually carries it: a goal stamped
     // FAILED and no log text anywhere. This used to hand the goal a name
     // containing the anomaly text, which no WP run produces, so the branch it
     // exercised could never fire on a real one.
-    let why3_crash = wp_run_response(
-        json!({
+    let why3_crash = wp_response(WpRun { tasks: json!({
             "goals": [{
                 "stable_goal_id": "g1",
                 "name": "Post-condition",
                 "normalized_status": "failed"
             }]
-        }),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        None,
-    );
+        }), report: None, goals: None });
     assert_eq!(why3_crash["failure_kind"], "frama_c_internal");
 
-    let unproved = wp_run_response(
-        json!({"goals": [{"stable_goal_id": "g1", "normalized_status": "unknown"}]}),
-        &params,
-        vec![],
-        "main",
-        false,
-        vec![],
-        None,
-    );
+    let unproved = wp_response(WpRun { tasks: json!({"goals": [{"stable_goal_id": "g1", "normalized_status": "unknown"}]}), report: None, goals: None });
     assert_eq!(unproved["failure_kind"], "proof_obligation");
 }
 
@@ -1760,7 +1732,7 @@ fn goal_timeouts_are_not_reported_as_no_timeout_evidence() {
         ]
     });
 
-    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report));
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report), None, HostLoad::Load(0.1));
     assert_eq!(triage["kind"], "prover_timeout", "{triage:?}");
     assert_eq!(triage["evidence"][0]["value"], 2, "{triage:?}");
 
@@ -1779,7 +1751,7 @@ fn goal_timeouts_are_not_reported_as_no_timeout_evidence() {
 fn task_level_verdict_takes_precedence_over_goal_timeouts() {
     let cancelled = json!({"tasks": "the WP task was cancelled"});
     let report = json!({"findings": [{"category": "timeout", "trigger": "x"}]});
-    let triage = wp_timeout_triage_from_tasks_and_report(&cancelled, Some(&report));
+    let triage = wp_timeout_triage_from_tasks_and_report(&cancelled, Some(&report), None, HostLoad::Load(0.1));
     assert_eq!(triage["kind"], "cancelled_task", "{triage:?}");
 }
 
@@ -1788,9 +1760,9 @@ fn task_level_verdict_takes_precedence_over_goal_timeouts() {
 fn clean_run_still_reports_no_timeout_evidence() {
     let drained = json!({"todo": 0, "drained": true});
     let report = json!({"findings": [{"category": "unconstrained_assigns"}]});
-    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report));
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report), None, HostLoad::Load(0.1));
     assert_eq!(triage["kind"], "none", "{triage:?}");
-    let triage = wp_timeout_triage_from_tasks_and_report(&drained, None);
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, None, None, HostLoad::Load(0.1));
     assert_eq!(triage["kind"], "none", "{triage:?}");
 }
 
@@ -2231,4 +2203,339 @@ fn a_profile_only_labels_its_loaded_project() {
     assert!(profile_matches_loaded_project(&profile, &["src/target.c".into()], &options));
     assert!(!profile_matches_loaded_project(&profile, &["src/other.c".into()], &options));
     assert!(!profile_matches_loaded_project(&profile, &["src/target.c".into()], &ProjectLoadOptions::default()));
+}
+
+// A prover budget is wall clock, so on an oversubscribed host every goal
+// grinds to it whatever its difficulty. Reporting that run at high confidence
+// states a verdict about the code that the run cannot support.
+#[test]
+fn a_saturated_host_withdraws_the_timeout_verdict() {
+    let t = prover_timeout_triage(18, vec![], HostLoad::from_reading(Some(7.6)), None);
+    assert_eq!(t["confidence"], "low");
+    assert_eq!(t["retry_with_higher_prover_timeout"], false);
+    assert!(t["reason"].as_str().unwrap().contains("oversubscribed"));
+}
+
+// -wp-rte decides which obligations exist at all, so a load without it gives a
+// strictly smaller set. A target proved with it is not described by a load
+// without it, however well every other field lines up.
+#[test]
+fn a_load_without_rte_does_not_match_a_target_that_needs_it() {
+    let needs_rte = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        rte: Some(true),
+        ..Default::default()
+    };
+    let files = ["src/target.c".to_string()];
+
+    let without = ProjectLoadOptions::default();
+    let with = ProjectLoadOptions { rte: true, ..Default::default() };
+
+    assert!(!profile_matches_loaded_project(&needs_rte, &files, &without));
+    assert!(profile_matches_loaded_project(&needs_rte, &files, &with));
+
+    // A profile that does not speak to RTE still matches either load. Only a
+    // profile that states it can be proof evidence, which the evidence gate in
+    // run_wp enforces separately.
+    let silent = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        ..Default::default()
+    };
+    assert!(profile_matches_loaded_project(&silent, &files, &without));
+    assert!(profile_matches_loaded_project(&silent, &files, &with));
+}
+
+// WP's cache stores timeout verdicts as readily as valid ones, so a run can
+// report a failure it never attempted. That is a stronger disqualifier than a
+// loaded host: neither the goal nor the machine explains a replayed verdict,
+// because nothing was run. A cached *valid* goal is not the trap, since the
+// timed-out goals are what a timeout verdict is about.
+#[test]
+fn only_a_run_whose_timeouts_were_all_replayed_withdraws_the_verdict() {
+    let goal = |status: &str, from_cache: bool| {
+        json!({"stable_goal_id": "g", "status": status, "from_cache": from_cache})
+    };
+
+    for (case, goals, all_replayed, confidence) in [
+        (
+            "every timeout replayed",
+            vec![goal("valid", false), goal("timeout", true)],
+            true,
+            "low",
+        ),
+        ("the timeout was attempted", vec![goal("timeout", false)], false, "high"),
+        (
+            "only a valid goal was replayed",
+            vec![goal("valid", true), goal("timeout", false)],
+            false,
+            "high",
+        ),
+        ("nothing timed out", vec![goal("valid", true)], false, "high"),
+        ("no goals at all", vec![], false, "high"),
+    ] {
+        let m = run_measurement(&goals);
+        assert_eq!(m.every_timed_out_goal_was_replayed(), all_replayed, "{case}");
+
+        // A quiet host throughout, so the replay is the only thing that can
+        // withdraw the verdict.
+        let t = prover_timeout_triage(1, vec![], HostLoad::from_reading(Some(0.1)), Some(&m));
+        assert_eq!(t["confidence"], confidence, "{case}");
+        if all_replayed {
+            assert!(t["reason"].as_str().unwrap().contains("cache"), "{case}");
+        }
+    }
+}
+
+// The predicate is handed the whole fetchGoals table, which carries goals from
+// functions proved earlier in the session and goals left at NORESULT by
+// -wp-prop. Those are unproved and not cached, so scoping the question to every
+// unproved goal let a single one of them keep the verdict confident while every
+// timed-out goal in the run had in fact been replayed.
+#[test]
+fn goals_the_run_never_attempted_do_not_rescue_a_wholly_replayed_timeout() {
+    let goals = vec![
+        json!({"stable_goal_id": "earlier", "status": "valid", "from_cache": true}),
+        json!({"stable_goal_id": "excluded", "status": "NORESULT", "from_cache": false}),
+        json!({"stable_goal_id": "timed_out", "status": "timeout", "from_cache": true}),
+    ];
+    let m = run_measurement(&goals);
+
+    // The unproved counters still see the excluded goal, which is why they
+    // cannot be what the verdict rests on.
+    assert_eq!(m.unproved, 2);
+    assert_ne!(m.unproved_replayed, m.unproved);
+
+    assert_eq!(m.timed_out, 1);
+    assert_eq!(m.timed_out_replayed, 1);
+    assert!(m.every_timed_out_goal_was_replayed());
+
+    let t = prover_timeout_triage(1, vec![], HostLoad::from_reading(Some(0.1)), Some(&m));
+    assert_eq!(t["confidence"], "low", "{t:?}");
+    assert!(t["reason"].as_str().unwrap().contains("cache"), "{t:?}");
+}
+
+// Both causes are named when both apply. Reporting only the cache sends the
+// caller to re-run with cache "None" on the machine that will grind to the
+// budget again.
+#[test]
+fn a_replayed_run_on_a_loaded_host_names_both_causes() {
+    let m = run_measurement(&[json!({"status": "timeout", "from_cache": true})]);
+    let t = prover_timeout_triage(1, vec![], HostLoad::from_reading(Some(9.0)), Some(&m));
+    let reason = t["reason"].as_str().unwrap();
+    assert_eq!(t["confidence"], "low");
+    assert!(reason.contains("cache"), "{reason}");
+    assert!(reason.contains("oversubscribed"), "{reason}");
+}
+
+// An absent reading is the one case where the host cannot be ruled out, so it
+// is said rather than defaulted to a quiet machine.
+#[test]
+fn an_unavailable_load_is_reported_rather_than_assumed_quiet() {
+    let t = prover_timeout_triage(1, vec![], HostLoad::Unavailable, None);
+    let ev = t["evidence"].as_array().unwrap();
+    let load = ev.iter().find(|e| e["field"] == "host_load").unwrap();
+    assert_eq!(load["value"], "unavailable");
+    assert_eq!(t["confidence"], "low");
+    assert!(t["reason"].as_str().unwrap().contains("could not be read"));
+}
+
+// The threshold is "above", not "at": one runnable thread per CPU is where
+// saturation starts. The low reading is host-wide, so load 4 on a 64-core box
+// stays quiet even under a one-CPU cgroup quota.
+#[test]
+fn the_saturation_threshold_excludes_its_own_boundary() {
+    for (load, confidence) in [(4.0 / 64.0, "high"), (1.0, "high"), (1.0001, "low")] {
+        let t = prover_timeout_triage(1, vec![], HostLoad::from_reading(Some(load)), None);
+        assert_eq!(t["confidence"], confidence, "load {load}");
+        assert_eq!(t["retry_with_higher_prover_timeout"], false, "load {load}");
+    }
+}
+
+// serde renders a non-finite float as JSON null, so a NaN reaching the evidence
+// would be invisible, and it compares false against the threshold on the way
+// past. The verdict must not depend on the reader having filtered them.
+#[test]
+fn a_non_finite_reading_never_reads_as_a_quiet_host() {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        let t = prover_timeout_triage(1, vec![], HostLoad::from_reading(Some(bad)), None);
+        let ev = t["evidence"].as_array().unwrap();
+        let load = ev.iter().find(|e| e["field"] == "host_load").unwrap();
+        assert!(!load["value"].is_null(), "{bad} serialized to null");
+
+        // Distinct from "unavailable": a reading that arrived and was refused
+        // is not a reading that never arrived, and only one of the two means
+        // the machine has a load average worth looking at.
+        assert_eq!(load["value"], "unreadable", "{bad}");
+        assert_eq!(HostLoad::from_reading(Some(bad)), HostLoad::Unreadable, "{bad}");
+        assert_eq!(HostLoad::from_reading(Some(bad)).per_cpu(), None, "{bad}");
+        assert_ne!(t["confidence"], "high", "{bad} passed as a quiet host");
+    }
+}
+
+// The triage goes into the proof receipt's reported block, and that block is
+// hashed. A reading in it would give two runs of the same proof on the same
+// machine different receipt digests, which is the one property a receipt
+// exists to carry. Rounding does not save it, so the payload carries a
+// category and the reading is reported outside the receipt.
+#[test]
+fn the_timeout_verdict_does_not_move_with_the_load_reading() {
+    let quiet = prover_timeout_triage(3, vec![], HostLoad::from_reading(Some(0.11)), None);
+    let quieter = prover_timeout_triage(3, vec![], HostLoad::from_reading(Some(0.87)), None);
+    assert_eq!(quiet, quieter, "the reading reached the hashed payload");
+
+    let busy = prover_timeout_triage(3, vec![], HostLoad::from_reading(Some(4.0)), None);
+    assert_ne!(quiet, busy, "the verdict must still move when the category does");
+
+    // Nothing anywhere in the payload is a number that came off the host.
+    let rendered = quiet.to_string();
+    assert!(!rendered.contains("0.11"), "{rendered}");
+}
+
+// The reading itself, on whatever machine the suite runs on. It may be any
+// value, but it may not be one the evidence cannot render.
+#[test]
+fn the_host_reading_is_usable_or_absent() {
+    // Whatever the machine reports, it lands in a variant the payload can
+    // render, and a Load carries a number the threshold can be compared with.
+    match host_load() {
+        HostLoad::Load(l) => assert!(l.is_finite() && l >= 0.0, "unusable reading {l}"),
+        HostLoad::Unavailable | HostLoad::Unreadable => {}
+    }
+    assert!(
+        ["quiet", "saturated", "unavailable", "unreadable"].contains(&host_load().category())
+    );
+}
+
+// The flags the build passes must reach the preprocessor, and in the order the
+// preprocessor searches: -nostdinc removes the default directories, the -I set
+// answers first, and -isystem is where the modeled libc sits so it is found
+// only where the project's own headers do not answer.
+#[test]
+fn the_load_flags_carry_nostdinc_and_isystem_in_search_order() {
+    let options = ProjectLoadOptions {
+        include_paths: vec!["stubs".into(), "src".into()],
+        isystem_paths: vec!["/opt/frama-c/libc".into()],
+        nostdinc: true,
+        force_includes: vec!["prelude.h".into()],
+        ..Default::default()
+    };
+    let args = frama_c_mcp::mcp::server::cpp_extra_args(&options).expect("flags");
+    assert_eq!(
+        args,
+        "-nostdinc -Istubs -Isrc -isystem /opt/frama-c/libc -include prelude.h"
+    );
+
+    // Off by default, so a caller that never heard of it is unaffected.
+    let plain = ProjectLoadOptions { include_paths: vec!["src".into()], ..Default::default() };
+    assert_eq!(frama_c_mcp::mcp::server::cpp_extra_args(&plain).unwrap(), "-Isrc");
+}
+
+#[test]
+fn receipt_load_identity_includes_all_obligation_shaping_options() {
+    let identity = project_load_identity(&ProjectLoadOptions {
+        rte: true,
+        isystem_paths: vec!["modeled-libc".into()],
+        nostdinc: true,
+        ..Default::default()
+    });
+    assert_eq!(identity["rte"], true);
+    assert_eq!(identity["isystem_paths"], json!(["modeled-libc"]));
+    assert_eq!(identity["nostdinc"], true);
+}
+
+// Without this a load against the real system headers passes for a load
+// against the modeled libc, which is a different program to prove.
+#[test]
+fn a_load_that_kept_the_system_headers_does_not_match_a_target_that_dropped_them() {
+    let profile = frama_c_mcp::state::VerificationProfile {
+        sources: vec!["src/target.c".into()],
+        nostdinc: Some(true),
+        isystem_paths: vec!["/opt/frama-c/libc".into()],
+        ..Default::default()
+    };
+    let files = ["src/target.c".to_string()];
+
+    let matching = ProjectLoadOptions {
+        nostdinc: true,
+        isystem_paths: vec!["/opt/frama-c/libc".into()],
+        ..Default::default()
+    };
+    assert!(profile_matches_loaded_project(&profile, &files, &matching));
+
+    let kept_system_headers = ProjectLoadOptions {
+        isystem_paths: vec!["/opt/frama-c/libc".into()],
+        ..Default::default()
+    };
+    assert!(!profile_matches_loaded_project(&profile, &files, &kept_system_headers));
+
+    let wrong_libc = ProjectLoadOptions {
+        nostdinc: true,
+        isystem_paths: vec!["/some/other/libc".into()],
+        ..Default::default()
+    };
+    assert!(!profile_matches_loaded_project(&profile, &files, &wrong_libc));
+}
+
+
+// drain_wp_tasks returns whatever Frama-C sent whenever it cannot count the
+// queue, and that payload need not be an object. A response missing the counts
+// on that path reads as a run with nothing replayed, which is the confident
+// direction.
+#[test]
+fn the_replay_counts_survive_a_task_payload_that_is_not_an_object() {
+    let goals = vec![json!({"status": "timeout", "from_cache": true})];
+
+    for tasks in [json!(["a bare list"]), json!({"done": 0, "total": 1})] {
+        let response = wp_response(WpRun {
+            tasks: tasks.clone(),
+            report: None,
+            goals: Some(goals.as_slice()),
+        });
+        assert_eq!(response["measurement"]["timed_out_replayed"], 1, "{tasks}");
+        assert_eq!(
+            response["measurement"]["every_timed_out_goal_was_replayed"], true,
+            "{tasks}"
+        );
+
+        // The reading lives here, outside the triage that the receipt hashes.
+        assert_eq!(response["host_load"]["category"], "quiet", "{tasks}");
+    }
+}
+
+// A timed-out goal counts as timed out even when the property it hangs off
+// consolidated to valid.
+//
+// The two questions come apart, which is what src/mcp/status.rs exists to keep
+// straight: own_status is what WP decided about this goal, consolidated_status
+// is what the property decided. run_measurement asked the second for a question
+// about the first, beside a line asking the first for whether the goal was
+// proved, so one loop asked two different questions about one row. Reading the
+// consolidated verdict here hides a replayed timeout behind a valid property,
+// which is the direction that keeps the run's verdict confident.
+#[test]
+fn a_timeout_under_a_valid_property_still_counts_as_a_timeout() {
+    let goal = json!({
+        "normalized_property_status": "valid",
+        "raw_status": "TIMEOUT",
+        "status": "TIMEOUT",
+        "from_cache": true,
+    });
+    let m = run_measurement(std::slice::from_ref(&goal));
+    assert_eq!(m.timed_out, 1, "consolidated verdict masked the goal's own");
+    assert_eq!(m.timed_out_replayed, 1);
+    assert!(m.every_timed_out_goal_was_replayed());
+
+    // And a goal straight off the wire, which carries "status" alone.
+    let raw = json!({"status": "TIMEOUT", "from_cache": false});
+    let m = run_measurement(std::slice::from_ref(&raw));
+    assert_eq!(m.timed_out, 1, "an unenriched goal was not counted");
+    assert_eq!(m.timed_out_replayed, 0);
+
+    // The enriched spelling, where normalized_status leads.
+    let enriched = json!({"normalized_status": "timeout", "raw_status": "TIMEOUT"});
+    assert_eq!(run_measurement(std::slice::from_ref(&enriched)).timed_out, 1);
+
+    // A goal that really is valid is not swept in by any of the three.
+    let valid = json!({"normalized_status": "valid", "raw_status": "VALID"});
+    assert_eq!(run_measurement(std::slice::from_ref(&valid)).timed_out, 0);
 }

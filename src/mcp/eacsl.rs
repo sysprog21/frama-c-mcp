@@ -128,15 +128,28 @@ fn compile_args(
     ];
 
     // -E is what Frama-C preprocesses the sources with and -e is what the C
-    // compiler builds the instrumented program with. Both get the same flags: a
-    // project that needs a -D to parse needs the same -D to compile, and giving
-    // it to only one of them is how instrumentation fails on a project that
-    // analyzed cleanly.
+    // compiler builds the instrumented program with. They get the same defines
+    // and include paths: a project that needs a -D to parse needs the same -D
+    // to compile, and giving it to only one of them is how instrumentation
+    // fails on a project that analyzed cleanly.
+    //
+    // -nostdinc is the exception, and it goes to the analyzer only. Frama-C's
+    // modeled libc exists to be analyzed, not compiled: dropping the real
+    // system headers from the gcc behind -e leaves the instrumented program
+    // with no stdio, no stdlib and no E-ACSL runtime headers, so a project that
+    // loads with nostdinc analyzes cleanly and then fails to build. The
+    // -isystem set still goes to both, because a directory the caller named is
+    // as likely to be the project's own as it is to be a model.
     if let Some(cpp_flags) = cpp_extra_args(project_options) {
         args.push("-E".to_string());
-        args.push(cpp_flags.clone());
-        args.push("-e".to_string());
         args.push(cpp_flags);
+    }
+    if let Some(compile_flags) = cpp_extra_args(&ProjectLoadOptions {
+        nostdinc: false,
+        ..project_options.clone()
+    }) {
+        args.push("-e".to_string());
+        args.push(compile_flags);
     }
     if let Some(machdep) = &project_options.machdep {
         match machdep.as_str() {

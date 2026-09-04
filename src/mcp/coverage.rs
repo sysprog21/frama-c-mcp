@@ -539,10 +539,11 @@ pub fn proof_coverage_report(
             );
             *by_status.entry(status.clone()).or_default() += 1;
             if status == "valid" {
-                let replayed = goal
-                    .get("from_cache")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                // Through the accessor, which falls back to the summary where
+                // the lifted field is absent. Reading the key alone called such
+                // a goal freshly proved, which is the flattering direction for
+                // a coverage number.
+                let replayed = crate::mcp::server::wpclass::goal_is_from_cache(goal);
                 valid_goals += 1;
                 cached_valid_goals += usize::from(replayed);
                 fresh_valid_goals += usize::from(!replayed);

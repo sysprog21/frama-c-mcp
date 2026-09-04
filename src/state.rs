@@ -276,6 +276,27 @@ pub struct VerificationProfile {
     #[serde(default)]
     pub provers: Vec<String>,
     pub timeout_seconds: Option<u32>,
+
+    /// System include directories the target's own command passes.
+    #[serde(default)]
+    pub isystem_paths: Vec<String>,
+
+    /// Whether the target's own command drops the default system includes.
+    ///
+    /// Pinned like the include paths: on a platform whose real headers shadow
+    /// the modeled libc, a load without this compiles different declarations,
+    /// so a run under it is not evidence about this target. Unset means the
+    /// profile does not speak to it.
+    pub nostdinc: Option<bool>,
+
+    /// Whether the target's own command generates runtime-error obligations.
+    ///
+    /// Pinned like the model and the provers, and for the same reason: -wp-rte
+    /// decides which obligations exist at all, so a run without it discharges a
+    /// strictly smaller set. Without this field a caller could pass rte:false
+    /// and have the thinner run recorded as this target's evidence.
+    pub rte: Option<bool>,
+
     /// The command that makes this target's verdict outside this server.
     ///
     /// Carried so a conclusion can name it. This server is an accelerator: a
@@ -292,9 +313,29 @@ pub struct VerificationProfile {
 pub fn parse_verification_profiles(
     value: &serde_json::Value,
 ) -> Result<BTreeMap<String, VerificationProfile>, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "profiles must be an object keyed by target name".to_string())?;
+    // The quoted-object form a schema-less client sends is unwrapped at the
+    // boundary, by deserialize_value_or_string on the parameter itself, which
+    // is where the other Value-typed parameters handle it. This used to redo it
+    // here, one layer down and slightly differently: the two disagreed on the
+    // empty string, and the second copy existed only because the parameter
+    // carried no deserializer.
+    let object = value.as_object().ok_or_else(|| {
+        let got = match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::Array(_) => "an array",
+
+            // Reachable through a double-encoded payload: the boundary unwraps
+            // one layer of quoting, so text that decodes to another string
+            // arrives here as one.
+            serde_json::Value::String(_) => "a string",
+
+            // Unreachable: this runs only where as_object() already said no.
+            serde_json::Value::Object(_) => "an object",
+        };
+        format!("profiles must be an object keyed by target name, got {got}")
+    })?;
     if object.is_empty() {
         return Err("profiles is empty, so no target could be named later".to_string());
     }

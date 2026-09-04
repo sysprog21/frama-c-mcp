@@ -69,8 +69,8 @@ fn classify_failure_reason(
     text: &str,
     push_evidence: &mut impl FnMut(&str, serde_json::Value),
 ) -> (&'static str, &'static str, &'static str) {
-    if normalized_status == "timeout"
-        || raw_status.eq_ignore_ascii_case("timeout")
+    if crate::mcp::status::status_is_timeout(normalized_status)
+        || crate::mcp::status::status_is_timeout(raw_status)
     {
         push_evidence("normalized_status", json!(normalized_status));
         (
@@ -1059,6 +1059,25 @@ fn stable_goal_id_for(
 /// So the cache changes only where a verdict came from, which is exactly what
 /// a proof receipt has to record.
 pub fn goal_is_from_cache(goal: &serde_json::Value) -> bool {
+    // The lifted field first. enrich_goal_stable_id puts it on every goal whose
+    // summary it could read, so no consumer has to know the answer comes from a
+    // word in a free-form string, and this function is a consumer like any
+    // other. Reading only the summary meant an enriched goal whose stats had
+    // been projected away answered "not cached", which is the confident
+    // direction and the one that hides a replayed verdict.
+    if let Some(lifted) = goal.get("from_cache").and_then(serde_json::Value::as_bool) {
+        return lifted;
+    }
+    summary_says_cached(goal)
+}
+
+/// The reading straight off the summary, with no lifted field consulted.
+///
+/// Separate from goal_is_from_cache because the enrichment that writes the
+/// field must not read it: doing so made the first enrichment's answer
+/// permanent while the reader above treated it as authoritative, so a goal
+/// enriched before its stats arrived could never be corrected.
+fn summary_says_cached(goal: &serde_json::Value) -> bool {
     goal.get("stats")
         .and_then(|stats| stats.get("summary"))
         .and_then(|summary| summary.as_str())
@@ -1074,16 +1093,235 @@ pub fn enrich_goal_stable_id(
 
     // Lifted onto the goal here because every goal passes through, so no
     // consumer has to know it comes from a word in a free-form summary string.
-    let from_cache = goal_is_from_cache(goal);
+    //
+    // Written only where there is a summary to project, and overwritten rather
+    // than filled in. A goal with no stats yet gets no field, so it falls
+    // through to the summary read like an unenriched one instead of carrying an
+    // invented "false" that outranks a summary arriving later.
+    let summary_answer = goal.get("stats").is_some().then(|| summary_says_cached(goal));
     if let Some(obj) = goal.as_object_mut() {
         obj.entry("stable_goal_id".to_string())
             .or_insert_with(|| serde_json::Value::String(stable_goal_id));
-        obj.entry("from_cache".to_string())
-            .or_insert(serde_json::Value::Bool(from_cache));
+        if let Some(from_cache) = summary_answer {
+            obj.insert("from_cache".to_string(), serde_json::Value::Bool(from_cache));
+        }
         if let Some(name) = obj.get("name").cloned() {
             obj.entry("frama_c_goal_name".to_string()).or_insert(name);
         }
     }
+}
+
+/// Above this, a wall-clock prover budget measures the machine rather than the
+/// goal. One runnable thread per CPU is the point where that starts, not the
+/// point where the host is merely busy.
+pub const HOST_SATURATED_LOAD_PER_CPU: f64 = 1.0;
+
+/// The host's load, as the timeout verdict needs it.
+///
+/// An enum rather than an Option<f64> beside a category string. The verdict is
+/// a match on the category, and matching a string needs a catch-all arm, so a
+/// renamed spelling would fall through it and leave the run confident. That is
+/// the direction this whole function exists to withhold, and it is the same
+/// argument RunMeasurement makes for keeping its predicate a method rather than
+/// a key routed out through JSON and back.
+///
+/// Normalized once, here. Three places used to refuse non-finite and negative
+/// readings, and because the last of them decided the verdict, every one of
+/// them had to be trusted for the refusal to hold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HostLoad {
+    /// Nothing to read: getloadavg or sysconf refused.
+    Unavailable,
+
+    /// A reading arrived and is not a usable number. Kept apart from
+    /// Unavailable so a machine whose load average is broken is not filed as
+    /// one that was never asked.
+    Unreadable,
+
+    /// Runnable threads per CPU.
+    Load(f64),
+}
+
+impl HostLoad {
+    pub fn from_reading(load_per_cpu: Option<f64>) -> Self {
+        match load_per_cpu {
+            None => Self::Unavailable,
+            Some(load) if !load.is_finite() || load < 0.0 => Self::Unreadable,
+            Some(load) => Self::Load(load),
+        }
+    }
+
+    /// The spelling that reaches a payload, and never the reading itself.
+    ///
+    /// run_wp hashes the timeout triage into the proof receipt, so a
+    /// continuous environment-dependent float in there would give two
+    /// byte-identical runs on the same machine different receipt digests. That
+    /// is the one property a receipt exists to carry, and rounding does not
+    /// save it: 0.42 and 0.55 differ however few decimals they are printed to.
+    /// A category moves only when the verdict moves. The reading is reported
+    /// beside the response through per_cpu, where nothing hashes it.
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Unreadable => "unreadable",
+            Self::Load(load) if load > HOST_SATURATED_LOAD_PER_CPU => "saturated",
+            Self::Load(_) => "quiet",
+        }
+    }
+
+    /// The reading, for the response block the receipt does not cover.
+    pub fn per_cpu(self) -> Option<f64> {
+        match self {
+            Self::Load(load) => Some(load),
+            Self::Unavailable | Self::Unreadable => None,
+        }
+    }
+
+    /// Why this reading leaves the host standing as a possible cause, or None
+    /// where it rules the host out.
+    fn timeout_caveat(self) -> Option<&'static str> {
+        match self {
+            Self::Load(load) if load > HOST_SATURATED_LOAD_PER_CPU => Some(
+                "Goals reached the prover budget on an oversubscribed host, where a wall-clock budget expires whatever a goal's difficulty. This run says nothing about whether they are provable. Re-run on an idle machine before drawing any conclusion; retry_unproved only grinds twice as long.",
+            ),
+            Self::Load(_) => None,
+            Self::Unavailable | Self::Unreadable => Some(
+                "Goals reached the prover budget, and host load could not be read, so an oversubscribed machine cannot be ruled out as the cause. Treat this as unclassified rather than as evidence the goals are unprovable; re-run where the load is readable.",
+            ),
+        }
+    }
+}
+
+/// Host load average over the last minute, divided by the host CPU count.
+///
+/// A prover budget is wall clock, so on an oversubscribed host every goal
+/// grinds to it whatever its difficulty, and a timeout stops saying anything
+/// about the goal. Nothing else in this file can see that, which is how a run
+/// made while another job saturated the machine gets reported as evidence
+/// about the code.
+///
+/// A coarse indicator, and deliberately so. The figure is a one-minute average,
+/// it counts uninterruptible sleep as well as runnable work, and it cannot tell
+/// load this server caused from load it merely suffered. It is used only to
+/// withhold a confident verdict, never to assert one.
+///
+/// Sample it before scheduling any proof, never after. A timeout-heavy WP run
+/// at WP's own parallelism drives the one-minute average toward one runnable
+/// thread per CPU by itself, and the stdio suite runs many servers at once by
+/// design, so a reading taken during response assembly is mostly this server's
+/// own provers. Read afterwards, the saturation branch fires on load this run
+/// created and withdraws confidence from the timeouts it was asked to explain.
+///
+/// Unavailable is reported as unknown rather than guessed at: an absent number
+/// must not read as a quiet machine.
+pub fn host_load() -> HostLoad {
+    // The load average is host-wide, whereas `available_parallelism` honors a
+    // container's CPU quota. Pair the former with the host's online CPUs so a
+    // one-CPU container on an otherwise idle many-core host is not "saturated".
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if cpus <= 0 {
+        return HostLoad::Unavailable;
+    }
+
+    // getloadavg rather than reading /proc or spawning sysctl: it is in libc on
+    // both platforms this runs on, so there is no subprocess to block a Tokio
+    // worker, no PATH to resolve, and no output format to parse.
+    let mut avg = [0.0f64; 1];
+    // Safety: getloadavg writes at most nelem doubles, and the buffer holds
+    // exactly that many.
+    if unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) } != 1 {
+        return HostLoad::Unavailable;
+    }
+
+    // from_reading refuses a non-finite or negative figure, so this hands over
+    // the raw quotient rather than screening it first. One screen, one place.
+    HostLoad::from_reading(Some(avg[0] / cpus as f64))
+}
+
+/// How much of this run's evidence was measured here rather than replayed.
+///
+/// WP's cache defaults to Update, so it stores and replays timeout verdicts as
+/// readily as valid ones. A run whose only failing goal came back from the
+/// cache attempted nothing and can look identical to one that did, down to the
+/// receipt digest. The counts below are what makes that visible without
+/// reading the goal array.
+pub struct RunMeasurement {
+    pub goals: usize,
+    pub replayed: usize,
+    pub unproved: usize,
+    pub unproved_replayed: usize,
+
+    /// Of the goals sitting at a prover timeout, how many, and how many of
+    /// those were replayed. Counted apart from the unproved pair because the
+    /// timeout verdict is about these and only these.
+    pub timed_out: usize,
+    pub timed_out_replayed: usize,
+}
+
+impl RunMeasurement {
+    /// Whether this run attempted none of the timeouts it is about to explain.
+    ///
+    /// Scoped to the timed-out goals rather than to every unproved one, because
+    /// the input is the whole fetchGoals table: it carries goals from functions
+    /// proved earlier in the session and goals left at NORESULT by -wp-prop,
+    /// which are unproved and not cached. One of those made
+    /// unproved_replayed != unproved and kept the verdict confident even where
+    /// every timed-out goal had been replayed, which is the single case this
+    /// predicate exists to catch.
+    ///
+    /// The one a reader has to act on, and the reason this is a method on a
+    /// struct rather than a key in a map: the triage reads it in the same
+    /// module that computes it, and routing a bool out through JSON and back
+    /// made a typo in either spelling mean "not replayed", which is the
+    /// confident direction.
+    pub fn every_timed_out_goal_was_replayed(&self) -> bool {
+        self.timed_out > 0 && self.timed_out_replayed == self.timed_out
+    }
+
+    /// Every counter, for the response block a caller reads. The verdict does
+    /// not travel through here: it goes into the triage as one bool, so the
+    /// object is not serialized into two places in the same payload.
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "goals": self.goals,
+            "replayed": self.replayed,
+            "unproved": self.unproved,
+            "unproved_replayed": self.unproved_replayed,
+            "timed_out": self.timed_out,
+            "timed_out_replayed": self.timed_out_replayed,
+            "every_timed_out_goal_was_replayed": self.every_timed_out_goal_was_replayed(),
+        })
+    }
+}
+
+pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
+    let mut measured = RunMeasurement {
+        goals: goals.len(),
+        replayed: 0,
+        unproved: 0,
+        unproved_replayed: 0,
+        timed_out: 0,
+        timed_out_replayed: 0,
+    };
+    for goal in goals {
+        // The module that owns "is this goal proved" answers it. Spelling the
+        // test here was how the two callers of its sibling drifted apart.
+        let unproved = !crate::mcp::status::own_status_is_proved(goal);
+        // The goal's own verdict, like the line above it. Reading the
+        // consolidated one asked what the property it hangs off decided, which
+        // answers "valid" for a timed-out goal under a property that
+        // consolidated valid, and that is the goal this predicate exists to
+        // count. own_status also covers a row straight off the wire, which
+        // carries "status" alone.
+        let timed_out = crate::mcp::status::own_status_is_timeout(goal);
+        let cached = goal_is_from_cache(goal);
+        measured.replayed += usize::from(cached);
+        measured.unproved += usize::from(unproved);
+        measured.unproved_replayed += usize::from(unproved && cached);
+        measured.timed_out += usize::from(timed_out);
+        measured.timed_out_replayed += usize::from(timed_out && cached);
+    }
+    measured
 }
 
 pub fn wp_timeout_triage(
@@ -1117,7 +1355,9 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
         .unwrap_or("unknown");
     let raw_status = crate::mcp::status::raw_status(goal)
         .unwrap_or(normalized_status);
-    if normalized_status == "timeout" || raw_status.eq_ignore_ascii_case("timeout") {
+    if crate::mcp::status::status_is_timeout(normalized_status)
+        || crate::mcp::status::status_is_timeout(raw_status)
+    {
         return wp_timeout_triage(
             "prover_timeout",
             true,
@@ -1163,6 +1403,8 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
 pub fn wp_timeout_triage_from_tasks_and_report(
     tasks: &serde_json::Value,
     report: Option<&serde_json::Value>,
+    measurement: Option<&RunMeasurement>,
+    host_load: HostLoad,
 ) -> serde_json::Value {
     let from_tasks = wp_timeout_triage_from_tasks(tasks);
     if from_tasks.get("kind").and_then(|k| k.as_str()) != Some("none") {
@@ -1187,6 +1429,61 @@ pub fn wp_timeout_triage_from_tasks_and_report(
         .iter()
         .filter_map(|f| f.get("trigger").cloned())
         .collect();
+    prover_timeout_triage(timed_out.len(), names, host_load, measurement)
+}
+
+/// The prover-timeout verdict, given a load reading rather than reading one.
+///
+/// Split from its caller so the load can be supplied: the interesting case is
+/// a saturated host, which a test cannot produce by loading the machine it
+/// runs on.
+pub fn prover_timeout_triage(
+    goals_at_timeout: usize,
+    triggers: Vec<serde_json::Value>,
+    host_load: HostLoad,
+    measurement: Option<&RunMeasurement>,
+) -> serde_json::Value {
+    let all_replayed = measurement.is_some_and(RunMeasurement::every_timed_out_goal_was_replayed);
+
+    let evidence = json!([
+        {"field": "goals_at_timeout", "value": goals_at_timeout},
+        {"field": "triggers", "value": triggers},
+
+        // The predicate rather than the counts. The counts are reported beside
+        // the response, and repeating the whole object here put two copies of
+        // it in every payload; what the verdict below rests on is this bool.
+        {"field": "every_timed_out_goal_was_replayed", "value": all_replayed},
+
+        // Categorized, never the reading: this payload is hashed into the
+        // proof receipt. See HostLoad::category.
+        {"field": "host_load", "value": host_load.category()},
+    ]);
+
+    // High is the claim that this run measured everything its verdict rests on.
+    // Each caveat below withdraws it for one thing the run did not measure, and
+    // every one that applies is named: a run that both replayed its failures
+    // and ran on a loaded host has two problems, and reporting only the first
+    // sends the caller to re-run with cache "None" on the machine that will
+    // grind to the budget again.
+    let withdrawn: Vec<&str> = [
+        all_replayed.then_some(
+            "Every timed-out goal in this run came back from WP's cache rather than being attempted, so this run measured nothing about them. WP's cache defaults to Update and stores timeout verdicts too. Re-run with cache: \"None\" before drawing any conclusion.",
+        ),
+        host_load.timeout_caveat(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let (confidence, reason) = if withdrawn.is_empty() {
+        (
+            "high",
+            "Goals reached the prover budget without a verdict. That does not mean they need more time: an unprovable goal grinds to the budget too. Use retry_unproved to see whether any flip at double the budget.".to_string(),
+        )
+    } else {
+        ("low", withdrawn.join(" "))
+    };
+
     wp_timeout_triage(
         "prover_timeout",
 
@@ -1195,12 +1492,9 @@ pub fn wp_timeout_triage_from_tasks_and_report(
         // advice that sends a caller round a loop that never terminates. See
         // classify_failure_reason for how to tell the two apart.
         false,
-        "high",
-        "Goals reached the prover budget without a verdict. That does not mean they need more time: an unprovable goal grinds to the budget too. Use retry_unproved to see whether any flip at double the budget.",
-        json!([
-            {"field": "goals_at_timeout", "value": timed_out.len()},
-            {"field": "triggers", "value": names},
-        ]),
+        confidence,
+        &reason,
+        evidence,
     )
 }
 
