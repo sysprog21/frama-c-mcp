@@ -13,8 +13,8 @@
 
 use super::*;
 
-// The band this came out of. The dependency runs one way at the item level,
-// but analysis.rs also calls back into here, so both carry a glob rather than a
+// The band this came out of. The dependency runs one way at the item level, but
+// analysis.rs also calls back into here, so both carry a glob rather than a
 // list that goes stale on the next move.
 use super::analysis::*;
 
@@ -40,18 +40,18 @@ pub struct NextCallInputs<'a> {
 }
 
 pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
-    // Ordered after "incomplete" so the fallback can name the gaps it
-    // found. Not every gap has an alarm or a goal to point at: an axiom
-    // leaves every one of them valid, and a fallback that cannot name it
-    // reads as all clear next to a verdict of incomplete.
+    // Ordered after "incomplete" so the fallback can name the gaps it found.
+    // Not every gap has an alarm or a goal to point at: an axiom leaves every
+    // one of them valid, and a fallback that cannot name it reads as all clear
+    // next to a verdict of incomplete.
     //
-    // The backend diagnosis comes first for the same reason a timeout is
-    // read before a goal's text: reading a VC no prover ever received sends
-    // the caller to rewrite an annotation that was never judged.
+    // The backend diagnosis comes first for the same reason a timeout is read
+    // before a goal's text: reading a VC no prover ever received sends the
+    // caller to rewrite an annotation that was never judged.
     //
-    // Gated on the same condition as the incomplete entry above: an abort
-    // that cost no goal its verdict should not displace the call that
-    // targets a goal which is still open.
+    // Gated on the same condition as the incomplete entry above: an abort that
+    // cost no goal its verdict should not displace the call that targets a goal
+    // which is still open.
     let NextCallInputs {
         backend_diagnosis,
         anomaly_left_goals_unjudged,
@@ -70,29 +70,29 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
         .or_else(|| first_alarm_next_call(eva_alarms))
         .or_else(|| first_wp_goal_next_call(wp_goals, function))
         .unwrap_or_else(|| {
-            // An analysis the caller left out is answered by asking for it,
-            // not by reading the table it never filled. Pointing at
-            // get_wp_goals after a run that skipped WP sends the caller to
-            // a list that is empty because nothing produced it.
+            // An analysis the caller left out is answered by asking for it, not
+            // by reading the table it never filled. Pointing at get_wp_goals
+            // after a run that skipped WP sends the caller to a list that is
+            // empty because nothing produced it.
             let (tool, args) = if wanted.eva && wanted.wp {
                 ("get_wp_goals", json!({"want": ["counts"]}))
             } else {
                 ("check", json!({"want": ["eva", "wp"]}))
             };
 
-            // A clean run is exactly when vacuity is worth testing, and
-            // exactly when nothing else prompts for it. check runs no smoke
-            // tests, so it cannot see a contract that proves by excluding
-            // its own branch: the goals are valid, the verdict is proved,
-            // and an over-strong requires has quietly removed the case the
-            // function exists to handle.
+            // A clean run is exactly when vacuity is worth testing, and exactly
+            // when nothing else prompts for it. check runs no smoke tests, so
+            // it cannot see a contract that proves by excluding its own branch:
+            // the goals are valid, the verdict is proved, and an over-strong
+            // requires has quietly removed the case the function exists to
+            // handle.
             //
-            // Carried in the reason rather than by redirecting the call.
-            // Two stronger versions were tried and both were wrong: as an
+            // Carried in the reason rather than by redirecting the call. Two
+            // stronger versions were tried and both were wrong: as an
             // incomplete[] code it gated the verdict, so "proved" became
             // unreachable and the abs-int canary went red; as a replacement
-            // tool it broke the recommendation this payload has always made
-            // on a clean run.
+            // tool it broke the recommendation this payload has always made on
+            // a clean run.
             let reason = if incomplete.is_empty() {
                 "Every goal is valid, which says the code matches the contract, not that \
                  the contract was worth matching. check runs no vacuity tests: run_wp \
@@ -256,6 +256,7 @@ impl WantedAnalyses {
 fn unrequested_analysis_gaps(
     incomplete: &mut Vec<serde_json::Value>,
     rte: Option<bool>,
+    wp: &serde_json::Value,
     wanted: WantedAnalyses,
 ) {
     // An analysis nobody asked for is still an analysis that did not run, and
@@ -275,9 +276,24 @@ fn unrequested_analysis_gaps(
         }));
     }
     if rte == Some(false) {
+        // Which half of the check the gap is about depends on what WP did.
+        // run_wp generates WP's own RTE guards for every main-instance run,
+        // so its goals cover runtime errors whatever the load said, while EVA
+        // ran before them and its alarms do not. Saying both were excluded was
+        // true while the kernel's -rte at load was the only source of these
+        // annotations, and it now tells a caller to discard a WP verdict that
+        // is sound. Read off the run rather than off the load flag, because
+        // the run is what decided it.
+        let wp_covered_runtime_errors = wanted.wp
+            && wp.pointer("/effective_wp_config/rte").and_then(serde_json::Value::as_bool)
+                == Some(true);
         incomplete.push(json!({
             "code": incomplete_code::RTE_DISABLED,
-            "reason": "check ran without RTE annotations, so absence of alarms/goals excludes implicit runtime-error checks.",
+            "reason": if wp_covered_runtime_errors {
+                "check loaded without RTE annotations, so EVA's alarms exclude implicit runtime-error checks. WP generated its own RTE obligations in place for this run, so the goals do cover them."
+            } else {
+                "check ran without RTE annotations, so absence of alarms/goals excludes implicit runtime-error checks."
+            },
         }));
     }
 }
@@ -489,13 +505,15 @@ fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json:
             "property_status": field("normalized_property_status"),
         }));
     }
+
     // Before the hypotheses test, and separate from the dead test above it.
     // "valid_under_false_hypothesis" is a proof leaning on a hypothesis that
     // cannot hold, which is neither unreachable code nor a conditional proof:
-    // property_is_dead matches only "_but_dead", and goal_is_valid_under_hypotheses
-    // matches "valid_under_hyp", so a goal in this state answered both tests
-    // false and produced no gap at all. check then read "proved" over a proof
-    // that holds over no execution. get_wp_goals already reported it, through
+    // property_is_dead matches only "_but_dead", and
+    // goal_is_valid_under_hypotheses matches "valid_under_hyp", so a goal in
+    // this state answered both tests false and produced no gap at all. check
+    // then read "proved" over a proof that holds over no execution.
+    // get_wp_goals already reported it, through
     // goal_needs_failure_classification, so the two paths disagreed.
     if status_is_vacuous(
         goal.get("normalized_property_status")
@@ -854,7 +872,7 @@ pub fn check_incomplete_items(
 ) -> Vec<serde_json::Value> {
     let mut incomplete = Vec::new();
     ast_diagnostic_gaps(&mut incomplete, reload, AST_WARNING_ALLOWLIST);
-    unrequested_analysis_gaps(&mut incomplete, rte, wanted);
+    unrequested_analysis_gaps(&mut incomplete, rte, wp, wanted);
     step_failure_gaps(
         &mut incomplete,
         reload,

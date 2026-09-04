@@ -1097,12 +1097,7 @@ pub fn unproved_assumption_findings(
         if !(is_assert || is_postcondition) {
             continue;
         }
-        let owner = goal
-            .get("fct")
-            .or_else(|| goal.get("scope"))
-            .or_else(|| goal.get("function_marker"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
+        let owner = crate::mcp::server::wpclass::goal_scope_key(goal);
 
         // Keyed on the goal's identity, not on its name. Frama-C names a goal
         // "Assertion" or "Post-condition" with no location in it, so a name is
@@ -1617,6 +1612,91 @@ fn enrich_vcs_with_goals(
     }
 }
 
+/// A profile as it stood when the run was configured.
+///
+/// The echo goes in the response; the floor is checked after the run. Both are
+/// taken from one snapshot because the registry is replaceable: reload_project
+/// swaps it before waiting on main_wp_lock, so re-reading the profile after the
+/// proof would judge this run by a target it was never configured for.
+pub struct AppliedProfile {
+    /// The name this run was configured under.
+    ///
+    /// Carried rather than read back from params at the check. The pair was
+    /// destructured from two Options that cannot disagree, which invited a
+    /// reader to work out a half-state that does not exist:
+    /// apply_verify_profile returns None exactly when verify_profile is None,
+    /// and never clears it.
+    pub name: String,
+    pub echo: serde_json::Value,
+    pub min_goals: Option<u32>,
+}
+
+/// The refusal for a run that generated fewer obligations than its target
+/// requires, or None when it cleared the floor.
+///
+/// "N of N discharged" is not evidence on its own: an emptied function body or
+/// a dropped contract discharges 0 of 0 and reports success, and every other
+/// check on this path would pass it. A build system carrying such a floor is
+/// carrying the only check that catches that, so a profile that states one is
+/// stating something the server cannot otherwise know.
+///
+/// Refused rather than reported: a caller who asked for this target's evidence
+/// and got a thinner program has no use for the verdict. Split out of run_wp so
+/// the rule is testable without a live Frama-C, and because run_wp was at the
+/// repo's function-length ceiling.
+///
+/// No floor means the target declares none, which is not a floor of zero.
+///
+/// Counted over the target's own obligations rather than over the whole goal
+/// table, which is what fetchGoals returns: it carries goals from functions
+/// proved earlier in the session and goals left at NORESULT by -wp-prop. So
+/// run_wp on one function followed by a profiled run on another would have let
+/// the first function's goals clear the second's floor, which is the emptied
+/// body this check exists to catch. check reloads first and never saw it; a
+/// direct run_wp in a CEGIS loop is where the stale goals live.
+pub fn goal_floor_shortfall(
+    name: &str,
+    min_goals: Option<u32>,
+    goals: &[serde_json::Value],
+    functions: &[String],
+) -> Option<String> {
+    let min_goals = min_goals?;
+    let generated = goals_owned_by(goals, functions);
+    if generated >= min_goals as usize {
+        return None;
+    }
+    Some(format!(
+        "verify_profile \"{name}\" requires at least {min_goals} obligations and this run \
+         generated {generated} for {functions:?}, so it is not that target's evidence however \
+         many discharged. A dropped contract or an emptied body proves 0 of 0. WP did run: the \
+         goals are in Frama-C's table and reading them back through get_wp_goals or check \
+         reports the verdict this refusal is about, and any RTE guards this call generated are \
+         still in the AST."
+    ))
+}
+
+/// How many of these goals belong to the functions a run was asked about.
+///
+/// A goal names its function in "fct", which is a name rather than one of the
+/// reallocated "#F" markers, and a goal that names no function is not counted.
+///
+/// Counting the unnamed was the first answer here, on the argument that a false
+/// refusal is worse than nothing if Frama-C ever stops emitting the field. It
+/// is not: the input is the whole fetchGoals table, so an unowned or
+/// marker-scoped entry left there by an earlier run counts once for every
+/// profiled target afterwards, and one such entry can carry an emptied target
+/// over its floor. That is the case this check exists for, so the direction to
+/// fail in is the loud one. If the field ever does disappear, every profiled
+/// run refuses at once and says which functions it counted, which is a bug
+/// report rather than a silent pass.
+pub fn goals_owned_by(goals: &[serde_json::Value], functions: &[String]) -> usize {
+    goals
+        .iter()
+        .filter_map(crate::mcp::server::wpclass::goal_owner_name)
+        .filter(|owner| functions.iter().any(|wanted| wanted == owner))
+        .count()
+}
+
 /// Whether a call names the same functions the profile declares.
 ///
 /// Lifted out of apply_verify_profile to be testable independently of a live
@@ -1640,10 +1720,10 @@ pub fn profile_matches_loaded_project(
     // a database-backed load is not described by the profile whatever the
     // fields below say. Refusing it is the only honest answer: the alternative
     // is calling a run evidence about a target while the flags it actually ran
-    // under came from somewhere the profile does not reach.
-    // Destructured exhaustively, for the reason given on ProjectLoadOptions.
-    // The profile side stays field by field on purpose: its Option fields mean
-    // "unset, do not constrain", which no derived equality can express.
+    // under came from somewhere the profile does not reach. Destructured
+    // exhaustively, for the reason given on ProjectLoadOptions. The profile
+    // side stays field by field on purpose: its Option fields mean "unset, do
+    // not constrain", which no derived equality can express.
     let ProjectLoadOptions {
         include_paths,
         defines,
@@ -2221,7 +2301,9 @@ impl FramaCMcpServer {
                 verify_profiles: None,
                 verify_profiles_source: None,
                 verify_profile: params.verify_profile.clone(),
-                // Resolved above, so a named profile cannot silently turn it off.
+
+                // Resolved above, so a named profile cannot silently turn it
+                // off.
                 rte: Some(rte),
 
                 // check's own detail governs goals and alarms; the function
@@ -2312,6 +2394,7 @@ impl FramaCMcpServer {
         };
 
         let mut incomplete = check_incomplete_items(
+
             // The value this call actually loaded under, which is the caller's
             // only when the caller gave one. A profile stating rte:false loads
             // without RTE, and passing the caller's None here reported no
@@ -3021,7 +3104,7 @@ impl FramaCMcpServer {
     async fn apply_verify_profile(
         &self,
         params: &mut RunWpParams,
-    ) -> Result<Option<serde_json::Value>, McpError> {
+    ) -> Result<Option<AppliedProfile>, McpError> {
         let Some(name) = params.verify_profile.clone() else {
             return Ok(None);
         };
@@ -3051,12 +3134,32 @@ impl FramaCMcpServer {
             || params.timeout.is_some()
             || params.prover.is_some()
             || params.provers.is_some()
+
+            // prop belongs with them. A filtered run attempts the obligations
+            // the filter selects and leaves the rest, so its goal count and its
+            // summary agree with each other while describing a subset, and
+            // nothing downstream can tell that from a whole run. Refused here
+            // rather than after it, because the run is the expensive part and
+            // the answer does not depend on it. proof_coverage names the same
+            // thing after the fact as proved_under_a_goal_filter.
+            || params.prop.is_some()
+
+            // And so does retry_unproved, for the timeout's version of the same
+            // argument. The retry re-proves at double the profile's timeout and
+            // the flipped goals replace the reported set everywhere downstream,
+            // including the receipt; the session timeout is restored before the
+            // receipt is taken and the receipt reads the live config, so the
+            // receipt would record the declared timeout while some goals were
+            // discharged at twice it. That is the mislabelling this list exists
+            // to prevent, arriving through a parameter that does not look like
+            // a proof setting.
+            || params.retry_unproved == Some(true)
         {
             return Err(McpError::invalid_params(
                 format!(
                     "verify_profile \"{name}\" is proof evidence and cannot be combined with \
-                     model, prover, provers, or timeout overrides. Drop verify_profile to deviate \
-                     from its proof settings."
+                     model, prover, provers, timeout, prop, or retry_unproved overrides. Drop \
+                     verify_profile to deviate from its proof settings."
                 ),
                 None,
             ));
@@ -3098,16 +3201,79 @@ impl FramaCMcpServer {
         if !profile.provers.is_empty() {
             params.prover = Some(profile.provers.join(","));
         }
-        Ok(Some(json!({
-            "name": name,
-            "model": profile.model,
-            "provers": profile.provers,
-            "timeout_seconds": profile.timeout_seconds,
-            "rte": profile.rte,
-            "nostdinc": profile.nostdinc,
-            "isystem_paths": profile.isystem_paths,
-            "reproduce": profile.reproduce,
-        })))
+        Ok(Some(AppliedProfile {
+            name: name.clone(),
+
+            // Carried from the snapshot this function validated, not looked up
+            // again after the run. reload_project replaces the registry before
+            // it waits on main_wp_lock, so a concurrent call can swap the
+            // profile mid-proof and the floor checked at the end would belong
+            // to a target this run was never configured for.
+            min_goals: profile.min_goals,
+            echo: json!({
+                "name": name,
+                "model": profile.model,
+                "provers": profile.provers,
+                "timeout_seconds": profile.timeout_seconds,
+                "rte": profile.rte,
+                "nostdinc": profile.nostdinc,
+                "isystem_paths": profile.isystem_paths,
+                "min_goals": profile.min_goals,
+
+                // Repeated because they did not happen. A profile can say what
+                // Frama-C was invoked with; it cannot run a separate script
+                // over the same sources, and a verdict that stayed silent about
+                // them would read as the build's verdict rather than WP's.
+                //
+                // "declared" is load-bearing in the name. The list is whatever
+                // the profile author wrote, so it can be stale or short, and an
+                // old profile carrying none is indistinguishable from a target
+                // that has none. It bounds this verdict downward and never
+                // upward: reading an empty list as "nothing else is checked" is
+                // the one conclusion it does not support.
+                "declared_build_gates_not_run_here": profile.build_gates,
+                "reproduce": profile.reproduce,
+            }),
+        }))
+    }
+
+    /// The isolated per-prover retry, when this call asked for one.
+    ///
+    /// The plural "provers" argument is what selects the isolated CLI retry
+    /// path; a singular "prover" and the environment defaults configure the
+    /// live instance instead. requested_provers already holds the trimmed and
+    /// validated list whenever "provers" was given.
+    ///
+    /// Never a profiled run. apply_verify_profile refuses a plural "provers"
+    /// beside a profile and never sets one itself, so profile_applied is None
+    /// on every path that reaches here, and there is no profile key to graft
+    /// onto this exit's response.
+    ///
+    /// Split out of run_wp because it is a whole alternative answer rather than
+    /// a step in the one below it: nothing after it runs, and it takes the
+    /// project lock for itself.
+    async fn run_isolated_wp_retries_for_main(
+        &self,
+        params: &RunWpParams,
+        provers: &[String],
+    ) -> Result<CallToolResult, McpError> {
+        let (files, project_options) = {
+            let main_state = self.main_frama_c_state.lock().await;
+            let state = main_state.as_ref().ok_or_else(no_project_loaded_err)?;
+            (state.files.clone(), state.project_options.clone())
+        };
+        let functions = params.functions.clone().unwrap_or_default();
+        self.run_isolated_wp_retries(IsolatedWpRetry {
+            files,
+            project_options,
+            rte_enabled: true,
+            functions: functions.clone(),
+            reported_functions: functions,
+            provers: provers.to_vec(),
+            params,
+            scope: "main",
+        })
+        .await
     }
 
     #[tool(
@@ -3167,37 +3333,13 @@ impl FramaCMcpServer {
         }
         let requested_provers = effective_wp_provers(&params)?;
 
-        // The plural `provers` argument is what selects the isolated CLI retry
-        // path; a singular `prover` and the environment defaults configure the
-        // live instance instead. requested_provers already holds the trimmed
-        // and validated list whenever `provers` was given.
-        //
-        // Never a profiled run. apply_verify_profile refuses a plural "provers"
-        // beside a profile and never sets one itself, so profile_applied is
-        // None on every path that reaches here, and there is no profile key to
-        // graft onto this exit's response.
+        // The guard stays here, where a reader of run_wp can see that this is a
+        // whole alternative answer rather than a step.
         if let Some(provers) = requested_provers
             .as_ref()
             .filter(|_| params.provers.is_some())
         {
-            let (files, project_options) = {
-                let main_state = self.main_frama_c_state.lock().await;
-                let state = main_state.as_ref().ok_or_else(no_project_loaded_err)?;
-                (state.files.clone(), state.project_options.clone())
-            };
-            let functions = params.functions.clone().unwrap_or_default();
-            return self
-                .run_isolated_wp_retries(IsolatedWpRetry {
-                    files,
-                    project_options,
-                    rte_enabled: true,
-                    functions: functions.clone(),
-                    reported_functions: functions,
-                    provers: provers.clone(),
-                    params: &params,
-                    scope: "main",
-                })
-                .await;
+            return self.run_isolated_wp_retries_for_main(&params, provers).await;
         }
 
         // Held across the whole transaction below: config, target resolution,
@@ -3266,11 +3408,18 @@ impl FramaCMcpServer {
         // Every run regenerates, which is safe to repeat: measured on 33.0,
         // three successive runs over the same function give the same eight
         // goals with the same eight stable ids, so nothing is duplicated.
-        let rte_guarded = if rte_enabled {
-            Vec::new()
-        } else {
-            self.generate_rte_guards(&client, &targets).await?
-        };
+        //
+        // Unconditional, and that is what dropping kernel -rte at load made it.
+        // The branch here used to skip generation for an rte=true load because
+        // the kernel had already put its own assertions into the AST, and those
+        // are a different, larger set: WP's generator emits no
+        // pointer_alignment. With the kernel out of it nothing else generates
+        // these, so an rte=true load that skipped this step proved no
+        // runtime-error obligations at all. Inverting the branch moved the hole
+        // rather than closing it, to rte=false, where the obligations are
+        // generated in place precisely so that asking for them does not cost a
+        // reload that would discard this session's injected annotations.
+        let rte_guarded = self.generate_rte_guards(&client, &targets).await?;
 
         // A named target gets its own marker; "everything" asks for everything,
         // so global obligations like lemmas are scheduled too.
@@ -3344,9 +3493,28 @@ impl FramaCMcpServer {
                 wp_goals,
             )
             .await?;
+
+        // The floor on obligations generated, checked here because this is
+        // where the count first exists, against the floor captured before the
+        // run. Ahead of the proofread report rather than after it: that report
+        // costs a Frama-C round trip per target function and this path throws
+        // it away, which is the argument the profile already makes for refusing
+        // prop before the run instead of after.
+        if let Some(applied) = profile_applied.as_ref() {
+            if let Some(message) = goal_floor_shortfall(
+                &applied.name,
+                applied.min_goals,
+                &wp_goals,
+                &function_names,
+            ) {
+                return Err(McpError::invalid_params(message, None));
+            }
+        }
+
         let mut proofread_report =
             main_proofread_report(&client, &wp_goals, &function_names, report_function).await;
         proofread_drop_stale_retry_advice(&mut proofread_report, &timeout_retry);
+
         {
             let mut state = self.state.write().await;
             state.set_wp_completed();
@@ -3399,7 +3567,7 @@ impl FramaCMcpServer {
         // warns about.
         if let Some(profile) = profile_applied {
             if let Some(object) = response.as_object_mut() {
-                object.insert("verify_profile".to_string(), profile);
+                object.insert("verify_profile".to_string(), profile.echo);
             }
         }
         Ok(json_result(response))

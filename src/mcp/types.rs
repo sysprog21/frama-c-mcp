@@ -235,8 +235,20 @@ pub struct ReloadProjectParams {
     /// loaded from this database.
     #[serde(alias = "compilation_db")]
     pub compilation_database: Option<String>,
-    /// Enable generated RTE annotations by restarting Frama-C with `-rte`.
-    /// Default: false.
+
+    // Deliberately a plain comment and not part of the doc below. This field's
+    // doc comment is the property description in the published tool schema,
+    // which tool_registry_count_matches_declared_snapshots caps at 90
+    // characters, so an explanation written there ships to every agent on every
+    // turn and fails the build.
+    //
+    // Nothing on the command line carries this any more. The kernel's -rte
+    // emits pointer_alignment assertions that WP's generator does not, so a
+    // load started under it proves a strictly larger set than a -wp-rte build,
+    // and run_wp generates WP's own guards for every main-instance run instead.
+    // Still part of the load identity, so two receipts differing here are not
+    // comparable.
+    /// Whether this load proves runtime-error obligations. Default: false.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte: Option<bool>,
     /// Register what the project's build system proves each target under, as an
@@ -253,6 +265,18 @@ pub struct ReloadProjectParams {
     /// because each decides which obligations exist at all. A profile written
     /// before those two were required loads as before and is refused only
     /// where it would have become evidence; state them to restore it.
+    ///
+    /// Two optional fields say what this server cannot otherwise know.
+    /// min_goals is the floor on obligations the target requires WP to
+    /// generate, and a run that generates fewer is refused: "N of N
+    /// discharged" is not evidence on its own, since an emptied body or a
+    /// dropped contract discharges 0 of 0. build_gates names checks the
+    /// target's own command runs that this server does not, and they are
+    /// echoed back under declared_build_gates_not_run_here so a verdict here is
+    /// not mistaken for the build's. "Declared" is the load-bearing word: the
+    /// list is whatever the profile author wrote, so an empty one means none
+    /// were declared rather than that none exist.
+    ///
     /// Registered for the session; passing it again replaces the set.
     ///
     /// Tolerant of the JSON text of the object as well as the object, like the

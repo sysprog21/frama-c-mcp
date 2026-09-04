@@ -1736,8 +1736,8 @@ fn a_string_that_is_not_json_is_refused_at_the_boundary() {
     assert!(err.contains("not valid JSON"), "{err}");
 }
 
-// The old message said only "must be an object", which gave a caller who sent
-// a string no way to tell that from a malformed object.
+// The old message said only "must be an object", which gave a caller who sent a
+// string no way to tell that from a malformed object.
 #[test]
 fn a_wrong_type_names_what_arrived() {
     let err = parse_verification_profiles(&json!([])).unwrap_err();
@@ -1786,8 +1786,9 @@ fn a_profile_silent_on_rte_or_nostdinc_cannot_check_a_receipt() {
     for (rte, nostdinc) in [(None, Some(false)), (Some(false), None), (None, None)] {
         let err = profile_evidence_error("t", &profile(rte, nostdinc), "f", Some(&receipt))
             .unwrap_or_else(|| panic!("accepted a profile silent on one of them"));
-        // Names both, because the guard fires when either is unset and
-        // "rte or nostdinc" reads as though only one of them were missing.
+
+        // Names both, because the guard fires when either is unset and "rte or
+        // nostdinc" reads as though only one of them were missing.
         assert!(err.contains("must state both rte and nostdinc"), "{err}");
     }
 
@@ -1799,4 +1800,273 @@ fn a_profile_silent_on_rte_or_nostdinc_cannot_check_a_receipt() {
         err.as_deref().is_none_or(|e| !e.contains("rte or nostdinc")),
         "{err:?}"
     );
+}
+
+// A build system's floor on obligations generated is the only check that
+// catches a proof passing by proving less, and nothing else in a profile can
+// express it. Absent means the target has no floor, not a floor of zero.
+#[test]
+fn a_profile_carries_the_targets_goal_floor_and_its_unrun_gates() {
+    let profile: crate::state::VerificationProfile = serde_json::from_value(json!({
+        "functions": ["f"],
+        "sources": ["a.c"],
+        "model": "typed",
+        "provers": ["alt-ergo"],
+        "timeout_seconds": 30,
+        "rte": true,
+        "nostdinc": true,
+        "min_goals": 17,
+        "build_gates": ["check-acsl-coverage.py", "check-char-signedness.py"]
+    }))
+    .unwrap();
+    assert_eq!(profile.min_goals, Some(17));
+    assert_eq!(profile.build_gates.len(), 2);
+
+    // Both optional: a project without either still registers.
+    let bare: crate::state::VerificationProfile = serde_json::from_value(json!({
+        "functions": ["f"],
+        "sources": ["a.c"]
+    }))
+    .unwrap();
+    assert_eq!(bare.min_goals, None);
+    assert!(bare.build_gates.is_empty());
+}
+
+// The case the floor exists for: a run that discharges everything it generated
+// while generating almost nothing. Every other check on that path passes it.
+#[test]
+fn a_run_that_generated_too_few_obligations_is_not_the_targets_evidence() {
+    use frama_c_mcp::mcp::server::analysis::goal_floor_shortfall;
+
+    let target = vec!["gva".to_string()];
+    let goals = |n: usize| -> Vec<serde_json::Value> {
+        (0..n).map(|i| json!({"fct": "gva", "name": format!("g{i}")})).collect()
+    };
+
+    let err = goal_floor_shortfall("t", Some(69), &goals(0), &target)
+        .expect("0 of 0 must be refused");
+    assert!(err.contains("at least 69"), "{err}");
+    assert!(err.contains("generated 0"), "{err}");
+
+    // The refusal says what already happened, because it lands after the proof
+    // and the goals are still in Frama-C's table.
+    assert!(err.contains("WP did run"), "{err}");
+
+    // At the floor and above it are both the target's evidence.
+    assert!(goal_floor_shortfall("t", Some(69), &goals(69), &target).is_none());
+    assert!(goal_floor_shortfall("t", Some(69), &goals(70), &target).is_none());
+    assert!(goal_floor_shortfall("t", Some(69), &goals(68), &target).is_some());
+
+    // No floor is not a floor of zero: a target that declares none is unchecked
+    // here rather than trivially passing.
+    assert!(goal_floor_shortfall("t", None, &goals(0), &target).is_none());
+}
+
+// fetchGoals returns the whole table, so a run_wp on one function leaves its
+// goals sitting there for the next call. Counting them would let an unrelated
+// function clear a gutted target's floor, which is the one thing the floor
+// exists to catch.
+#[test]
+fn another_functions_leftover_goals_do_not_clear_this_targets_floor() {
+    use frama_c_mcp::mcp::server::analysis::{goal_floor_shortfall, goals_owned_by};
+
+    let table = vec![
+        json!({"fct": "proved_earlier", "name": "a"}),
+        json!({"fct": "proved_earlier", "name": "b"}),
+        json!({"fct": "proved_earlier", "name": "c"}),
+        json!({"fct": "gva", "name": "d"}),
+    ];
+    let target = vec!["gva".to_string()];
+
+    assert_eq!(goals_owned_by(&table, &target), 1);
+    let err = goal_floor_shortfall("t", Some(3), &table, &target)
+        .expect("three goals belonging to another function must not clear this floor");
+    assert!(err.contains("generated 1"), "{err}");
+
+    // A goal owning no name does not count. The table is global, so an entry an
+    // earlier run left unowned would otherwise count once for every profiled
+    // target afterwards and could carry an emptied one over its floor, which is
+    // the case the floor exists for.
+    let unowned = vec![json!({"name": "lemma"}), json!({"fct": "gva", "name": "d"})];
+    assert_eq!(goals_owned_by(&unowned, &target), 1);
+
+    // A reallocated declaration marker is not a name either, so it cannot be
+    // compared against one and cannot be attributed to this target.
+    let marked = vec![json!({"scope": "#F24", "name": "x"})];
+    assert_eq!(goals_owned_by(&marked, &target), 0);
+
+    // Every function the call named counts, not just the first.
+    let two = vec![json!({"fct": "a", "name": "x"}), json!({"fct": "b", "name": "y"})];
+    assert_eq!(goals_owned_by(&two, &["a".to_string(), "b".to_string()]), 2);
+    assert_eq!(goals_owned_by(&two, &["a".to_string()]), 1);
+}
+
+// run_wp is not the only door. store_function_conclusion takes a receipt from
+// the caller, so a run made without the profile over a gutted target could be
+// stored under the profile's name and the floor would never have run. The
+// conclusion is durable and names the target, which makes this the worse miss.
+#[test]
+fn a_stored_receipt_below_the_targets_goal_floor_is_not_its_evidence() {
+    use frama_c_mcp::mcp::server::receipt::project_load_identity;
+
+    let profile = crate::state::VerificationProfile {
+        functions: vec!["f".into()],
+        sources: vec!["a.c".into()],
+        model: Some("Typed".into()),
+        provers: vec!["alt-ergo".into()],
+        timeout_seconds: Some(10),
+        rte: Some(true),
+        nostdinc: Some(true),
+        min_goals: Some(4),
+        ..Default::default()
+    };
+    let load = project_load_identity(&frama_c_mcp::mcp::server::ProjectLoadOptions {
+        rte: true,
+        nostdinc: true,
+        ..Default::default()
+    });
+    let receipt = |goals: usize| {
+        json!({
+            "wp": {"functions": ["f"], "model": "Typed"},
+            "subject": {"files": [{"path": "a.c", "sha256": "h"}], "project_load": load},
+            "goals": (0..goals).map(|i| json!({"stable_goal_id": format!("sg_{i}"), "status": "valid"}))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let err = profile_evidence_error("t", &profile, "f", Some(&receipt(1)))
+        .expect("a receipt recording one obligation cannot be a four-obligation target's evidence");
+    assert!(err.contains("at least 4"), "{err}");
+    assert!(err.contains("records 1"), "{err}");
+
+    // A receipt with no goals array at all is the same case, not an exemption.
+    let empty = json!({
+        "wp": {"functions": ["f"], "model": "Typed"},
+        "subject": {"files": [{"path": "a.c", "sha256": "h"}], "project_load": load}
+    });
+    assert!(profile_evidence_error("t", &profile, "f", Some(&empty)).is_some());
+
+    // At the floor it passes, and a profile declaring no floor never asks.
+    assert_eq!(profile_evidence_error("t", &profile, "f", Some(&receipt(4))), None);
+    let no_floor = crate::state::VerificationProfile { min_goals: None, ..profile.clone() };
+    assert_eq!(profile_evidence_error("t", &no_floor, "f", Some(&receipt(0))), None);
+
+    // And a conclusion stored before any proof exists is still nameable: the
+    // floor is a question about a receipt, not about the target.
+    assert_eq!(profile_evidence_error("t", &profile, "f", None), None);
+}
+
+// A receipt need not be about the whole target. check {function: "a"} scopes
+// its goals to a, so an honest receipt for one function of a multi-function
+// profile records a fraction of the floor, and asking the floor of it refused
+// evidence that was correct. proof_coverage re-runs this check over every
+// stored conclusion, so the refusal also reached conclusions stored earlier.
+#[test]
+fn the_goal_floor_is_asked_only_of_a_receipt_covering_the_whole_target() {
+    use frama_c_mcp::mcp::server::receipt::project_load_identity;
+
+    let profile = crate::state::VerificationProfile {
+        functions: vec!["a".into(), "b".into(), "c".into()],
+        sources: vec!["a.c".into()],
+        model: Some("Typed".into()),
+        provers: vec!["alt-ergo".into()],
+        timeout_seconds: Some(10),
+        rte: Some(true),
+        nostdinc: Some(true),
+        min_goals: Some(60),
+        ..Default::default()
+    };
+    let load = project_load_identity(&frama_c_mcp::mcp::server::ProjectLoadOptions {
+        rte: true,
+        nostdinc: true,
+        ..Default::default()
+    });
+    // Goals carry "fct", which is what a receipt this build writes looks like.
+    // Without it every assertion below would exercise the compatibility branch
+    // for older receipts instead of the rule this test is named for.
+    let receipt = |functions: serde_json::Value, goals: usize, owner: fn(usize) -> &'static str| {
+        json!({
+            "wp": {"functions": functions, "model": "Typed"},
+            "subject": {"files": [{"path": "a.c", "sha256": "h"}], "project_load": load},
+            "goals": (0..goals).map(|i| {
+                json!({"stable_goal_id": format!("sg_{i}"), "fct": owner(i)})
+            }).collect::<Vec<_>>()
+        })
+    };
+    let all_a = |_| "a";
+
+    // One function of three, honestly proved, well under the target's floor.
+    assert_eq!(
+        profile_evidence_error("t", &profile, "a", Some(&receipt(json!(["a"]), 12, all_a))),
+        None,
+        "a receipt scoped to one function was refused for not carrying the whole target's floor"
+    );
+
+    // The whole target, and short: this is the case the floor exists for.
+    let short = receipt(json!(["a", "b", "c"]), 3, all_a);
+    let err = profile_evidence_error("t", &profile, "a", Some(&short))
+        .expect("a receipt covering the whole target must still meet its floor");
+    assert!(err.contains("at least 60"), "{err}");
+
+    // Padding with another function's goals does not clear it. A whole-project
+    // run's receipt legitimately carries every function's goals, so counting
+    // the array let an emptied target pass on its neighbours' obligations,
+    // which is looser than the rule run_wp applies to the same profile.
+    let padded = receipt(json!(["a", "b", "c"]), 80, |i| if i < 4 { "a" } else { "elsewhere" });
+    let err = profile_evidence_error("t", &profile, "a", Some(&padded))
+        .expect("goals owned by another function must not count toward this target's floor");
+    assert!(err.contains("records 4"), "{err}");
+
+    // Owned goals do clear it, counted the way run_wp counts them.
+    let owned = receipt(json!(["a", "b", "c"]), 60, |i| ["a", "b", "c"][i % 3]);
+    assert_eq!(profile_evidence_error("t", &profile, "a", Some(&owned)), None);
+
+    // A receipt from before "fct" existed keeps the older, looser count, so
+    // adding a floor to a profile does not invalidate what is already stored.
+    let older = json!({
+        "wp": {"functions": ["a", "b", "c"], "model": "Typed"},
+        "subject": {"files": [{"path": "a.c", "sha256": "h"}], "project_load": load},
+        "goals": (0..60).map(|i| json!({"stable_goal_id": format!("sg_{i}")}))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(profile_evidence_error("t", &profile, "a", Some(&older)), None);
+
+    // The whole target, and sufficient.
+    assert_eq!(
+        profile_evidence_error("t", &profile, "a", Some(&receipt(json!(["a", "b", "c"]), 60, all_a))),
+        None
+    );
+}
+
+// None already says the target declares no floor, so zero would be a field that
+// reads as a floor and checks nothing.
+#[test]
+fn a_zero_goal_floor_is_refused_rather_than_accepted_as_no_floor() {
+    let with_zero = json!({"t": {"functions": ["f"], "sources": ["a.c"], "min_goals": 0}});
+    let err = parse_verification_profiles(&with_zero).unwrap_err();
+    assert!(err.contains("checks nothing"), "{err}");
+
+    // Omitted is the way to say a target has none.
+    let omitted = json!({"t": {"functions": ["f"], "sources": ["a.c"]}});
+    let p = parse_verification_profiles(&omitted).expect("no floor is a valid profile");
+    assert_eq!(p["t"].min_goals, None);
+
+    // And one is kept as written.
+    let stated = json!({"t": {"functions": ["f"], "sources": ["a.c"], "min_goals": 1}});
+    let p = parse_verification_profiles(&stated).unwrap();
+    assert_eq!(p["t"].min_goals, Some(1));
+}
+
+// A gate name is printed back rather than matched, so padding is harmless and a
+// blank is not: it lands in declared_build_gates_not_run_here as an entry with
+// no name, in a list a reader counts.
+#[test]
+fn a_blank_build_gate_is_refused_and_a_padded_one_is_trimmed() {
+    let blank = json!({"t": {"functions": ["f"], "sources": ["a.c"], "build_gates": ["  "]}});
+    let err = parse_verification_profiles(&blank).unwrap_err();
+    assert!(err.contains("build_gates"), "{err}");
+
+    let padded = json!({"t": {"functions": ["f"], "sources": ["a.c"], "build_gates": [" check.py "]}});
+    let p = parse_verification_profiles(&padded).unwrap();
+    assert_eq!(p["t"].build_gates, vec!["check.py".to_string()]);
 }

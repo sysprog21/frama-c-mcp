@@ -56,8 +56,8 @@ run()
         # A gate can fail without printing any of those. The three shell gates
         # refuse a Frama-C whose proved-goal counts they were not measured
         # under, which is what a 32.1 switch gets, and the refusal says so in
-        # prose. Printing nothing there reports a bare rc=1 and sends the
-        # reader to a log to learn something the runner already had.
+        # prose. Printing nothing there reports a bare rc=1 and sends the reader
+        # to a log to learn something the runner already had.
         if [ -z "$detail" ]; then
             detail=$(tail -3 "$log")
         fi
@@ -97,13 +97,14 @@ want abs-int && run abs-int scripts/check-abs-int-fixtures.sh
 want wp-model && run wp-model scripts/check-wp-model-fixtures.sh
 want artifacts && run artifacts scripts/check-artifacts.sh
 want corpus && run corpus scripts/check-tutorial-corpus.sh
+
 # No --test-threads=1, unlike every other Frama-C gate here. Each of this
 # suite's 89 tests spawns its own server, its own frama-c and its own state
 # directory, so nothing is shared to serialise. Measured cold on 8 cores:
 # 1160.81s serial against 218.42s at libtest's default, both 89/89. The default
 # is available parallelism rather than a pinned number, so a 4-core runner gets
-# 4 and this does not oversubscribe whatever machine it lands on.
-# RUST_LOG matches the stdio step in .github/workflows/ci.yml: without it the
+# 4 and this does not oversubscribe whatever machine it lands on. RUST_LOG
+# matches the stdio step in .github/workflows/ci.yml: without it the
 # recovered-race warn the check below counts is filtered out before the log.
 want stdio && run stdio env RUST_LOG=frama_c_mcp=warn cargo test --test test-mcp-stdio --release
 # Keyed on the same "want stdio", so the suite cannot be run without its check.

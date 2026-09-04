@@ -15,6 +15,10 @@ import sys
 roots = [
     Path("README.md"),
     Path("Cargo.toml"),
+
+    # Scanned like any other source. The build script was simply never listed,
+    # so nothing read it for CJK, translator output or a misspelled Frama-C.
+    Path("build.rs"),
     Path("docs"),
     Path("src"),
     Path("tests"),
@@ -128,7 +132,7 @@ def is_published(rel_path):
 # `roots` covers is watched here for free, so a new root only has to be named
 # once; below it are the build inputs that sit outside `roots` because the
 # scans above have no reason to read them.
-build_roots = [str(r) for r in roots] + ["Cargo.lock", "build.rs", ".cargo"]
+build_roots = [str(r) for r in roots] + ["Cargo.lock", ".cargo"]
 
 # Narrowed by what the file is, since `roots` deliberately reaches into docs/
 # and the markdown at the top, where an untracked draft is ordinary work in

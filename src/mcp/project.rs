@@ -1527,23 +1527,44 @@ fn parse_surface_next_action(blocked_by: &[serde_json::Value]) -> serde_json::Va
 }
 
 pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpError> {
+    // Exhaustive so a field added later cannot slip past validation unnoticed:
+    // the decision "does this one need a grammar" is made here or nowhere.
+    //
+    // Bound rather than elided, and every binding is used below. Destructuring
+    // all eight to "_" and then reading them back through options. was the
+    // decorative form: the compiler's only demand on a new field would have
+    // been that someone type its name beside the others, which is the same
+    // amount of thought as ignoring it.
+    let ProjectLoadOptions {
+        include_paths,
+        defines,
+        force_includes,
+        isystem_paths,
+        machdep,
+        compilation_database,
+
+        // Booleans, with no spelling to get wrong.
+        rte: _,
+        nostdinc: _,
+    } = options;
+
     validate_cpp_entries(
-        &options.include_paths,
+        include_paths,
         "include_paths entries must be non-empty directories of [A-Za-z0-9_./+-] \
          without a leading dash (write \"include\", not \"-Iinclude\")",
     )?;
     validate_cpp_entries(
-        &options.defines,
+        defines,
         "defines entries must be non-empty NAME or NAME=VALUE of [A-Za-z0-9_=./+-] \
          without a leading dash (write \"_Atomic=\", not \"-D_Atomic=\")",
     )?;
     validate_cpp_entries(
-        &options.force_includes,
+        force_includes,
         "force_includes entries must be non-empty header names of [A-Za-z0-9_./+-] \
          without a leading dash (write \"builtins.h\", not \"-include builtins.h\")",
     )?;
     validate_cpp_entries(
-        &options.isystem_paths,
+        isystem_paths,
         "isystem_paths entries must be non-empty directories of [A-Za-z0-9_./+-] \
          without a leading dash (write \"include\", not \"-isystem include\")",
     )?;
@@ -1555,7 +1576,7 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
     //
     // Frama-C decides whether a non-name machdep argument is YAML from its
     // contents, so do not infer that from a filename suffix.
-    if let Some(machdep) = options.machdep.as_deref() {
+    if let Some(machdep) = machdep.as_deref() {
         if machdep.is_empty() || machdep.starts_with('-') {
             return Err(McpError::invalid_params(
                 "machdep must be a non-empty predefined name or YAML machdep file path without a \
@@ -1564,7 +1585,7 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
             ));
         }
     }
-    if let Some(compilation_database) = options.compilation_database.as_deref() {
+    if let Some(compilation_database) = compilation_database.as_deref() {
         if compilation_database.is_empty() || compilation_database.starts_with('-') {
             return Err(McpError::invalid_params(
                 "compilation_database must be a non-empty path without a leading dash \

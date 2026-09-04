@@ -330,6 +330,11 @@ fn no_em_dash_in_a_rust_comment() {
         source_files(&root.join(dir), "rs", &mut sources);
     }
 
+    // Plus the build script, which is Rust and is in neither directory, so a
+    // list of directories exempted it by construction. Cargo requires it at
+    // this path under this name, so naming it beats walking for it.
+    sources.push(root.join("build.rs"));
+
     let mut offenders = Vec::new();
     for path in &sources {
         let text = std::fs::read_to_string(path)
@@ -394,7 +399,11 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
 
     let mut offenders = Vec::new();
     for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        // Panics rather than skipping, like source_files above and for its
+        // reason: a reader inside a file this guard could not open would escape
+        // the check with nothing said, which is the quiet green this whole file
+        // exists to refuse.
+        let text = read_source(&path);
         let lines: Vec<&str> = text.lines().collect();
         for (start, line) in lines.iter().enumerate() {
             let Some(name) = function_name(line) else { continue };
@@ -625,6 +634,20 @@ fn closes_at(line: &str, close: &str) -> bool {
     let Some(rest) = line.strip_prefix(close) else { return false };
     let rest = rest.trim();
     rest.is_empty() || rest.starts_with("//")
+}
+
+/// One source file, or a panic naming it.
+///
+/// The same argument source_files makes for panicking on a directory it cannot
+/// read: every caller is a guard, and a guard that quietly skips the file it
+/// could not open reports on the part of the tree it happened to reach.
+///
+/// Eight other reads in this file still use "else { continue }" or
+/// unwrap_or_default. They have the same hole and are not this change's to
+/// close.
+fn read_source(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
 /// Walk every file whose extension is the one asked for, under a directory.
@@ -2172,4 +2195,315 @@ fn jobs_running_repo_scripts_check_out_the_repo() {
         "these jobs run a script out of the tree without checking it out first, \
          so the step fails with no such file: {offenders:?}"
     );
+}
+
+/// Every reader of a whole ProjectLoadOptions destructures it exhaustively.
+///
+/// The load identity is the server's central claim: two loads that differ in
+/// any field are different programs, and the functions that read one have to
+/// agree on that or the claim is void. Forgetting a field is silent and fails
+/// open in every direction. cpp_extra_args forgetting one means the flag never
+/// reaches Frama-C at all; frama_c_command_line forgetting one means the same;
+/// profile_matches_loaded_project forgetting one accepts a load the profile
+/// does not describe. None of them reports anything when it happens.
+///
+/// project_load_identity is the exception and is deliberately left out: it
+/// serializes the struct rather than reading fields, which is the stronger
+/// guarantee, so nobody should "fix" it into a destructure to satisfy this.
+///
+/// Exhaustive destructuring turns each of those into a compile error, and this
+/// guard is what stops the next reader appearing without one. It checks the
+/// shape rather than the field list, so adding a field needs no edit here.
+///
+/// Field access is the tell: a function that reads "options.machdep" is
+/// deciding, per field, what to do with it, which is exactly the decision that
+/// goes stale. One that destructures has already been made to see every field,
+/// unless it wrote ".." in the pattern, which is why that is rejected too: a
+/// rest pattern is exactly the silence this guard exists to refuse, wearing the
+/// shape it asks for.
+#[test]
+fn every_reader_of_the_whole_load_options_destructures_it() {
+    let mut files = Vec::new();
+    source_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        "rs",
+        &mut files,
+    );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+
+        for (number, line) in lines.iter().enumerate() {
+            let Some(parameter) = load_options_parameter_name(line) else {
+                continue;
+            };
+
+            // The window starts at the "fn" line rather than at the parameter,
+            // because a multi-line signature puts the parameter at the same
+            // indentation as the body and a window measured from there closes
+            // on the very next line of the signature.
+            let Some(signature) = (0..=number)
+                .rev()
+                .find(|at| function_name(lines[*at]).is_some())
+            else {
+                continue;
+            };
+
+            let body = function_body(&lines[signature..]);
+
+            if reads_load_options_field_by_field(&body, &parameter) {
+                offenders.push(format!(
+                    "{}:{} reads ProjectLoadOptions field by field without \
+                     destructuring it, so a field added later is silently ignored here",
+                    path.display(),
+                    number + 1
+                ));
+            }
+        }
+    }
+
+    assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
+/// The guard above is a string heuristic, so it needs its own counterexamples.
+///
+/// A structural guard that cannot fail is decoration, and this one decides by
+/// reading source text rather than by asking the compiler. If its shape
+/// matching ever stops recognising a field read, it goes quietly green and the
+/// property it protects is gone with it. So every part that decides gets a
+/// fixture: the predicate, the signature filter, and the body window, which
+/// were the two the first version of this test left unexercised while they
+/// were the fragile ones.
+#[test]
+fn the_destructuring_guard_can_tell_the_shapes_apart() {
+    // The shape the guard exists to catch.
+    let field_by_field = "\
+fn build(options: &ProjectLoadOptions) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(machdep) = &options.machdep {
+        out.push(machdep.clone());
+    }
+    out
+}";
+    // The shape it must accept.
+    let destructured = "\
+fn build(options: &ProjectLoadOptions) -> Vec<String> {
+    let ProjectLoadOptions { machdep, compilation_database, include_paths: _ } = options;
+    let mut out = Vec::new();
+    if let Some(machdep) = machdep {
+        out.push(machdep.clone());
+    }
+    out
+}";
+
+    // A rest pattern is not exhaustive. It is the silence the guard exists to
+    // refuse, wearing the shape the guard asks for, and it passed until a
+    // reviewer read the fixture rather than the rule.
+    let rest_pattern = "\
+fn build(options: &ProjectLoadOptions) -> Vec<String> {
+    let ProjectLoadOptions { machdep, .. } = options;
+    match machdep {
+        Some(machdep) => vec![machdep.clone()],
+        None => Vec::new(),
+    }
+}";
+
+    // A function that forwards the whole struct and reads nothing off it makes
+    // no per-field decision, so it has nothing to go stale and is not asked to
+    // destructure. Both spellings: passing it on, and calling a method on it,
+    // which a bare "options." read as a field access.
+    let forwards = "\
+fn build(options: &ProjectLoadOptions) -> Option<String> {
+    cpp_extra_args(options)
+}";
+    let forwards_by_method = "\
+fn build(options: &ProjectLoadOptions) -> ProjectLoadOptions {
+    options.clone()
+}";
+
+    // Through function_body, which is the window the guard actually uses. The
+    // fixtures used to be handed to the predicate directly, so the two fragile
+    // parts, the window and the signature scan, were the two nothing exercised,
+    // and the window was closing before the body began.
+    let judge = |source: &str| {
+        let lines: Vec<&str> = source.lines().collect();
+        reads_load_options_field_by_field(&function_body(&lines), "options")
+    };
+
+    assert!(
+        judge(field_by_field),
+        "the guard no longer recognises a field read, so it protects nothing"
+    );
+    assert!(
+        !judge(destructured),
+        "the guard rejects the shape it is asking for"
+    );
+    assert!(
+        judge(rest_pattern),
+        "a .. pattern is not exhaustive and must not satisfy the guard, whether or not \
+         the body goes on to read a field through the parameter"
+    );
+    for (source, shape) in [(forwards, "passing it on"), (forwards_by_method, "a method call")] {
+        assert!(
+            !judge(source),
+            "a forwarder makes no per-field decision and has nothing to destructure ({shape})"
+        );
+    }
+
+    // The signature filter takes the parameter's name from the signature rather
+    // than assuming it. Assuming it is what made both readers this guard was
+    // written for invisible to it, since they are spelled project_options.
+    assert_eq!(
+        load_options_parameter_name("fn build(project_options: &ProjectLoadOptions) -> X {"),
+        Some("project_options".to_string())
+    );
+    assert_eq!(
+        load_options_parameter_name("    load: &super::ProjectLoadOptions,"),
+        Some("load".to_string())
+    );
+    assert_eq!(load_options_parameter_name("struct X { inner: ProjectLoadOptions }"), None);
+
+    // And a field read must be attributed to the parameter that names it: a
+    // body mentioning some other struct's field is not this reader's problem.
+    let lines: Vec<&str> = field_by_field.lines().collect();
+    assert!(!reads_load_options_field_by_field(&function_body(&lines), "cfg"));
+}
+
+/// The predicate the guard applies to one function body.
+///
+/// One definition, used by the guard and by the counterexamples above. Written
+/// twice it would be the guard's own failure mode: the copy the test exercises
+/// drifting from the copy that decides.
+fn reads_load_options_field_by_field(body: &str, parameter: &str) -> bool {
+    let patterns: Vec<&str> = ["let ProjectLoadOptions {", "let super::ProjectLoadOptions {"]
+        .iter()
+        .filter_map(|opener| body.find(opener).map(|at| &body[at + opener.len()..]))
+        .map(|rest| &rest[..rest.find('}').unwrap_or(rest.len())])
+        .collect();
+
+    // Neither destructuring nor reading a field is a function that forwards the
+    // whole struct somewhere else, such as the cpp_extra_args caller. It makes
+    // no per-field decision, so it has nothing to go stale.
+    if patterns.is_empty() {
+        return reads_a_field_of(body, parameter);
+    }
+
+    // Exhaustive means no rest pattern, so this asks about the pattern itself
+    // rather than about the presence of the keyword. A "{ machdep, .. }" wears
+    // the shape the guard asks for and ignores every field added after it.
+    patterns.iter().any(|pattern| pattern.contains(".."))
+}
+
+/// Whether a body reads a field off this parameter, rather than calling a
+/// method on it.
+///
+/// "options." alone cannot tell the two apart, so a forwarder written as
+/// "options.clone()" was reported as reading fields one at a time, and the
+/// guard would have failed the build with a finding about a function that
+/// makes no per-field decision at all. A call has an opening parenthesis after
+/// the name; a field read does not.
+fn reads_a_field_of(body: &str, parameter: &str) -> bool {
+    let needle = format!("{parameter}.");
+    body.match_indices(&needle).any(|(at, _)| {
+        let rest = &body[at + needle.len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !name.is_empty() && !rest[name.len()..].starts_with('(')
+    })
+}
+
+/// One function, from its signature to its closing brace.
+///
+/// Braces rather than indentation, and neither was the first answer. Stopping
+/// at a column-zero brace only ever worked for a free function, since a method
+/// inside an impl closes with an indented one and the window ran to the end of
+/// the impl. Stopping at the signature's own indentation was worse: the closing
+/// paren of a multi-line signature sits at exactly that column, so the window
+/// closed before the body began and the guard silently checked nothing.
+///
+/// A brace inside a string literal would throw the count off. The window would
+/// run long, which loses a finding rather than inventing one, and telling the
+/// two apart needs a lexer.
+fn function_body(lines: &[&str]) -> String {
+    let mut depth = 0usize;
+    let mut body = Vec::new();
+    for line in lines {
+        body.push(*line);
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+        if depth == 0 && body.len() > 1 && line.contains('}') {
+            break;
+        }
+    }
+    body.join("\n")
+}
+
+/// The parameter a signature line binds a whole ProjectLoadOptions to.
+///
+/// Read from the line rather than assumed, because the name is a choice the
+/// author makes and nothing in this repository constrains it. An earlier
+/// version required "options" or "opts", so "fn f(load: &ProjectLoadOptions)"
+/// was invisible to the guard, and so were both readers it was written for,
+/// which spell it project_options.
+///
+/// This is also the whole signature filter. A line that binds one field by
+/// value does not name the type, so nothing further has to exclude it.
+fn load_options_parameter_name(line: &str) -> Option<String> {
+    let at = line.find(": &ProjectLoadOptions")
+        .or_else(|| line.find(": &super::ProjectLoadOptions"))?;
+    let name: String = line[..at]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then(|| name.chars().rev().collect())
+}
+
+/// The running binary names the commit it was built from.
+///
+/// `version` reads 0.1.0 and always has, so it cannot distinguish an installed
+/// binary from the source beside it. `build_commit` is what closes that, and
+/// it comes from build.rs through an environment variable: delete the build
+/// script, or rename the variable it sets, and this stops compiling rather than
+/// quietly reporting a value nobody set.
+///
+/// The value itself is not asserted. A tarball build has no git and honestly
+/// reports "unknown"; what must hold is that the field exists, is non-empty,
+/// and is one of the two shapes a reader is told to expect. A git that cannot
+/// answer whether the tree is clean reports "-dirty" rather than a third
+/// shape, because that is what a reader has to do with either.
+#[test]
+fn the_binary_reports_the_commit_it_was_built_from() {
+    let stamp = env!("BUILD_COMMIT");
+    assert!(!stamp.is_empty(), "build.rs set an empty BUILD_COMMIT");
+
+    // The full object id, because the length git abbreviates to grows with the
+    // object database and a stamp that changes without the commit changing is
+    // not an identity.
+    let commit = stamp.trim_end_matches("-dirty");
+    let looks_like_a_commit = commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit());
+    assert!(
+        stamp == "unknown" || looks_like_a_commit,
+        "BUILD_COMMIT {stamp:?} is neither a commit nor the documented \"unknown\""
+    );
+
+    // And a reader is told where to find it, and what every shape of it means.
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"),
+    )
+    .expect("README.md");
+    assert!(
+        readme.contains("build_commit"),
+        "build_commit is reported but not documented, so nobody knows to compare it"
+    );
+    for shape in ["-dirty", "`unknown`"] {
+        assert!(
+            readme.contains(shape),
+            "build_commit can read {shape} and README does not say what that means"
+        );
+    }
 }

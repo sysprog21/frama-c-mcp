@@ -351,7 +351,21 @@ last two are there for different reasons. `rte` decides whether runtime-error
 obligations exist at all, so a receipt made without it covers a strictly
 smaller set than the target's own command does. `nostdinc` decides which
 declarations the file is compiled against, so a receipt made without it is
-about a different program rather than a smaller part of the same one. Because the tool is
+about a different program rather than a smaller part of the same one.
+
+A profile may also carry `min_goals`, the floor on obligations the target
+requires WP to generate. A profiled run that generates fewer is refused
+outright, because "N of N discharged" is not evidence on its own: an emptied
+body or a dropped contract discharges 0 of 0 and every other check on the path
+passes it. It counts the goals belonging to the functions the call named, not
+the whole goal table, which still holds whatever an earlier run left in it.
+`prop` and `retry_unproved` are refused alongside the proof settings for the
+same family of reason, and before the run rather than after: a filtered run
+attempts a subset while its goal count and summary agree with each other, and a
+retry discharges some goals at double the declared timeout while the receipt
+records the declared one, so nothing downstream can tell either from a whole
+run at the target's settings. `proof_coverage` names the same thing
+after the fact as `proved_under_a_goal_filter`. Because the tool is
 incremental, the comparison is against the conclusion as it will stand, so a
 later call that replaces the receipt is rechecked against the name already
 stored.

@@ -10168,10 +10168,10 @@ async fn naming_a_profile_does_not_turn_off_the_runtime_error_checks() {
     );
 
     // A load without RTE says so in incomplete[], whichever of the three
-    // decided it. check resolves rte before reload_project sees it, and the
-    // gap list used to be handed the caller's unresolved value, so naming a
-    // profile that turns RTE off produced a load with no runtime-error
-    // obligations and no RTE_DISABLED gap to say so.
+    // decided it. check resolves rte before reload_project sees it, and the gap
+    // list used to be handed the caller's unresolved value, so naming a profile
+    // that turns RTE off produced a load with no runtime-error obligations and
+    // no RTE_DISABLED gap to say so.
     let gap_codes = |args: serde_json::Value| {
         let client = &client;
         async move {

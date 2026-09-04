@@ -164,6 +164,41 @@ fn classify_wp_failure_timeout() {
 }
 
 #[test]
+fn cached_failure_keeps_its_verdict_category() {
+    for (goal, category, failure_kind) in [
+        (
+            json!({"name": "division_by_zero", "goal_kind": "rte_division", "normalized_status": "unknown", "from_cache": true}),
+            "rte",
+            "proof_obligation",
+        ),
+        (
+            json!({"name": "Post", "normalized_status": "failed", "from_cache": true}),
+            "internal_error",
+            "frama_c_internal",
+        ),
+    ] {
+        let classification = classify_wp_failure_from_goal(&goal, Some("f"));
+        assert_eq!(classification["category"], category, "{classification:?}");
+        assert_eq!(classification["failure_kind"], failure_kind, "{classification:?}");
+        assert_eq!(classification["confidence"], "low", "{classification:?}");
+
+        // Scored down and also said. A payload that reads "low" without naming
+        // the cache has told the reader the confidence and withheld what
+        // explains it, and the evidence entry beside it is not prose. Said in
+        // wp_timeout_triage, which is the per-goal field a caller already reads
+        // for why a verdict is thin. Not appended to the classification's own
+        // reason: that is sent per goal, and a constant repeated per goal is
+        // what the stdio payload budget exists to catch.
+        let triage = &classification["wp_timeout_triage"];
+        assert_eq!(triage["confidence"], "low", "{triage:?}");
+        assert!(
+            triage["reason"].as_str().unwrap_or_default().contains("came back from WP's cache"),
+            "a replayed goal says nothing about the cache: {triage:?}"
+        );
+    }
+}
+
+#[test]
 fn classify_wp_failure_includes_proofread_report_shape() {
     let classification = classify_wp_failure_from_goal(
         &json!({
@@ -940,6 +975,44 @@ fn an_absent_eva_config_says_which_absence_it_is() {
     let ran = body(json!({"precision": 2, "slevel": 64}));
     assert_eq!(ran["eva"]["precision"], 2);
     assert_ne!(ran["sha256"], not_requested["sha256"]);
+}
+
+// The floor at the conclusion door counts goals owned by the target's
+// functions, which only works because the receipt records the owner. Nothing
+// asserted that the writer emits it: delete the field from proof_receipt_goals
+// and profile_evidence_error silently falls back to counting the whole array,
+// which is the loose rule that let an emptied target pass on its neighbours'
+// obligations, with every gate still green.
+#[test]
+fn a_receipt_goal_records_the_function_it_belongs_to() {
+    use frama_c_mcp::mcp::server::receipt::receipt_goals_record_owner;
+
+    let goals = proof_receipt_goals(
+        &[
+            json!({"stable_goal_id": "sg_a", "normalized_status": "valid", "fct": "swap"}),
+            json!({"stable_goal_id": "sg_b", "normalized_status": "valid"}),
+        ],
+        None,
+        &HashMap::new(),
+    );
+    let owner_of = |id: &str| {
+        goals
+            .iter()
+            .find(|goal| goal["stable_goal_id"] == id)
+            .unwrap_or_else(|| panic!("{id} is in the receipt"))["fct"]
+            .clone()
+    };
+    assert_eq!(owner_of("sg_a"), json!("swap"));
+
+    // Null rather than absent for a goal owning no function, because the key's
+    // presence is what tells a reader this receipt records owners at all.
+    assert_eq!(owner_of("sg_b"), serde_json::Value::Null);
+    assert!(receipt_goals_record_owner(&goals));
+
+    // And a receipt written before the field carries the key nowhere, which is
+    // the shape the fallback exists for.
+    let older = vec![json!({"stable_goal_id": "sg_a", "status": "valid"})];
+    assert!(!receipt_goals_record_owner(&older));
 }
 
 #[test]
@@ -2205,9 +2278,9 @@ fn a_profile_only_labels_its_loaded_project() {
     assert!(!profile_matches_loaded_project(&profile, &["src/target.c".into()], &ProjectLoadOptions::default()));
 }
 
-// A prover budget is wall clock, so on an oversubscribed host every goal
-// grinds to it whatever its difficulty. Reporting that run at high confidence
-// states a verdict about the code that the run cannot support.
+// A prover budget is wall clock, so on an oversubscribed host every goal grinds
+// to it whatever its difficulty. Reporting that run at high confidence states a
+// verdict about the code that the run cannot support.
 #[test]
 fn a_saturated_host_withdraws_the_timeout_verdict() {
     let t = prover_timeout_triage(18, vec![], HostLoad::from_reading(Some(7.6)), None);
@@ -2374,9 +2447,9 @@ fn a_non_finite_reading_never_reads_as_a_quiet_host() {
 
 // The triage goes into the proof receipt's reported block, and that block is
 // hashed. A reading in it would give two runs of the same proof on the same
-// machine different receipt digests, which is the one property a receipt
-// exists to carry. Rounding does not save it, so the payload carries a
-// category and the reading is reported outside the receipt.
+// machine different receipt digests, which is the one property a receipt exists
+// to carry. Rounding does not save it, so the payload carries a category and
+// the reading is reported outside the receipt.
 #[test]
 fn the_timeout_verdict_does_not_move_with_the_load_reading() {
     let quiet = prover_timeout_triage(3, vec![], HostLoad::from_reading(Some(0.11)), None);
@@ -2443,8 +2516,8 @@ fn receipt_load_identity_includes_all_obligation_shaping_options() {
     assert_eq!(identity["nostdinc"], true);
 }
 
-// Without this a load against the real system headers passes for a load
-// against the modeled libc, which is a different program to prove.
+// Without this a load against the real system headers passes for a load against
+// the modeled libc, which is a different program to prove.
 #[test]
 fn a_load_that_kept_the_system_headers_does_not_match_a_target_that_dropped_them() {
     let profile = frama_c_mcp::state::VerificationProfile {
@@ -2540,16 +2613,16 @@ fn a_timeout_under_a_valid_property_still_counts_as_a_timeout() {
     assert_eq!(run_measurement(std::slice::from_ref(&valid)).timed_out, 0);
 }
 
-// A profile that names no system include directories does not match a load
-// that carries some.
+// A profile that names no system include directories does not match a load that
+// carries some.
 //
 // isystem_paths is a Vec, so omission and "explicitly empty" are the same
 // value, and the evidence gate requires rte and nostdinc but not this list.
 // Treating an empty list as "unset" therefore let a profile match a load
-// carrying any -isystem at all, and run_wp would label that run as the
-// target's evidence under a load identity that is not the target's. The three
-// Vec fields beside it have always compared exactly; only the two Option flags
-// can say "unset".
+// carrying any -isystem at all, and run_wp would label that run as the target's
+// evidence under a load identity that is not the target's. The three Vec fields
+// beside it have always compared exactly; only the two Option flags can say
+// "unset".
 #[test]
 fn a_profile_that_names_no_system_includes_does_not_match_a_load_that_has_them() {
     let profile = frama_c_mcp::state::VerificationProfile {
@@ -2574,4 +2647,122 @@ fn a_profile_that_names_no_system_includes_does_not_match_a_load_that_has_them()
         !profile_matches_loaded_project(&profile, &files, &with_isystem),
         "an omitted isystem_paths matched a load that passes one"
     );
+}
+
+// The rule stated in one place used to be contradicted in two: for a replayed
+// timeout, prover_timeout_triage withdrew confidence while
+// wp_timeout_triage_from_goal answered "high, a higher prover timeout may help"
+// about the same goal. A caller reading both got opposite instructions.
+#[test]
+fn every_triage_agrees_a_replayed_goal_was_not_measured_here() {
+    let replayed = json!({
+        "stable_goal_id": "g",
+        "status": "timeout",
+        "normalized_status": "timeout",
+        "from_cache": true
+    });
+
+    let per_goal = wp_timeout_triage_from_goal(&replayed);
+    assert_eq!(per_goal["confidence"], "low");
+
+    // And it must not advise spending more budget on a goal no budget was spent
+    // on, which is what the uncapped branch said.
+    assert_eq!(per_goal["retry_with_higher_prover_timeout"], false);
+
+    let m = run_measurement(std::slice::from_ref(&replayed));
+    assert_eq!(prover_timeout_triage(1, vec![], HostLoad::Load(0.1), Some(&m))["confidence"], "low");
+
+    // A freshly attempted timeout still gets the confident reading from both,
+    // so the cap is about the replay and not about timeouts in general.
+    let fresh = json!({
+        "stable_goal_id": "g",
+        "status": "timeout",
+        "normalized_status": "timeout",
+        "from_cache": false
+    });
+    assert_eq!(wp_timeout_triage_from_goal(&fresh)["confidence"], "high");
+    let m = run_measurement(std::slice::from_ref(&fresh));
+    assert_eq!(prover_timeout_triage(1, vec![], HostLoad::Load(0.1), Some(&m))["confidence"], "high");
+}
+
+// The kernel's RTE generator and WP's own are different analyses over the same
+// code, and only one of them is what a -wp-rte build proves. Measured on
+// elfuse's iov target: -wp-rte alone generates 40 obligations and discharges
+// all of them, while kernel -rte alongside it generates 42 and leaves the two
+// extra pointer_alignment goals open. A load started with kernel -rte is
+// therefore proving a strictly larger set than the target it names.
+//
+// This asserts the command line rather than the goal count, because the goal
+// count needs Frama-C and this is the decision that produces it.
+//
+// On main_frama_c_args, which is the argv that changed. Asserting
+// project_cli_args alone could never fail: it has never emitted -rte, at HEAD
+// or before it, and its own comment says so, so the test would have passed
+// against the code it was written to pin.
+#[test]
+fn a_load_that_proves_runtime_errors_does_not_ask_the_kernel_for_them() {
+    let options = ProjectLoadOptions { rte: true, ..Default::default() };
+    let args = frama_c_mcp::mcp::server::main_frama_c_args(
+        "frama-c",
+        &["a.c".to_string()],
+        &options,
+        std::path::Path::new("/tmp/s.sock"),
+    );
+    assert!(
+        !args.iter().any(|a| a == "-rte"),
+        "kernel -rte generates pointer_alignment assertions that WP's own \
+         generator does not, so a run under it is not the target's evidence: {args:?}"
+    );
+
+    // And the load settings still reach it, so the assertion above is about a
+    // command line that carries them rather than an empty one.
+    let with_machdep = ProjectLoadOptions {
+        rte: true,
+        machdep: Some("gcc_x86_64".to_string()),
+        ..Default::default()
+    };
+    let args = frama_c_mcp::mcp::server::main_frama_c_args(
+        "frama-c",
+        &["a.c".to_string()],
+        &with_machdep,
+        std::path::Path::new("/tmp/s.sock"),
+    );
+    assert!(args.windows(2).any(|w| w == ["-machdep", "gcc_x86_64"]), "{args:?}");
+}
+
+// The advertised model list is what Frama-C documents; this server validates
+// against what it accepts. Caveat is the known gap: -wp-h names it nowhere and
+// the parser takes it, so a project proved under it was told its own model was
+// invalid. Both spellings, because the build system writes whichever it likes
+// and Frama-C does not care.
+#[test]
+fn a_model_frama_c_accepts_is_not_called_invalid() {
+    use frama_c_mcp::mcp::server::{
+        parse_wp_model_support, WpModelSupport, ACCEPTED_BUT_UNDOCUMENTED_BASES,
+    };
+
+    // Both paths, and parameterized over the list rather than naming Caveat
+    // again here. The parsed path is built from help text that omits these by
+    // definition, so it is the one that goes stricter when a second model is
+    // added to only one of the two lists.
+    let parsed = parse_wp_model_support(
+        "  -wp-model  use 'Hoare', 'Typed', 'Bytes', 'Region', 'Eva' with '+nocast' or '+cast'\n         -wp-prover  ...",
+    );
+    for support in [WpModelSupport::fallback(), parsed] {
+        for base in ACCEPTED_BUT_UNDOCUMENTED_BASES {
+            assert!(
+                support.validate(base).is_ok(),
+                "{base} is accepted by frama-c -wp-model and must not be refused here"
+            );
+        }
+        for model in ["typed", "Typed", "Bytes", "bytes", "Typed+nocast"] {
+            assert!(
+                support.validate(model).is_ok(),
+                "{model}: {:?}",
+                support.validate(model)
+            );
+        }
+        // Still a closed set: a name Frama-C would reject is refused here too.
+        assert!(support.validate("NotAModel").is_err());
+    }
 }
