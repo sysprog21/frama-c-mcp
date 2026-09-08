@@ -204,6 +204,7 @@ own payloads.
 | `wp` | object or null | WP run result; null when the reload failed or `want` excluded it |
 | `wp_goals` | array, object, or null | Object when summarized, array when `detail` is `full`, null when WP did not run |
 | `wp_backend_diagnosis` | object or null | Non-null when the message stream shows a Why3 abort, so a `FAILED` goal is a crashed prover and not a verdict. Non-null does not imply `incomplete` |
+| `memory_model_probe` | object | What WP assumed about the memory model, read off the run's own probe. Always present, always carries `ran` and `hypotheses`; `ran: false` carries a `reason` instead of claiming an empty list. "Nothing was assumed" and "nobody looked" are different answers and this is the field that separates them |
 | `messages` | array | Frama-C diagnostics drained for this run |
 | `messages_truncated` | boolean | The drain hit its cap |
 | `recommended_next_call` | object | `{tool, args, reason}`. `args` names tool parameters and is not frozen |

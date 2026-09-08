@@ -1,5 +1,6 @@
 use std::time::Duration;
 use serde_json::json;
+use crate::server_fixture::{lazy_server, MISSING_FRAMA_C};
 use frama_c_mcp::error::FramaCError;
 
 use frama_c_mcp::mcp::server::*;
@@ -17,6 +18,9 @@ use frama_c_mcp::mcp::server::checkgaps::{
     check_variants_summary,
     gap_guidance,
     incomplete_guidance,
+    memory_model_hypothesis_gap,
+    memory_model_unchecked_gap,
+    probe_absent,
     check_next_call, incomplete_code, wp_goal_gaps, NextCallInputs,
     WantedAnalyses,
 };
@@ -1596,6 +1600,164 @@ fn a_vacuously_discharged_property_is_reported_rather_than_counted_as_proved() {
     assert!(clean.is_empty(), "{clean:?}");
 }
 
+/// The probe payload for a run whose named functions each carry a hypothesis.
+///
+/// The probe is a separate frama-c run because the socket never carries these:
+/// WP emits them from its batch entry point and the request that runs proofs
+/// never reaches that code.
+fn hypothesis_probe(functions: &[&str]) -> serde_json::Value {
+    let text: String = functions
+        .iter()
+        .map(|function| {
+            format!(
+                "Memory model hypotheses for function '{function}':\n\
+                 /*@ behavior wp_typed:\n\
+                 \x20     requires \\separated(p, &g); */\n\
+                 void {function}(int *p);\n"
+            )
+        })
+        .collect();
+    json!({
+        "ran": true,
+        "read_from": frama_c_mcp::mcp::server::checkgaps::PROBE_READ_FROM_SEPARATE_RUN,
+        "model": "Typed+nocast",
+        "hypotheses": frama_c_mcp::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&text),
+    })
+}
+
+/// The case the whole item exists for: nothing is unproved, and the entry fires
+/// anyway. A gate that only reported this alongside an unproved goal would skip
+/// the run where the hypothesis does damage.
+#[test]
+fn a_memory_model_hypothesis_is_a_gap_even_when_every_goal_is_valid() {
+    let gap = memory_model_hypothesis_gap(&hypothesis_probe(&["two"]))
+        .expect("a hypothesis warning is a gap");
+    assert_eq!(gap["code"], json!(incomplete_code::WP_MEMORY_MODEL_HYPOTHESIS));
+    assert_eq!(gap["function_count"], json!(1));
+    assert_eq!(gap["functions"][0]["function"], json!("two"));
+    assert_eq!(
+        gap["functions"][0]["hypotheses"],
+        json!(["requires \\separated(p, &g);"])
+    );
+    assert_eq!(gap["functions_truncated"], json!(false));
+
+    // Says where the answer came from, because it is not where a reader of the
+    // rest of the payload would look.
+    assert_eq!(
+        gap["read_from"],
+        json!("a separate frama-c run with provers off")
+    );
+}
+
+/// A run WP printed no hypothesis for is not a run with an empty hypothesis
+/// list; it carries no entry at all.
+///
+/// Both shapes of that: a probe whose output held no hypothesis block, and a
+/// probe whose output held only WP's other warnings.
+#[test]
+fn a_run_with_no_hypothesis_carries_no_entry() {
+    assert!(memory_model_hypothesis_gap(&hypothesis_probe(&[])).is_none());
+
+    let noise = json!({
+        "ran": true,
+        "hypotheses": frama_c_mcp::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(
+            "[wp] Warning: Missing RTE guards\n[wp] Proved goals: 4 / 4\n"
+        ),
+    });
+    assert!(memory_model_hypothesis_gap(&noise).is_none(), "{noise:?}");
+}
+
+/// One entry per run rather than one per function, with the untruncated count
+/// beside a bounded sample. An entry per function would grow with the program
+/// inside the payload that already has a size problem.
+#[test]
+fn the_function_sample_is_bounded_and_says_how_many_it_dropped() {
+    let names: Vec<String> = (0..25).map(|n| format!("f{n:02}")).collect();
+    let probe = hypothesis_probe(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    let gap = memory_model_hypothesis_gap(&probe).expect("gap");
+    assert_eq!(gap["function_count"], json!(25));
+    assert_eq!(gap["functions"].as_array().expect("array").len(), 20);
+    assert_eq!(gap["functions_truncated"], json!(true));
+}
+
+/// A probe that ran and found nothing is evidence of absence, and says so by
+/// producing no entry rather than an entry with an empty list.
+///
+/// This is the pair to the test below: ran-and-empty and did-not-run both give
+/// no entry here, and the two are told apart on the probe payload itself,
+/// which carries a reason for the second and none for the first.
+#[test]
+fn a_probe_that_ran_and_found_nothing_produces_no_entry() {
+    let clean = json!({"ran": true, "model": "Typed+nocast", "hypotheses": []});
+    assert!(memory_model_hypothesis_gap(&clean).is_none());
+}
+
+/// The code carries guidance, because knowing a separation was assumed does not
+/// tell a caller that the fix is a requires on the function rather than a
+/// longer timeout.
+#[test]
+fn the_memory_model_hypothesis_code_carries_guidance() {
+    let guidance = gap_guidance(incomplete_code::WP_MEMORY_MODEL_HYPOTHESIS);
+    let text = guidance.as_str().expect("guidance is a string");
+    assert!(text.contains("requires"), "{text}");
+    assert!(!text.is_empty());
+}
+
+/// The guidance map is keyed by code, so an entry produced by this builder
+/// resolves through the same lookup every other entry uses.
+#[test]
+fn the_memory_model_hypothesis_entry_resolves_its_guidance_by_code() {
+    let gap = memory_model_hypothesis_gap(&hypothesis_probe(&["two"])).expect("gap");
+    let guidance = incomplete_guidance(&[gap]);
+    assert!(
+        guidance
+            .get(incomplete_code::WP_MEMORY_MODEL_HYPOTHESIS)
+            .and_then(|entry| entry.as_str())
+            .is_some_and(|text| text.contains("requires")),
+        "{guidance:?}"
+    );
+}
+
+/// A probe that did not run produces no entry, whatever the reason.
+///
+/// The two answers this payload exists to keep apart are "nothing was assumed"
+/// and "nobody looked". A probe skipped because the caller wanted no WP, or
+/// because WP failed, or because frama-c would not start, is the second, and
+/// its reason travels on the payload rather than becoming a silent empty list.
+#[test]
+fn a_probe_that_did_not_run_produces_no_entry() {
+    for reason in ["check did not run WP", "WP did not complete", "no project is loaded"] {
+        let skipped = json!({"ran": false, "reason": reason, "hypotheses": []});
+        assert!(memory_model_hypothesis_gap(&skipped).is_none(), "{reason}");
+    }
+    assert!(memory_model_hypothesis_gap(&hypothesis_probe(&["two"])).is_some());
+}
+
+/// The functions array is ordered by name, because it is hashed into the
+/// receipt and WP's warning order is not a property of the program.
+#[test]
+fn the_reported_functions_are_ordered_by_name() {
+    let probe = hypothesis_probe(&["zeta", "alpha", "mu"]);
+    let gap = memory_model_hypothesis_gap(&probe).expect("gap");
+    let names: Vec<&str> = gap["functions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|entry| entry["function"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names, ["alpha", "mu", "zeta"]);
+}
+
+/// Two runs over the same warnings in different arrival orders digest the same,
+/// which is what makes two receipts comparable.
+#[test]
+fn arrival_order_does_not_change_the_entry() {
+    assert_eq!(
+        memory_model_hypothesis_gap(&hypothesis_probe(&["alpha", "zeta"])),
+        memory_model_hypothesis_gap(&hypothesis_probe(&["zeta", "alpha"]))
+    );
+}
+
 /// An unresolved-call finding reaches the verdict as its own code.
 ///
 /// The dispatch in proofread_finding_gaps ends with a negative guard, so a
@@ -1652,4 +1814,191 @@ fn the_indirect_call_guidance_rules_out_a_longer_timeout() {
     let text = text.as_str().expect("guidance is a string");
     assert!(text.contains("calls"), "{text}");
     assert!(text.contains("timeout"), "{text}");
+}
+
+/// A probe that could not run makes the run loud rather than clean.
+///
+/// This is the half that matters more. WP proving every goal while the probe
+/// failed is a proof whose assumptions are unknown, and an empty hypothesis
+/// list would report it as a proof that assumed nothing.
+#[test]
+fn a_failed_probe_is_reported_as_an_unread_assumption() {
+    let failed = json!({
+        "ran": false,
+        "reason": "frama-c exited 1 during the memory-model probe",
+        "exit_code": 1,
+        "hypotheses": [],
+    });
+    let gap = memory_model_unchecked_gap(&failed, WantedAnalyses::BOTH).expect("gap");
+    assert_eq!(gap["code"], json!(incomplete_code::WP_MEMORY_MODEL_UNCHECKED));
+    assert_eq!(gap["exit_code"], json!(1));
+    assert!(
+        gap["reason"].as_str().is_some_and(|text| text.contains("could not read")),
+        "{gap:?}"
+    );
+}
+
+/// A probe that ran carries no unread-assumption gap, whether or not it found
+/// anything: that case is answered by the entry above it.
+#[test]
+fn a_probe_that_ran_is_not_an_unread_assumption() {
+    let ran = json!({"ran": true, "hypotheses": []});
+    assert!(memory_model_unchecked_gap(&ran, WantedAnalyses::BOTH).is_none());
+}
+
+/// A check that wanted no WP has no proof for an assumption to own, so it
+/// carries neither half.
+#[test]
+fn an_eva_only_check_carries_no_memory_model_gap() {
+    let skipped = probe_absent("check did not run WP", true);
+    let eva_only = WantedAnalyses { eva: true, wp: false };
+    assert!(memory_model_unchecked_gap(&skipped, eva_only).is_none());
+    assert!(memory_model_unchecked_gap(&skipped, WantedAnalyses::BOTH).is_none());
+}
+
+/// A run where WP itself failed already says so, and saying it twice would
+/// report one absence as two gaps.
+#[test]
+fn a_run_where_wp_failed_does_not_also_report_an_unread_assumption() {
+    let skipped = probe_absent("WP did not complete", true);
+    assert!(memory_model_unchecked_gap(&skipped, WantedAnalyses::BOTH).is_none());
+}
+
+/// check reads the run's own probe rather than paying for a second one.
+///
+/// run_wp probes inside the WP lock, over the AST it proved. Running a second
+/// probe in check would cost another frama-c process per call, measured at 2.3
+/// seconds, would put the same answer under two keys, and would run outside
+/// that lock, so it could describe a project loaded after the proofs.
+///
+/// Through the reader rather than around it. This asserted on
+/// memory_model_hypothesis_gap with a hand-built pointer, which is the gap
+/// formatter and not the read-through: it passed with every line of the
+/// read-through reverted. The frama-c path is a name no process is spawned
+/// under, because a payload carrying a probe never reaches one.
+#[tokio::test]
+async fn a_check_reads_the_probe_its_wp_run_already_made() {
+    let server = lazy_server(MISSING_FRAMA_C);
+    let wp = json!({
+        "ok": true,
+        "memory_model_probe": {
+            "ran": true,
+            "model": "Typed+nocast",
+            "hypotheses": [{"function": "two", "hypotheses": ["requires \\separated(p, &g);"]}],
+        },
+    });
+
+    let probe = server.memory_model_probe(WantedAnalyses::BOTH, &wp).await;
+    assert_eq!(probe, wp["memory_model_probe"], "{probe:?}");
+
+    let gap = memory_model_hypothesis_gap(&probe).expect("gap");
+    assert_eq!(gap["functions"][0]["function"], json!("two"), "{gap:?}");
+}
+
+/// A WP payload from a build that did not probe is not a probe that found
+/// nothing.
+///
+/// The reader turns a missing key into a stated ran:false, which
+/// memory_model_unchecked_gap then reports. Asserting instead that a bare null
+/// yields no gap tested the formatter's tolerance of a null and described the
+/// opposite of what check does with a payload that carries no probe.
+#[tokio::test]
+async fn a_wp_payload_without_a_probe_key_is_not_a_clean_probe() {
+    let server = lazy_server(MISSING_FRAMA_C);
+
+    let probe = server
+        .memory_model_probe(WantedAnalyses::BOTH, &json!({"ok": true}))
+        .await;
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(
+        probe["reason"],
+        json!("the WP run reported no memory-model probe"),
+        "{probe:?}"
+    );
+
+    // No hypothesis entry, because none was read, and an unchecked entry
+    // instead, because a run whose assumptions nobody read is a gap.
+    assert!(memory_model_hypothesis_gap(&probe).is_none(), "{probe:?}");
+    assert!(
+        memory_model_unchecked_gap(&probe, WantedAnalyses::BOTH).is_some(),
+        "{probe:?}"
+    );
+}
+
+/// The parser's sentinel for a warning it could not read is not a hypothesis.
+///
+/// WP keys the record as a memory-model hypothesis and the parser keeps it,
+/// because a warning it cannot read is still evidence WP said something. It
+/// names no function and carries no clause, so counting it as a separation
+/// would claim one nobody read, under a reason telling the caller to write a
+/// requires it has no text for.
+#[test]
+fn an_unparsed_warning_is_not_reported_as_an_assumed_separation() {
+    let probe = json!({
+        "ran": true,
+        "read_from": "a separate frama-c run with provers off",
+        "hypotheses": [{
+            "function": null,
+            "hypotheses": [],
+            "hypothesis_count": 0,
+            "hypotheses_truncated": false,
+            "unparsed_warning_count": 2,
+            "source_location": null,
+            "matched_by": "log_category",
+        }],
+    });
+    assert!(memory_model_hypothesis_gap(&probe).is_none(), "{probe:?}");
+
+    // And it is not silence either: unread is its own answer.
+    let unchecked = memory_model_unchecked_gap(&probe, WantedAnalyses::BOTH)
+        .unwrap_or_else(|| panic!("an unread warning vanished: {probe:?}"));
+    assert_eq!(
+        unchecked["code"],
+        json!(incomplete_code::WP_MEMORY_MODEL_UNCHECKED)
+    );
+    assert_eq!(unchecked["unparsed_warning_count"], json!(2));
+}
+
+/// A run with both reports the clauses it read and says how many it did not.
+///
+/// The sample would otherwise look complete, since the count beside it counts
+/// only what parsed.
+#[test]
+fn an_unread_warning_travels_beside_the_clauses_that_were_read() {
+    let probe = json!({
+        "ran": true,
+        "read_from": "a separate frama-c run with provers off",
+        "hypotheses": [
+            {
+                "function": "two",
+                "hypotheses": ["requires \\separated(p, &g);"],
+                "hypothesis_count": 1,
+                "hypotheses_truncated": false,
+                "source_location": null,
+                "matched_by": "message_text",
+            },
+            {
+                "function": null,
+                "hypotheses": [],
+                "hypothesis_count": 0,
+                "hypotheses_truncated": false,
+                "unparsed_warning_count": 3,
+                "source_location": null,
+                "matched_by": "log_category",
+            },
+        ],
+    });
+    let gap = memory_model_hypothesis_gap(&probe).expect("a parsed clause is still a gap");
+
+    // One function, not two: the sentinel is not one of them.
+    assert_eq!(gap["function_count"], json!(1), "{gap:?}");
+    assert_eq!(gap["functions"].as_array().map(Vec::len), Some(1), "{gap:?}");
+    assert_eq!(gap["functions"][0]["function"], json!("two"), "{gap:?}");
+    assert_eq!(gap["unparsed_warning_count"], json!(3), "{gap:?}");
+
+    // The unread half is already reported here, so it is not a second entry.
+    assert!(
+        memory_model_unchecked_gap(&probe, WantedAnalyses::BOTH).is_none(),
+        "{probe:?}"
+    );
 }

@@ -1,10 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+
+use crate::server_fixture::{lazy_server, MISSING_FRAMA_C};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 use frama_c_mcp::error::FramaCError;
-use frama_c_mcp::state::SessionState;
 use frama_c_mcp::mcp::server::contracts::{result_unconstrained_findings, unconstrained_assigns_findings};
 use frama_c_mcp::mcp::server::eacsl::run_e_acsl_counterexample;
 use frama_c_mcp::mcp::server::wpclass::*;
@@ -204,12 +203,7 @@ fn wp_model_support_parses_bases_and_modifiers() {
 
 #[tokio::test]
 async fn self_check_shape_with_missing_frama_c() {
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(
-        state,
-        "__frama_c_mcp_missing_binary__".to_string(),
-        4,
-    );
+    let server = lazy_server(MISSING_FRAMA_C);
     let payload = server.self_check_payload().await;
     assert_eq!(payload["server"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(payload["frama_c"]["status"], "missing");
@@ -335,12 +329,7 @@ fn probe_that_did_not_run_reports_why() {
 
 #[tokio::test]
 async fn self_check_capabilities_shape_with_missing_frama_c() {
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(
-        state,
-        "__frama_c_mcp_missing_binary__".to_string(),
-        4,
-    );
+    let server = lazy_server(MISSING_FRAMA_C);
     let payload = server.self_check_payload().await;
     let payload = &payload["capabilities"];
 
@@ -408,8 +397,7 @@ async fn self_check_live_reports_frama_c_when_available() {
     {
         return;
     }
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(state, "frama-c".to_string(), 4);
+    let server = lazy_server("frama-c");
     let payload = server.self_check_payload().await;
     assert_eq!(payload["frama_c"]["status"], "ok");
     assert_eq!(payload["temp_dir_writeability"]["status"], "ok");

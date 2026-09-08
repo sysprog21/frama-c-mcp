@@ -170,6 +170,8 @@ pub mod incomplete_code {
     pub const EVA_NOT_REQUESTED: &str = "EVA_NOT_REQUESTED";
     pub const WP_NOT_REQUESTED: &str = "WP_NOT_REQUESTED";
     pub const WP_BACKEND_ANOMALY: &str = "WP_BACKEND_ANOMALY";
+    pub const WP_MEMORY_MODEL_HYPOTHESIS: &str = "WP_MEMORY_MODEL_HYPOTHESIS";
+    pub const WP_MEMORY_MODEL_UNCHECKED: &str = "WP_MEMORY_MODEL_UNCHECKED";
     pub const AST_ASM_CLOBBER: &str = "AST_ASM_CLOBBER";
     pub const AST_UNKNOWN_ATTRIBUTE: &str = "AST_UNKNOWN_ATTRIBUTE";
     pub const AST_UNCLASSIFIED_WARNING: &str = "AST_UNCLASSIFIED_WARNING";
@@ -202,6 +204,8 @@ pub mod incomplete_code {
         EVA_NOT_REQUESTED,
         WP_NOT_REQUESTED,
         WP_BACKEND_ANOMALY,
+        WP_MEMORY_MODEL_HYPOTHESIS,
+        WP_MEMORY_MODEL_UNCHECKED,
         AST_ASM_CLOBBER,
         AST_UNKNOWN_ATTRIBUTE,
         AST_UNCLASSIFIED_WARNING,
@@ -279,13 +283,13 @@ fn unrequested_analysis_gaps(
     }
     if rte == Some(false) {
         // Which half of the check the gap is about depends on what WP did.
-        // run_wp generates WP's own RTE guards for every main-instance run,
-        // so its goals cover runtime errors whatever the load said, while EVA
-        // ran before them and its alarms do not. Saying both were excluded was
-        // true while the kernel's -rte at load was the only source of these
+        // run_wp generates WP's own RTE guards for every main-instance run, so
+        // its goals cover runtime errors whatever the load said, while EVA ran
+        // before them and its alarms do not. Saying both were excluded was true
+        // while the kernel's -rte at load was the only source of these
         // annotations, and it now tells a caller to discard a WP verdict that
-        // is sound. Read off the run rather than off the load flag, because
-        // the run is what decided it.
+        // is sound. Read off the run rather than off the load flag, because the
+        // run is what decided it.
         let wp_covered_runtime_errors = wanted.wp
             && wp.pointer("/effective_wp_config/rte").and_then(serde_json::Value::as_bool)
                 == Some(true);
@@ -390,9 +394,241 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
              Raising the prover timeout closes neither: the open goals are unprovable rather than \
              slow."
         }
+        incomplete_code::WP_MEMORY_MODEL_UNCHECKED => {
+            "This is not a finding about the code; it is the absence of one. The separate run that \
+             reads WP's memory-model hypotheses did not complete, so whether the proof rests on an \
+             unstated separation is unknown rather than answered. Check that the loaded sources \
+             still exist and that the memory model this run used is one the command-line Frama-C \
+             accepts, then run check again."
+        }
+        incomplete_code::WP_MEMORY_MODEL_HYPOTHESIS => {
+            "WP's memory model needed these separations and assumed them; no goal in this run \
+             checks one. Put each clause into the function's own requires, which turns it into an \
+             obligation every caller has to discharge. Leave it out and the proof holds only for \
+             callers that happen to keep the locations apart, which nothing here verifies: a \
+             caller passing the address of the global the function also writes proves too, and \
+             is wrong at run time."
+        }
         _ => return serde_json::Value::Null,
     };
     json!(guidance)
+}
+
+/// The probe entries that name a function and the separations WP assumed for
+/// it, as opposed to the parser's sentinel for a keyed warning whose wording it
+/// could not read.
+///
+/// The sentinel carries a null function, an empty clause list and a count. It
+/// is evidence that WP said something, which is why the parser keeps it rather
+/// than dropping it, and it is not evidence of any particular separation. Told
+/// apart here so one is not reported as the other.
+fn parsed_hypothesis_entries(probe: &serde_json::Value) -> Vec<serde_json::Value> {
+    hypothesis_entries(probe)
+        .iter()
+        .filter(|entry| entry.get("function").is_some_and(|name| !name.is_null()))
+        .cloned()
+        .collect()
+}
+
+/// How many keyed memory-model warnings the parser could not read.
+fn unparsed_hypothesis_warnings(probe: &serde_json::Value) -> u64 {
+    hypothesis_entries(probe)
+        .iter()
+        .filter_map(|entry| entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64))
+        .sum()
+}
+
+/// Whether any entry names a function, without building the list to find out.
+fn has_parsed_hypothesis_entry(probe: &serde_json::Value) -> bool {
+    hypothesis_entries(probe)
+        .iter()
+        .any(|entry| entry.get("function").is_some_and(|name| !name.is_null()))
+}
+
+fn hypothesis_entries(probe: &serde_json::Value) -> &[serde_json::Value] {
+    const NONE: &[serde_json::Value] = &[];
+    probe
+        .get("hypotheses")
+        .and_then(serde_json::Value::as_array)
+        .map_or(NONE, Vec::as_slice)
+}
+
+/// The hypotheses WP assumed about the memory model, as an incomplete[] entry.
+///
+/// A memory-model hypothesis is worst exactly when every goal is valid, so
+/// unlike WP_BACKEND_ANOMALY there is no "left something unjudged" test to
+/// gate on: a run with nothing unproved is the run this has to fire on.
+///
+/// One aggregate entry rather than one per function. The hypothesis is a
+/// property of the model this run used and a reader needs the list once, while
+/// an entry per function would grow with the program inside the payload that
+/// already has a size problem. The sample is bounded for the same reason and
+/// the untruncated count travels with it.
+pub fn memory_model_hypothesis_gap(probe: &serde_json::Value) -> Option<serde_json::Value> {
+    // Twenty functions is already more than a reader acts on in one sitting,
+    // and the count below says how many there were.
+    const HYPOTHESIS_SAMPLE: usize = 20;
+
+    // A probe that did not run has not shown that the run assumed nothing, so
+    // it produces no entry here and says why on the payload instead. The
+    // reasons are the probe's, not this function's: no WP, no project, a
+    // Frama-C that would not start, a timeout.
+    if probe.get("ran").and_then(|ran| ran.as_bool()) != Some(true) {
+        return None;
+    }
+
+    // The parsed entries only. A keyed warning this server could not read is a
+    // sentinel with a null function and no clauses, and counting it here would
+    // report a separation nobody read as one WP assumed, under a reason that
+    // tells the caller to write requires clauses it has no text for. That case
+    // is memory_model_unchecked_gap's, which says the hypotheses are unknown.
+    let mut sample = parsed_hypothesis_entries(probe);
+    if sample.is_empty() {
+        return None;
+    }
+    let total = sample.len();
+    sample.truncate(HYPOTHESIS_SAMPLE);
+    let unparsed = unparsed_hypothesis_warnings(probe);
+    Some(json!({
+        "code": incomplete_code::WP_MEMORY_MODEL_HYPOTHESIS,
+        "reason": "WP's memory model assumed these separations to discharge this run's goals, and \
+                   emitted no obligation for any of them. A goal reported valid here is valid only \
+                   for callers that satisfy them.",
+        "function_count": total,
+        "functions": sample,
+        "functions_truncated": total > HYPOTHESIS_SAMPLE,
+
+        // Beside the parsed ones rather than mixed into them: WP printed this
+        // many more that the parser could not read, so the list above is
+        // incomplete in a way the count alone would not show.
+        "unparsed_warning_count": unparsed,
+
+        // Where the answer came from, because it is not where a reader of the
+        // rest of this payload would look. The socket never carries these.
+        //
+        // The producer's own word for it. Every producer sets the key, so there
+        // is no default here to go stale. See PROBE_READ_FROM_*.
+        "read_from": probe.get("read_from").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// Where a probe's hypotheses were read, in the producer's own words.
+///
+/// Two producers answer the same question by different means, and the reader
+/// used to paper over that with a default: run_wp and the sandbox spawn a
+/// frama-c with provers off over the printed AST, while the isolated CLI retry
+/// reads the warning out of output it already had, from runs that did have
+/// provers and from no extra process at all. Defaulting described the retry as
+/// a run that never happened, so each producer states its own.
+///
+/// Set by every producer that read anything, which is every arm that reaches
+/// frama-c. probe_absent below carries no such key, because a probe that never
+/// started read from nowhere; only memory_model_hypothesis_gap looks, and it
+/// looks only at a probe whose ran flag is true.
+pub const PROBE_READ_FROM_SEPARATE_RUN: &str = "a separate frama-c run with provers off";
+pub const PROBE_READ_FROM_RETRY_OUTPUT: &str = "the isolated retry's own captured output";
+
+/// The shape every producer writes when the probe did not read anything.
+///
+/// Twelve sites spelled this literal before it had a name, across three
+/// modules, and the readers below guess nothing: a producer that omitted
+/// "hypotheses" or spelled "ran" differently was invisible until a gap reader
+/// silently dropped it. eva_config_absent is the same idiom for the same
+/// reason one module over.
+///
+/// nothing_was_proved is the flag rather than the sentence. The reader used to
+/// suppress its gap by comparing the reason against a list of exact strings,
+/// which coupled two modules through prose: a typo on either side turned a run
+/// that proved nothing into a report that goals were proved under unread
+/// assumptions, and the list was already missing the fourth such reason. The
+/// producer knows which case it is in, so it says so.
+pub fn probe_absent(reason: impl Into<String>, nothing_was_proved: bool) -> serde_json::Value {
+    json!({
+        "ran": false,
+        "reason": reason.into(),
+        "nothing_was_proved": nothing_was_proved,
+        "hypotheses": [],
+    })
+}
+
+/// A WP run whose memory-model assumptions nobody could read.
+///
+/// The other half of the entry above, and the half that matters more. WP
+/// proving every goal while the probe failed is a proof whose assumptions are
+/// unknown, and an empty hypothesis list would report it as a proof that
+/// assumed nothing. The two are told apart here rather than left to a reader
+/// noticing which fields the probe payload carries.
+///
+/// Silent when the caller wanted no WP, because there is then no proof for an
+/// assumption to own and every EVA-only check would otherwise carry this.
+pub fn memory_model_unchecked_gap(
+    probe: &serde_json::Value,
+    wanted: WantedAnalyses,
+) -> Option<serde_json::Value> {
+    if !wanted.wp {
+        return None;
+    }
+
+    // A probe that ran and parsed nothing is the other half of the split
+    // memory_model_hypothesis_gap makes. WP printed keyed memory-model warnings
+    // whose wording this server does not read, so the separations it assumed
+    // are unknown rather than absent, which is exactly what this code says.
+    // Silent when something did parse, because the entry above then carries the
+    // unread count beside the clauses it did read.
+    if probe.get("ran").and_then(|ran| ran.as_bool()) == Some(true) {
+        let unparsed = unparsed_hypothesis_warnings(probe);
+        if unparsed == 0 || has_parsed_hypothesis_entry(probe) {
+            return None;
+        }
+        return Some(json!({
+            "code": incomplete_code::WP_MEMORY_MODEL_UNCHECKED,
+            "reason": format!(
+                "WP printed {unparsed} memory-model hypothesis warning(s) whose wording this \
+                 server could not parse, so the separations it assumed are unknown rather than \
+                 absent. A goal reported valid here is not evidence that the model assumed \
+                 nothing."
+            ),
+            "probe_reason": "the probe ran and could not parse what WP printed",
+            "unparsed_warning_count": unparsed,
+            "exit_code": probe.get("exit_code").cloned().unwrap_or_else(|| json!(null)),
+        }));
+    }
+
+    // A probe skipped because WP itself did not run is not a second gap: the
+    // run already carries WP_NOT_RUN, and reporting both would say twice that
+    // nothing was proved. A run whose every target was a bare declaration is
+    // the same case reached differently: WP had no body to prove, so there is
+    // no proof for an unread assumption to undermine, and the sentence below
+    // would say goals were proved when none were. So is a failed reload.
+    //
+    // Read off the flag the producer set rather than off its prose. See
+    // probe_absent.
+    let reason = probe.get("reason").and_then(|value| value.as_str())?;
+    if probe
+        .get("nothing_was_proved")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(json!({
+        "code": incomplete_code::WP_MEMORY_MODEL_UNCHECKED,
+
+        // Says the hypotheses are unknown rather than that goals were proved
+        // under them. Not every producer that reaches here proved anything: the
+        // isolated CLI retry reports ran:false when no attempt exited 0, and
+        // frama-c exits 0 with unproved goals, so a nonzero exit on every
+        // attempt is a run that errored rather than one that proved. Claiming a
+        // proof there is the false statement this payload exists to avoid, and
+        // the sentence below is true in both cases.
+        "reason": format!(
+            "WP's memory-model hypotheses are unknown for this run: the probe could not read \
+             them ({reason}). A goal reported valid here is not evidence that the model \
+             assumed nothing."
+        ),
+        "probe_reason": reason,
+        "exit_code": probe.get("exit_code").cloned().unwrap_or_else(|| json!(null)),
+    }))
 }
 
 /// Gaps carried by rows of the property table itself, which is where EVA

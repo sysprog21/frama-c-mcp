@@ -618,6 +618,8 @@ payload contract and the change rule. The full set:
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
 | `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
+| `WP_MEMORY_MODEL_HYPOTHESIS` | WP's memory model needed separations it assumed rather than proved, so a valid goal is valid only for callers that satisfy them |
+| `WP_MEMORY_MODEL_UNCHECKED` | The separate run that reads WP's memory-model hypotheses did not complete, so whether the proof rests on an unstated separation is unknown |
 | `AST_ASM_CLOBBER` | Frama-C assumed inline assembly has no effects beyond its operands, so the analyzed statement is weaker than the compiled one |
 | `AST_UNKNOWN_ATTRIBUTE` | Frama-C ignored an unknown attribute, so the analyzed declaration differs from the source |
 | `AST_UNCLASSIFIED_WARNING` | Frama-C emitted parse warnings in categories this server has not classified, so their effect on the analyzed program is unknown |

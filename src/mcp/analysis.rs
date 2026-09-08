@@ -1183,6 +1183,112 @@ pub fn unproved_assumption_findings(
     findings
 }
 
+/// The inputs the probe-and-receipt tail takes, as one value.
+///
+/// A struct rather than nine loose arguments, and four of them are the same
+/// two types: two &str, two bool-ish name lists. Positional, those swap
+/// silently and the run reports the right goals under the wrong provenance.
+pub(crate) struct ProbeAndReceipt<'a> {
+    pub client: &'a FramaCClient,
+    pub response: &'a mut serde_json::Value,
+    pub project_options: &'a ProjectLoadOptions,
+    pub rte: bool,
+    pub probe_functions: &'a [String],
+    pub temp_dir_prefix: &'a str,
+    pub source_files: Vec<String>,
+    pub wp_goals: &'a [serde_json::Value],
+    pub report_function: Option<&'a str>,
+}
+
+/// What a WP run is about to prove, read off the session state in one go.
+///
+/// A struct rather than a tuple because the last field is the odd one out: four
+/// of these describe the project, and changed_from describes this process's
+/// history with it. A five-tuple at the call site said none of that.
+struct WpRunSubject {
+    requested_model: String,
+    rte_enabled: bool,
+    source_files: Vec<String>,
+    project_options: ProjectLoadOptions,
+
+    /// The model this process last proved under, when it differs from the one
+    /// being asked for now, so an abort can be explained by the change.
+    changed_from: Option<String>,
+}
+
+/// Put a printed AST on disk for a process that can only read files.
+///
+/// A random O_EXCL directory, for the reason materialize_check_source gives at
+/// length. The e-ACSL site was the worse of the two before this was shared: it
+/// created the directory and never removed it, so there was no race to win, an
+/// attacker planted a symlink at current-ast.c once, and every later call wrote
+/// through it into something run_e_acsl then compiles and runs.
+///
+/// The guard goes back to the caller. Dropping it removes the directory, so a
+/// caller that needs the file to outlive one statement has to hold it.
+fn write_ast_source_file(
+    source: &str,
+    prefix: &str,
+) -> Result<(String, tempfile::TempDir), McpError> {
+    let dir = private_temp_dir(prefix).map_err(|error| {
+        McpError::internal_error(format!("failed to create a temp dir: {error}"), None)
+    })?;
+    let path = dir.path().join("current-ast.c");
+    std::fs::write(&path, source).map_err(|error| {
+        McpError::internal_error(format!("failed to write {}: {error}", path.display()), None)
+    })?;
+    Ok((path.display().to_string(), dir))
+}
+
+/// The options a probe over a printed AST is given, from the ones the project
+/// was loaded with.
+///
+/// Only the machine description survives, and dropping the other two is the
+/// point rather than an omission. A printed AST is one already-preprocessed
+/// translation unit: it has no include directive left for -cpp-extra-args to
+/// affect, and -compilation-db maps the project's own source paths to flags,
+/// so pointing it at a temporary file in a temporary directory asks it about a
+/// path it does not describe. The machine description is not optional in the
+/// same way, because it fixes sizeof and alignof and those decide which
+/// separations the memory model needs, which is the whole question here.
+///
+/// Destructured exhaustively rather than written as a struct update, for the
+/// reason project_cli_args gives: a field added to ProjectLoadOptions has to
+/// become a compile error here, or a printed-source probe quietly goes on
+/// running under the old set while the loaded project uses the new one. Every
+/// field dropped is named below with why, so adding one is a decision rather
+/// than an omission.
+fn printed_source_options(options: &ProjectLoadOptions) -> ProjectLoadOptions {
+    let ProjectLoadOptions {
+        machdep,
+
+        // The database maps the project's own source paths to flags, so it has
+        // nothing to say about a temporary file in a temporary directory.
+        compilation_database: _,
+
+        // Preprocessor settings, and a printed AST has already been through the
+        // preprocessor: there is no include directive left for these to affect.
+        include_paths: _,
+        defines: _,
+        force_includes: _,
+        isystem_paths: _,
+        nostdinc: _,
+
+        // Not emitted by project_cli_args for anyone, so there is nothing here
+        // to carry. The probe decides -wp-rte for itself, from what the run it
+        // describes actually guarded.
+        rte: _,
+    } = options;
+
+    ProjectLoadOptions {
+        // The one that survives. It fixes sizeof and alignof, and those decide
+        // which separations the memory model needs, which is the whole question
+        // a probe is asking.
+        machdep: machdep.clone(),
+        ..ProjectLoadOptions::default()
+    }
+}
+
 pub fn assumed_callee_contract_findings(
     caller: &str,
     context: &serde_json::Value,
@@ -2175,32 +2281,13 @@ impl FramaCMcpServer {
     async fn write_current_ast_source(&self) -> Result<(String, tempfile::TempDir), McpError> {
         let client = self.require_client().await?;
         let source = client.print_source().await.map_err(McpError::from)?;
-        let source = source.as_str();
         if source.trim().is_empty() {
             return Err(McpError::internal_error(
                 "printSource returned nothing, so there is no AST to instrument",
                 None,
             ));
         }
-
-        // A random O_EXCL name, for the reason materialize_check_source gives
-        // at length. This site was the worse of the two: it created the
-        // directory and never removed it, so there was no race to win. An
-        // attacker planted a symlink at current-ast.c once and every later call
-        // wrote through it, and what lands here is then compiled and run by
-        // run_e_acsl.
-        //
-        // The guard is returned to the caller, which holds it for the whole run
-        // and only then parks it on the server, so the file outlives the run
-        // and the reported path stays readable.
-        let dir = private_temp_dir("frama-c-mcp-e-acsl-ast-").map_err(|error| {
-            McpError::internal_error(format!("failed to create a temp dir: {error}"), None)
-        })?;
-        let path = dir.path().join("current-ast.c");
-        std::fs::write(&path, source).map_err(|error| {
-            McpError::internal_error(format!("failed to write {}: {error}", path.display()), None)
-        })?;
-        Ok((path.display().to_string(), dir))
+        write_ast_source_file(&source, "frama-c-mcp-e-acsl-ast-")
     }
 
     /// The EVA half of one check: the run, then the alarms it left.
@@ -2316,6 +2403,14 @@ impl FramaCMcpServer {
             // is present because the two build sites carry one field set, which
             // check_returns_one_field_set_on_both_paths freezes.
             "wp_backend_diagnosis": null,
+
+            // Present on this path too, and in the same position, for the
+            // reason "detail" above is null rather than absent. Saying why
+            // rather than reporting an empty hypothesis list: nothing was
+            // proved here, so there is no assumption for a proof to own, and a
+            // reader branching on this key needs "did not run" and "found
+            // nothing" to look different.
+            "memory_model_probe": probe_absent("the reload failed, so nothing was proved", true),
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": {
@@ -2340,6 +2435,10 @@ impl FramaCMcpServer {
                 }),
                 // No goals, so nothing to discriminate.
                 properties: &HashMap::new(),
+
+                // The reload failed, so there is no AST to have printed.
+                ast_source: None,
+                ast_digest: None,
             })
             .await;
         payload["proof_receipt"] = receipt;
@@ -2372,6 +2471,307 @@ impl FramaCMcpServer {
             .ok()
             .and_then(|profile| profile.rte)
             .unwrap_or(true)
+    }
+
+    /// What this run is about to prove, and what the last one proved.
+    ///
+    /// Read under the WP lock and in one place, because every field here is a
+    /// property of the project as it stands at the moment the lock was taken.
+    /// Split out of run_wp when that function passed the length ceiling: the
+    /// block answers from the session state alone, touching no client, no
+    /// proof and no response, which is the independent sub-unit the ceiling
+    /// exists to find.
+    ///
+    /// Read here and written after the proofs are scheduled, not before. A run
+    /// that fails in configuration or in target resolution never reached WP, so
+    /// recording its model would make the next abort blame a change from a
+    /// model this process never used.
+    async fn wp_run_subject(&self, params: &RunWpParams) -> Result<WpRunSubject, McpError> {
+        let requested_model = params
+            .model
+            .clone()
+            .unwrap_or_else(|| default_wp_model().to_string());
+
+        let main_state = self.main_frama_c_state.lock().await;
+        let state = main_state.as_ref().ok_or_else(no_project_loaded_err)?;
+        Ok(WpRunSubject {
+            rte_enabled: state.project_options.rte,
+            source_files: state.files.clone(),
+
+            // The whole struct, not the one or two fields the probe ends up
+            // using. memory_model_probe_over_printed_ast narrows it through
+            // printed_source_options, whose exhaustive destructure is a compile
+            // error when a field is added, and only machdep survives from here
+            // onto the probe's command line; that function records why each of
+            // the others is dropped. Taken in the block that already reads the
+            // state under the WP lock, so it describes the program this run
+            // proved rather than whatever is loaded when the probe gets to run.
+            project_options: state.project_options.clone(),
+
+            // The model this process last proved under, kept only when it
+            // differs from the one asked for now. None covers both "first run
+            // in this process" and "same model again", which are exactly the
+            // two cases an abort must not be blamed on.
+            changed_from: state
+                .wp_model_used
+                .clone()
+                .filter(|previous| *previous != requested_model),
+            requested_model,
+        })
+    }
+
+    /// Probe the AST this run proved, then digest that same print into the
+    /// receipt.
+    ///
+    /// One method because both proving paths do the identical three steps in
+    /// the identical order, and the middle one exists only to carry the print
+    /// from the first to the third: probe, record the probe, build the receipt
+    /// over the bytes the probe was run on. Written out at both call sites, the
+    /// Option that carries the print read as a value either might use, when in
+    /// fact neither does anything with it but pass it along.
+    pub(crate) async fn attach_probe_and_receipt(
+        &self,
+        args: ProbeAndReceipt<'_>,
+    ) -> Result<(), McpError> {
+        let ProbeAndReceipt {
+            client,
+            response,
+            project_options,
+            rte,
+            probe_functions,
+            temp_dir_prefix,
+            source_files,
+            wp_goals,
+            report_function,
+        } = args;
+
+        let (probe, printed_source) = self
+            .memory_model_probe_over_printed_ast(
+                client,
+                project_options,
+                rte,
+                probe_functions,
+                response,
+                temp_dir_prefix,
+            )
+            .await;
+        response["memory_model_probe"] = probe;
+
+        self.attach_run_wp_receipt(
+            client,
+            response,
+            source_files,
+            wp_goals,
+            report_function,
+            printed_source.as_deref(),
+        )
+        .await
+    }
+
+    /// Probe the AST a run actually proved, and hand back the print it used.
+    ///
+    /// Annotations reach Frama-C through execAddAnnotation and the ghost
+    /// insertions, and none of them writes the source back: a sandbox's
+    /// sandbox.c is written once, at creation, and a main-project file is never
+    /// written at all. So the files on disk are the program as it was before
+    /// this session injected anything, and a probe pointed at them answers "no
+    /// hypotheses" for a proof that rested on a separation an injected contract
+    /// introduced. That is the false clean the payload exists to rule out, and
+    /// it is the shape the CEGIS loop runs in: inject, then run_wp, with no
+    /// reload between. printSource prints the live AST instead, annotations and
+    /// RTE assertions included, as one translation unit that round-trips
+    /// through the C front end.
+    ///
+    /// The returned source is the same text, for a caller that also needs to
+    /// digest it. One print serves both, which is not only cheaper than two
+    /// sixty-second requests but is what makes the digest and the probe
+    /// describe one AST rather than two prints with a window between them.
+    ///
+    /// A print that fails becomes a probe that did not run. Falling back to the
+    /// files on disk would be the same wrong answer arrived at more slowly.
+    ///
+    /// Both proving paths call this, so the sandbox cannot drift from the main
+    /// project on what "the AST that was proved" means. It narrows the options
+    /// through printed_source_options itself rather than trusting each caller
+    /// to, because that function exists to make a field added to
+    /// ProjectLoadOptions a compile error, and a guarantee a caller can skip is
+    /// not one: the sandbox passed its options straight through and would have
+    /// gone on doing so.
+    pub(crate) async fn memory_model_probe_over_printed_ast(
+        &self,
+        client: &FramaCClient,
+        project_options: &ProjectLoadOptions,
+        rte: bool,
+        functions: &[String],
+        response: &serde_json::Value,
+        temp_dir_prefix: &str,
+    ) -> (serde_json::Value, Option<String>) {
+        let source = match client.print_source().await {
+            Ok(source) if !source.trim().is_empty() => source,
+            Ok(_) => {
+                let reason = "printSource returned nothing, so there is no AST to probe";
+                return (probe_absent(reason, false), None);
+            }
+            Err(error) => return (probe_absent(format!("printSource failed: {error}"), false), None),
+        };
+
+        // Asked before the AST is written out, and after it is printed. A run
+        // with no target the probe can name has its answer already, so writing
+        // a whole AST to disk for it is work for a known result; the print
+        // itself still has to happen, because the receipt digests those bytes
+        // whether or not a probe follows.
+        //
+        // An empty list means "no target this probe could describe" rather than
+        // "the whole file". Nothing asks for a whole-file probe: an unscoped
+        // run passes every defined function by name, so falling through to an
+        // unrestricted frama-c would attribute some other function's separation
+        // to a run that never proved it.
+        if functions.is_empty() {
+            return (
+                probe_absent("the run named no defined function for the probe to describe", true),
+                Some(source),
+            );
+        }
+
+        // Bounded by the same semaphore as every other extra front end this
+        // server starts. parse_probe_slots exists because a Frama-C front end
+        // is a few hundred megabytes and what matters is how many exist at
+        // once; a probe per run_wp is exactly that, and a sandbox scope can
+        // have max_sandboxes of them in flight, each already holding its own
+        // process. Taken before the file is written so a waiter is not also
+        // holding a temp directory of printed AST open for the length of the
+        // wait, which is what a permit taken after the write costs.
+        let _probe_slot = self.parse_probe_slots.clone().acquire_owned().await.ok();
+
+        // The guard lives to the end of this function, which is past the await
+        // below, so the file is still there while frama-c reads it.
+        let (path, _dir) = match write_ast_source_file(&source, temp_dir_prefix) {
+            Ok(written) => written,
+
+            // The print itself succeeded, so it still travels: the digest wants
+            // those bytes and only the probe needed them on disk. Answering
+            // None here made a failure to create a temp directory cost the
+            // caller a second sixty-second printSource.
+            Err(error) => {
+                let reason = format!("the printed AST could not be written: {error}");
+                return (probe_absent(reason, false), Some(source));
+            }
+        };
+
+        let probe = run_wp_memory_model_probe(
+            &self.frama_c_path,
+            std::slice::from_ref(&path),
+            &printed_source_options(project_options),
+            rte,
+            response
+                .pointer("/effective_wp_config/model")
+                .and_then(|value| value.as_str()),
+            functions,
+            response
+                .pointer("/effective_wp_config/prop/effective")
+                .and_then(|value| value.as_str()),
+        )
+        .await;
+        (probe, Some(source))
+    }
+
+    /// What WP assumed about the memory model on this run, or why nobody asked.
+    ///
+    /// A reader, not a prober, despite the name it kept. run_wp runs the probe
+    /// inside the lock that makes its inputs agree with the goals, so this
+    /// takes the answer off the wp payload and supplies only the two cases
+    /// there is no payload for: the caller wanted no WP, and WP did not finish.
+    ///
+    /// Every arm says why rather than answering with an empty hypothesis list,
+    /// because "nothing was assumed" and "nobody looked" are the two answers
+    /// this whole payload exists to keep apart. An empty list under ran: false
+    /// would collapse them.
+    pub async fn memory_model_probe(
+        &self,
+        wanted: WantedAnalyses,
+        wp: &serde_json::Value,
+    ) -> serde_json::Value {
+        if !wanted.wp {
+            return probe_absent("check did not run WP", true);
+        }
+        if wp.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+            return probe_absent("WP did not complete", true);
+        }
+
+        // The run's own answer, and the only one. run_wp probes under the WP
+        // lock with the files and options it proved from, so nothing this
+        // function could reconstruct would be more exact, and a second probe
+        // would cost a second frama-c process per check.
+        //
+        // This used to rebuild the arguments from the run's receipt and probe
+        // again. That path is unreachable now, and unreachable code that looks
+        // like a fallback is worse than none: a reader takes it for a case that
+        // happens. If a WP payload ever arrives without the key, that is a
+        // build whose run_wp did not probe, and saying so is the honest answer
+        // rather than quietly probing on its behalf under arguments this side
+        // of the lock cannot vouch for.
+        match wp.get("memory_model_probe") {
+            Some(probe) if !probe.is_null() => probe.clone(),
+
+            // Not a nothing_was_proved case: WP ran, and only the reading is
+            // missing, which is exactly the gap the unchecked code reports.
+            _ => probe_absent("the WP run reported no memory-model probe", false),
+        }
+    }
+
+    /// The calls run_wp answers without proving anything on the main instance.
+    ///
+    /// Three of them, and each returns a whole alternative answer rather than a
+    /// step, which is why they are gathered here instead of reading as stages
+    /// of the transaction below. A sandbox target is a different instance; a
+    /// sandbox target with a verify_profile is a category error, since a
+    /// profile labels proofs of the loaded main project and a sandbox proof is
+    /// not target evidence; and a cancel is the way out of a run rather than a
+    /// run, which is why it is answered before the project lock and before any
+    /// config, a caller reaching for it being by definition not in a position
+    /// to satisfy preconditions.
+    ///
+    /// None means this is a main-instance proof and the caller should carry on.
+    async fn run_wp_answered_without_a_main_run(
+        &self,
+        params: &RunWpParams,
+    ) -> Option<Result<CallToolResult, McpError>> {
+        match run_wp_target_scope(params) {
+            Err(error) => return Some(Err(error)),
+            Ok(RunWpScope::Sandbox) => {
+                if params.verify_profile.is_some() {
+                    return Some(Err(McpError::invalid_params(
+                        "verify_profile only labels proofs of the loaded main project; sandbox proofs are not target evidence",
+                        None,
+                    )));
+                }
+                return Some(self.run_wp_on_sandbox(params).await);
+            }
+            Ok(RunWpScope::Main) => {}
+        }
+        if params.cancel == Some(true) {
+            return Some(self.cancel_wp_queue().await);
+        }
+        None
+    }
+
+    /// Refuse a main-instance WP run while phase two owns the project.
+    ///
+    /// Asked twice by run_wp, once before it waits for the WP lock and once
+    /// after: verify_program_step can set the flag while a run queues behind
+    /// another, so the first answer is stale by the time the lock is held. The
+    /// message is long enough that stating it twice made the second check read
+    /// as a different rule.
+    async fn refuse_run_wp_while_project_locked(&self) -> Result<(), McpError> {
+        if *self.project_locked.read().await {
+            return Err(project_locked_error(
+                "run_wp",
+                "Project is locked. run_wp is blocked during Phase 2 to prevent state pollution. \
+                 If you are in verify-function, pass sandbox-prefixed functions. \
+                 Do NOT touch the main Frama-C instance. Call verify_program_step with lock_project=false first if this is the final main-project gate.",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn check_payload(&self, params: CheckParams) -> Result<serde_json::Value, McpError> {
@@ -2557,6 +2957,15 @@ impl FramaCMcpServer {
             }));
         }
 
+        // Not from the drain, though it took a measurement to learn that. WP
+        // emits its memory-model hypotheses from the batch entry point, and the
+        // server request that runs proofs never reaches that code, so the
+        // socket carries nothing to classify. A fresh Frama-C with provers off
+        // is the only source, and it is one process rather than one per goal.
+        let memory_model = self.memory_model_probe(wanted, &wp).await;
+        incomplete.extend(memory_model_hypothesis_gap(&memory_model));
+        incomplete.extend(memory_model_unchecked_gap(&memory_model, wanted));
+
         let recommended_next_call = check_next_call(NextCallInputs {
             backend_diagnosis: &backend_diagnosis,
             anomaly_left_goals_unjudged,
@@ -2612,6 +3021,12 @@ impl FramaCMcpServer {
             "wp": wp,
             "wp_goals": reported_goals,
             "wp_backend_diagnosis": backend_diagnosis,
+
+            // Provenance for the one answer in this payload that did not come
+            // through the socket. Carries the command, the model and the exit
+            // code when it ran, and the reason when it did not, so a reader can
+            // tell "nothing was assumed" from "nobody could look".
+            "memory_model_probe": memory_model,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": recommended_next_call,
@@ -2683,6 +3098,21 @@ impl FramaCMcpServer {
                 "wp_failure_kind": wp.get("failure_kind").cloned().unwrap_or_else(|| json!(null)),
             }),
             properties,
+
+            // check never prints the AST itself. It reaches WP through run_wp,
+            // which prints once for its memory-model probe and digests that
+            // same text into its own receipt, and nothing between the two
+            // mutates the AST. Reading the answer off the WP payload is what
+            // keeps a check to one print instead of two, each of which ships
+            // the whole AST over the socket under a sixty-second budget.
+            //
+            // None when the run produced no digest, which puts the print back
+            // where it was: a nested receipt that could not digest is not a
+            // reason for this one to give up.
+            ast_source: None,
+            ast_digest: wp
+                .pointer("/proof_receipt/subject/ast_digest")
+                .and_then(|value| value.as_str()),
         })
         .await
     }
@@ -3400,24 +3830,8 @@ impl FramaCMcpServer {
         &self,
         Parameters(mut params): Parameters<RunWpParams>,
     ) -> Result<CallToolResult, McpError> {
-        match run_wp_target_scope(&params)? {
-            RunWpScope::Sandbox => {
-                if params.verify_profile.is_some() {
-                    return Err(McpError::invalid_params(
-                        "verify_profile only labels proofs of the loaded main project; sandbox proofs are not target evidence",
-                        None,
-                    ));
-                }
-                return self.run_wp_on_sandbox(&params).await;
-            }
-            RunWpScope::Main => {}
-        }
-
-        // Before the project lock and before any config: cancelling is not a
-        // proof run, it is the way out of one, and a caller reaching for it is
-        // by definition not in a position to satisfy preconditions.
-        if params.cancel == Some(true) {
-            return self.cancel_wp_queue().await;
+        if let Some(answer) = self.run_wp_answered_without_a_main_run(&params).await {
+            return answer;
         }
 
         // After the cancel above, for the reason stated there: resolving a
@@ -3437,14 +3851,7 @@ impl FramaCMcpServer {
         let profile_applied = self.apply_verify_profile(&mut params).await?;
 
         // Check project lock for main instance WP
-        if *self.project_locked.read().await {
-            return Err(project_locked_error(
-                "run_wp",
-                "Project is locked. run_wp is blocked during Phase 2 to prevent state pollution. \
-                 If you are in verify-function, pass sandbox-prefixed functions. \
-                 Do NOT touch the main Frama-C instance. Call verify_program_step with lock_project=false first if this is the final main-project gate.",
-            ));
-        }
+        self.refuse_run_wp_while_project_locked().await?;
         let requested_provers = effective_wp_provers(&params)?;
 
         // The guard stays here, where a reader of run_wp can see that this is a
@@ -3462,6 +3869,19 @@ impl FramaCMcpServer {
         // two concurrent runs overwrite each other's config mid-flight and each
         // reports the union of both runs' goals. cancel_wp_queue takes no lock,
         // so a run stuck in drain can still be cancelled.
+        //
+        // The memory-model probe is inside it too, and that is a cost paid
+        // deliberately rather than an oversight. The probe prints this AST and
+        // spawns a frama-c over the print, measured at 2.3 s on the two
+        // function fixture and capped by EXTERNAL_COMMAND_BUDGET at 60 s, and
+        // for all of that time reload_project and every other WP call queue
+        // behind this one. Holding the lock is what makes the probe describe
+        // the program the goals were proved against: released first, a
+        // concurrent reload_project would swap the AST out from under the
+        // print, and the probe would answer about a different program while
+        // reporting it beside this run's goals. That failure is silent in the
+        // worst direction, since a newly loaded project needing no separation
+        // reads as a proof that assumed nothing.
         let _wp_op_guard = if profile_wp_guard.is_none() {
             Some(self.main_wp_lock.lock().await)
         } else {
@@ -3471,14 +3891,7 @@ impl FramaCMcpServer {
         // Rechecked under the lock: verify_program_step can set the flag while
         // this call waits for a run ahead of it, and the check at the top of
         // the handler was read before that wait.
-        if *self.project_locked.read().await {
-            return Err(project_locked_error(
-                "run_wp",
-                "Project is locked. run_wp is blocked during Phase 2 to prevent state pollution. \
-                 If you are in verify-function, pass sandbox-prefixed functions. \
-                 Do NOT touch the main Frama-C instance. Call verify_program_step with lock_project=false first if this is the final main-project gate.",
-            ));
-        }
+        self.refuse_run_wp_while_project_locked().await?;
 
         // Recorded, not enforced. Frama-C aborts on SOME memory model changes
         // within one process and not others: Typed+cast to Typed+nocast is
@@ -3487,30 +3900,13 @@ impl FramaCMcpServer {
         // which is which would block calls that work, so this only remembers
         // what ran, and the error path below uses it to explain an abort that
         // has already happened.
-        let requested_model = params
-            .model
-            .clone()
-            .unwrap_or_else(|| default_wp_model().to_string());
-
-        // Read here and written after the proofs are scheduled, not before. A
-        // run that fails in configuration or in target resolution never reached
-        // WP, so recording its model would make the next abort blame a change
-        // from a model this process never used.
-        let (rte_enabled, source_files, previous_model) = {
-            let main_state = self.main_frama_c_state.lock().await;
-            let state = main_state.as_ref().ok_or_else(no_project_loaded_err)?;
-            (
-                state.project_options.rte,
-                state.files.clone(),
-                state.wp_model_used.clone(),
-            )
-        };
-
-        // The model this process last proved under, kept only when it differs
-        // from the one asked for now. None covers both "first run in this
-        // process" and "same model again", which are exactly the two cases an
-        // abort must not be blamed on.
-        let changed_from = previous_model.filter(|previous| *previous != requested_model);
+        let WpRunSubject {
+            requested_model,
+            rte_enabled,
+            source_files,
+            project_options,
+            changed_from,
+        } = self.wp_run_subject(&params).await?;
         let client = self.require_client().await?;
         self.apply_wp_config(&client, &params, requested_provers.as_ref())
             .await?;
@@ -3591,6 +3987,19 @@ impl FramaCMcpServer {
             .iter()
             .map(|info| info.name.clone())
             .collect::<Vec<_>>();
+
+        // The defined subset, for the memory-model probe alone. The reported
+        // config keeps every target, because that is the scope the caller asked
+        // for and a reader diffing two runs needs it whole; the probe cannot
+        // take the same list, because -wp-fct on a declared-but-undefined name
+        // is "no function 'f'" and a Frama-C that aborts before printing
+        // anything. generate_rte_guards filters on the same flag and for the
+        // same reason: only a defined function has obligations to carry.
+        let probe_functions = targets
+            .iter()
+            .filter(|info| info.defined)
+            .map(|info| info.name.clone())
+            .collect::<Vec<_>>();
         let report_function = (function_names.len() == 1).then(|| function_names[0].as_str());
         let wp_goals =
             reload_fetch(&client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await?;
@@ -3658,13 +4067,27 @@ impl FramaCMcpServer {
         response["rte_guarded_in_place"] = json!(rte_guarded);
         response["timeout_retry"] = timeout_retry;
 
-        self.attach_run_wp_receipt(
-            &client,
-            &mut response,
+        // What WP assumed about the memory model, on the tool that produced the
+        // proof rather than only on check. The rte value passed is wider than
+        // the project's own flag on purpose: run_wp generates WP's guards in
+        // place for a main-instance run, so a project loaded without rte still
+        // proves them and a probe told otherwise would describe a smaller
+        // program.
+        //
+        // Over the printed AST rather than over state.files. See
+        // memory_model_probe_over_printed_ast for why the files on disk are the
+        // wrong program to ask.
+        self.attach_probe_and_receipt(ProbeAndReceipt {
+            client: &client,
+            response: &mut response,
+            project_options: &project_options,
+            rte: rte_enabled || !rte_guarded.is_empty(),
+            probe_functions: &probe_functions,
+            temp_dir_prefix: "frama-c-mcp-wp-probe-ast-",
             source_files,
-            &wp_goals,
+            wp_goals: &wp_goals,
             report_function,
-        )
+        })
         .await?;
 
         // Beside the goals rather than in the receipt: the receipt already

@@ -34,7 +34,7 @@ mod harness;
 #[path = "support/receipt.rs"]
 mod receipt_fixture;
 
-use frama_c_mcp::mcp::server::receipt::RECEIPT_SCHEMA;
+use frama_c_mcp::mcp::server::receipt::{ISOLATED_RETRY_NO_AST, RECEIPT_SCHEMA};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7792,6 +7792,7 @@ async fn check_returns_one_field_set_on_both_paths() {
         "eva_alarms",
         "incomplete",
         "incomplete_guidance",
+        "memory_model_probe",
         "messages",
         "messages_truncated",
         "proof_receipt",
@@ -7813,6 +7814,15 @@ async fn check_returns_one_field_set_on_both_paths() {
     std::fs::write(&bad, "int broken(void) { return\n").expect("write bad");
 
     let client = spawn_mcp_client(good.to_str().unwrap()).await;
+
+    // The key order each path emitted, kept to be compared with the other after
+    // the loop. serde_json runs with preserve_order here, so the order is part
+    // of what a caller receives, and a sorted comparison cannot see a key that
+    // moved: memory_model_probe was added between "detail" and "reload" on one
+    // path and between "wp_backend_diagnosis" and "messages" on the other,
+    // under a comment claiming the two matched, and this assertion passed.
+    let mut orders: Vec<(&str, Vec<String>)> = Vec::new();
+
     for (label, file) in [("analysis ran", &good), ("reload failed", &bad)] {
         let payload = call_tool_json(&client, "check", json!({
             "files": [file.to_str().unwrap()],
@@ -7820,12 +7830,11 @@ async fn check_returns_one_field_set_on_both_paths() {
         }))
         .await
         .unwrap_or_else(|e| panic!("check on the {label} path: {e}"));
-        let mut fields = payload
+        let object = payload
             .as_object()
-            .unwrap_or_else(|| panic!("{label}: not an object: {payload:?}"))
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+            .unwrap_or_else(|| panic!("{label}: not an object: {payload:?}"));
+        orders.push((label, object.keys().cloned().collect()));
+        let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
         fields.sort_unstable();
         assert_eq!(fields, expected, "{label} path field set moved");
         assert_eq!(payload["schema"], "frama-c-mcp.check.v2", "{label}");
@@ -7856,6 +7865,15 @@ async fn check_returns_one_field_set_on_both_paths() {
             "{label}: proved and an empty incomplete array must agree: {payload:?}"
         );
     }
+
+    // One field set is half the promise; one order is the other half.
+    let [(first_label, first_order), (second_label, second_order)] = &orders[..] else {
+        panic!("expected exactly two payloads, got {}", orders.len());
+    };
+    assert_eq!(
+        first_order, second_order,
+        "the {first_label} and {second_label} paths emit their fields in different orders"
+    );
 
     let _ = client.cancel().await;
 }
@@ -7965,7 +7983,7 @@ async fn the_receipt_records_the_contract_it_proved_under() {
     .unwrap()["proof_receipt"]
         .clone();
     assert_eq!(
-        isolated["subject"]["contracts"], "unavailable_isolated_cli_retry",
+        isolated["subject"]["contracts"], ISOLATED_RETRY_NO_AST,
         "the isolated retry claimed a contract it did not prove: {isolated:?}"
     );
 
@@ -10211,6 +10229,113 @@ async fn naming_a_profile_does_not_turn_off_the_runtime_error_checks() {
     );
 }
 
+/// The whole point of the code: a run with nothing unproved is still
+/// incomplete.
+///
+/// The fixture memory-model-hypothesis.c proves 11 of 11 goals on Frama-C
+/// 32.1 while WP assumes \separated(p, &g), and "caller" in that file violates
+/// the hypothesis by passing &g. Without this code the payload reads
+/// as a clean proof of a function whose postcondition is false at run time.
+#[tokio::test]
+async fn a_memory_model_hypothesis_makes_a_fully_proved_run_incomplete() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    // No function filter, so WP proves both. Scoping to one function would
+    // scope the warning too: WP prints the hypothesis for the function it is
+    // processing, and "caller" has no pointer formal of its own. The unsound
+    // pair only exists when both are proved, which is the run a caller makes.
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    // Every goal valid, and incomplete anyway. Both halves matter: a code that
+    // only fired alongside an unproved goal would miss this run entirely. Every
+    // count key ends in "/valid", so nothing is unproved. Named by suffix
+    // rather than by the exact key set, which carries the goal kinds WP
+    // happened to generate and moves with the Frama-C version.
+    let counts = check["wp_goals"]["counts"].as_object().expect("counts");
+    assert!(!counts.is_empty(), "{check:?}");
+    assert!(
+        counts.keys().all(|key| key.ends_with("/valid")),
+        "{check:?}"
+    );
+    assert!(check["wp_goals"]["total"].as_u64().is_some_and(|total| total > 0), "{check:?}");
+    assert_eq!(check["verdict"], "incomplete", "{check:?}");
+
+    let entry = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .find(|item| item["code"] == "WP_MEMORY_MODEL_HYPOTHESIS")
+        .unwrap_or_else(|| panic!("no memory-model entry: {check:?}"));
+
+    assert_eq!(entry["function_count"], json!(1), "{entry:?}");
+    assert_eq!(entry["functions"][0]["function"], json!("two"), "{entry:?}");
+
+    // The clause verbatim, because what a caller does with this is paste it
+    // into a precondition.
+    assert_eq!(
+        entry["functions"][0]["hypotheses"],
+        json!(["requires \\separated(p, &g);"]),
+        "{entry:?}"
+    );
+    assert_eq!(
+        entry["read_from"],
+        json!("a separate frama-c run with provers off"),
+        "{entry:?}"
+    );
+
+    // The guidance says what to do about it, keyed by code like every other.
+    assert!(
+        check["incomplete_guidance"]["WP_MEMORY_MODEL_HYPOTHESIS"]
+            .as_str()
+            .is_some_and(|text| text.contains("requires")),
+        "{check:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// The negative control, so the code is not simply always on.
+///
+/// One pointer formal and no global in the same frame needs no separation, and
+/// Frama-C prints none. Measured at 4 of 4 goals on 32.1.
+#[tokio::test]
+async fn a_function_needing_no_separation_carries_no_memory_model_entry() {
+    let c_file = workspace_path("tests/fixtures/memory-model-no-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    // The control has to actually prove something, or its silence proves
+    // nothing: a run where WP never started would carry no entry either.
+    assert!(check["wp_goals"]["total"].as_u64().is_some_and(|total| total > 0), "{check:?}");
+
+    assert!(
+        !check["incomplete"]
+            .as_array()
+            .expect("incomplete array")
+            .iter()
+            .any(|item| item["code"] == "WP_MEMORY_MODEL_HYPOTHESIS"),
+        "{check:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
 /// An indirect call is reported as a missing annotation, not as a slow prover.
 ///
 /// The fixture is a function whose body is one call through a pointer formal.
@@ -10320,6 +10445,142 @@ async fn a_direct_call_graph_carries_no_indirect_call_gap() {
             .iter()
             .any(|item| item["code"] == "INDIRECT_CALL_UNRESOLVED"),
         "{check:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// The probe asks WP the question this run asked, not a broader one.
+///
+/// The probe is a second Frama-C run, and an unscoped one walks the whole file.
+/// So it carries the run's own WP scope onto the command line, and this pins
+/// that it does.
+///
+/// What that scope does not do is narrow the answer to the target's own frame,
+/// and the measurement is worth keeping because it is the opposite of what a
+/// reader expects. Frama-C 33.0, over the two-function fixture: both
+/// "-wp-fct caller" and "-wp-fct two" report the hypothesis for "two". Proving
+/// "caller" uses "two"'s contract, and the separation the model needs for
+/// "two"'s frame is part of what "caller"'s proof rests on, so WP names it
+/// under either scope. Reporting it for a scoped check is therefore right, and
+/// the scope still matters: it is what makes the probe describe this run.
+#[tokio::test]
+async fn a_scoped_check_probes_under_its_own_wp_scope() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let scoped = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "function": "caller", "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    // The scope reached the command line. Without this the probe answers about
+    // the whole file for a run that proved one function.
+    let command = probe_command(&scoped["memory_model_probe"]);
+    assert!(
+        command.windows(2).any(|pair| pair == ["-wp-fct", "caller"]),
+        "{command:?}"
+    );
+    assert!(
+        !command.contains(&"two"),
+        "the probe named a function this run did not prove: {command:?}"
+    );
+
+    // And the hypothesis is reported, because WP reports it under this scope.
+    let entry = scoped["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .find(|item| item["code"] == "WP_MEMORY_MODEL_HYPOTHESIS")
+        .unwrap_or_else(|| panic!("no memory-model entry: {scoped:?}"));
+    assert_eq!(entry["functions"][0]["function"], json!("two"), "{entry:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// A run over a file with no separation to assume carries neither half.
+///
+/// The control for the probe itself: it ran, it exited zero, and it found
+/// nothing, which is a different answer from not having looked.
+#[tokio::test]
+async fn a_probe_that_finds_nothing_reports_that_it_looked() {
+    let c_file = workspace_path("tests/fixtures/memory-model-no-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(check["memory_model_probe"]["ran"], json!(true), "{check:?}");
+    assert_eq!(check["memory_model_probe"]["hypotheses"], json!([]), "{check:?}");
+    let codes: Vec<&str> = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .filter_map(|item| item["code"].as_str())
+        .collect();
+    assert!(!codes.contains(&"WP_MEMORY_MODEL_HYPOTHESIS"), "{codes:?}");
+    assert!(!codes.contains(&"WP_MEMORY_MODEL_UNCHECKED"), "{codes:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// The probe's provenance is on the payload, because it is the one answer here
+/// that did not come through the socket.
+#[tokio::test]
+async fn the_memory_model_probe_reports_how_it_was_run() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    let probe = &check["memory_model_probe"];
+    assert_eq!(probe["ran"], json!(true), "{check:?}");
+    assert_eq!(probe["exit_code"], json!(0), "{probe:?}");
+    assert_eq!(probe["model"], check["wp"]["effective_wp_config"]["model"], "{check:?}");
+
+    // Provers off, because the hypotheses are a property of the function and
+    // the model rather than of any proof.
+    let command = probe_command(probe);
+    assert!(command.windows(2).any(|pair| pair == ["-wp-prover", "none"]), "{command:?}");
+
+    // An EVA-only check pays for no process at all, and says why.
+    let eva_only = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["eva"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(eva_only["memory_model_probe"]["ran"], json!(false), "{eva_only:?}");
+    assert_eq!(
+        eva_only["memory_model_probe"]["reason"],
+        json!("check did not run WP"),
+        "{eva_only:?}"
+    );
+    assert!(
+        !eva_only["incomplete"]
+            .as_array()
+            .expect("incomplete array")
+            .iter()
+            .any(|item| item["code"] == "WP_MEMORY_MODEL_UNCHECKED"),
+        "{eva_only:?}"
     );
 
     let _ = client.cancel().await;
@@ -10446,6 +10707,392 @@ async fn the_contract_frontier_is_not_a_check_gap() {
     assert!(
         !codes.iter().any(|code| code.contains("FRONTIER")),
         "{codes:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// run_wp reports the assumption its own proof rests on.
+///
+/// The defect fixed for check, reached by the tool call the playbook has an
+/// agent make directly. A run_wp that reports every goal valid and omits the
+/// separation WP assumed is the same wrong answer by a different route.
+#[tokio::test]
+async fn run_wp_reports_the_memory_model_hypothesis_it_proved_under() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let wp = call_tool_json(&client, "run_wp", json!({"timeout": 10}))
+        .await
+        .unwrap();
+
+    let probe = &wp["memory_model_probe"];
+    assert_eq!(probe["ran"], json!(true), "{wp:?}");
+    assert_eq!(
+        probe["hypotheses"][0]["function"],
+        json!("two"),
+        "{probe:?}"
+    );
+    assert_eq!(
+        probe["hypotheses"][0]["hypotheses"],
+        json!(["requires \\separated(p, &g);"]),
+        "{probe:?}"
+    );
+
+    // Under the model the run used, not a default, since which separations the
+    // model needs is exactly what varies between models.
+    assert_eq!(probe["model"], wp["effective_wp_config"]["model"], "{wp:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// check reads that probe rather than paying for a second process.
+///
+/// Two probes per check would cost another Frama-C run, measured at 2.3
+/// seconds, and would put the same answer under two keys. The command on the
+/// check payload is the one run_wp issued, which is how this tells a
+/// read-through from a second run.
+#[tokio::test]
+async fn a_check_does_not_probe_twice_for_one_wp_run() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    // The same object, by value, on both levels.
+    assert_eq!(
+        check["memory_model_probe"],
+        check["wp"]["memory_model_probe"],
+        "check ran its own probe instead of reading the run's: {check:?}"
+    );
+    assert_eq!(check["memory_model_probe"]["ran"], json!(true), "{check:?}");
+
+    // And the gap still lands exactly once.
+    let entries: Vec<&serde_json::Value> = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .filter(|item| item["code"] == "WP_MEMORY_MODEL_HYPOTHESIS")
+        .collect();
+    assert_eq!(entries.len(), 1, "{check:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// A sandbox hands back a proof like any other run, and now says what it
+/// assumed.
+///
+/// It cannot use check's reconstruction: a sandbox's files are a temporary
+/// sandbox.c rather than the session's, so the receipt carries no project
+/// options to rebuild from. It calls the probe with the defaults its own
+/// process was started with, and with the bare target names, which are what
+/// its Frama-C knows its functions by.
+#[tokio::test]
+async fn a_sandbox_run_reports_its_own_memory_model_hypothesis() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let experiment_id = unique_experiment_id("mm");
+    let created = call_tool_json(
+        &client,
+        "create_sandbox",
+        json!({"function": "two", "experiment_id": experiment_id}),
+    )
+    .await
+    .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox_name").to_string();
+
+    let wp = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": [sandbox.clone()], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    let probe = &wp["memory_model_probe"];
+    assert_eq!(probe["ran"], json!(true), "{wp:?}");
+    assert_eq!(probe["hypotheses"][0]["function"], json!("two"), "{probe:?}");
+
+    // The bare name reached the command line. The prefixed form is this
+    // server's addressing and the sandbox's Frama-C has never heard of it.
+    let command = probe_command(probe);
+    assert!(command.windows(2).any(|pair| pair == ["-wp-fct", "two"]), "{command:?}");
+
+    let _ = call_tool_json(&client, "delete_sandbox", json!({"sandbox_name": sandbox})).await;
+    let _ = client.cancel().await;
+}
+
+/// The probe describes the run's guards, not the project's flag.
+///
+/// run_wp generates WP's runtime-error guards in place for a main-instance
+/// run, so a project loaded without rte still proves them. A probe told the
+/// project's own flag would analyse a smaller program than the one that was
+/// proved, and could miss a separation the guards introduce.
+///
+/// Loaded with rte:false on purpose, and that is the whole test. The helper
+/// reloads with rte:true, so under it the project's own flag is already set,
+/// "-wp-rte" reaches the command line either way, and the assertion below held
+/// for the narrow expression it exists to rule out. The two readings only
+/// disagree when the flag is off and the guards were generated anyway.
+#[tokio::test]
+async fn the_probe_analyses_the_program_the_run_actually_guarded() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let reloaded = call_tool_json(
+        &client,
+        "reload_project",
+        json!({"files": [c_file], "rte": false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reloaded["rte"],
+        json!(false),
+        "the project has to be loaded without rte for this to mean anything: {reloaded:?}"
+    );
+
+    let wp = call_tool_json(&client, "run_wp", json!({"timeout": 10}))
+        .await
+        .unwrap();
+
+    let command = probe_command(&wp["memory_model_probe"]);
+    assert!(
+        wp["rte_guarded_in_place"]
+            .as_array()
+            .is_some_and(|guarded| !guarded.is_empty()),
+        "the run has to have guarded something for this to mean anything: {wp:?}"
+    );
+    assert!(command.contains(&"-wp-rte"), "{command:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// Adding the probe to the response does not move a run_wp receipt.
+///
+/// The probe is provenance for a payload, not part of what was proved:
+/// attach_run_wp_receipt copies the effective config, the failure kind and the
+/// timeout triage, and nothing else. Two runs of the same file therefore still
+/// digest the same, which is what makes a receipt comparable at all.
+#[tokio::test]
+async fn the_probe_does_not_change_a_run_wp_receipt() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let first = call_tool_json(&client, "run_wp", json!({"timeout": 10}))
+        .await
+        .unwrap();
+    let second = call_tool_json(&client, "run_wp", json!({"timeout": 10}))
+        .await
+        .unwrap();
+
+    assert!(
+        first["memory_model_probe"]["ran"] == json!(true),
+        "{first:?}"
+    );
+    assert_eq!(
+        first["proof_receipt"]["sha256"],
+        second["proof_receipt"]["sha256"],
+        "two runs of one file digested differently"
+    );
+
+    // And the probe is not inside the digested part.
+    assert!(
+        first["proof_receipt"]["reported"]["memory_model_probe"].is_null(),
+        "{first:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// The probe's command line as a borrowed argv.
+///
+/// Five tests read this the same way and differed only in the panic message.
+fn probe_command(probe: &Value) -> Vec<&str> {
+    probe["command"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a probe that ran carries its command: {probe:?}"))
+        .iter()
+        .filter_map(|arg| arg.as_str())
+        .collect()
+}
+
+/// A declared-but-undefined callee does not kill the probe.
+///
+/// An unscoped run proves every function resolve_wp_targets returns, and that
+/// list keeps declarations: uncontracted-callee.c has "helper" with no body.
+/// Passing that name to -wp-fct is "no function 'helper'" and a Frama-C that
+/// aborts with exit 1 before printing a hypothesis, so the probe answered
+/// ran:false for every program with an external callee and check turned that
+/// into WP_MEMORY_MODEL_UNCHECKED. Measured against 33.0: exit 1 with the
+/// undefined name on the command line, exit 0 without it.
+#[tokio::test]
+async fn an_undefined_callee_is_kept_off_the_probe_command_line() {
+    let c_file = workspace_path("tests/fixtures/uncontracted-callee.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let wp = call_tool_json(&client, "run_wp", json!({"timeout": 10}))
+        .await
+        .unwrap();
+
+    let probe = &wp["memory_model_probe"];
+    assert_eq!(probe["ran"], json!(true), "{probe:?}");
+
+    let command = probe_command(probe);
+
+    // The defined functions are addressed and the declaration is not. Both
+    // halves matter: dropping every name would probe the whole file and
+    // attribute a separation to a run that never proved its owner.
+    assert!(command.contains(&"compute"), "{command:?}");
+    assert!(!command.contains(&"helper"), "{command:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// The probe describes the AST that was proved, not the file on disk.
+///
+/// Annotations reach Frama-C through execAddAnnotation and the ghost
+/// insertions. Neither writes the source back: a sandbox's sandbox.c is
+/// written once, at creation, and a main-project file is never written at all.
+/// A probe that re-parses those files therefore analyses the program as it was
+/// before the session injected anything, and a contract that introduces a
+/// separation is invisible to it. The run reports every goal valid and the
+/// probe reports no hypotheses, which is exactly the false clean the payload
+/// exists to prevent, and it is the shape the CEGIS loop runs in: inject, then
+/// run_wp, with no reload between.
+///
+/// The fixture is chosen so the two answers differ. "bump" writes the global
+/// and never touches "p", so the file as it stands needs no separation;
+/// naming "*p" in a contract puts the pointer in the frame and the Typed model
+/// then needs one.
+#[tokio::test]
+async fn the_probe_sees_a_separation_that_only_the_injected_contract_introduces() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis-injected.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let experiment_id = unique_experiment_id("inj");
+    let created = call_tool_json(
+        &client,
+        "create_sandbox",
+        json!({"function": "bump", "experiment_id": experiment_id}),
+    )
+    .await
+    .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox_name").to_string();
+
+    // The control, in the same test rather than in prose: before the contract
+    // lands the probe has to find nothing, or the assertion below would pass
+    // for a fixture that always had a hypothesis.
+    let before = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": [sandbox.clone()], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before["memory_model_probe"]["ran"], json!(true), "{before:?}");
+    assert_eq!(
+        before["memory_model_probe"]["hypotheses"],
+        json!([]),
+        "the fixture must need no separation until the contract is injected: {before:?}"
+    );
+
+    let injected = call_tool_json(
+        &client,
+        "inject_all_annotations",
+        json!({
+            "sandbox_name": sandbox.clone(),
+            "proposed_requires": [{"acsl": "\\valid_read(p)", "necessity": "brings p into the frame"}],
+            "proposed_assigns": [{"acsl": "g"}],
+            "proposed_ensures": [{"acsl": "*p == \\old(*p)"}],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(injected["status"], json!("success"), "{injected:?}");
+
+    let after = call_tool_json(
+        &client,
+        "run_wp",
+        json!({"functions": [sandbox.clone()], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    let probe = &after["memory_model_probe"];
+    assert_eq!(probe["ran"], json!(true), "{after:?}");
+    assert_eq!(
+        probe["hypotheses"][0]["function"],
+        json!("bump"),
+        "the contract is in the AST and the probe has to see it: {probe:?}"
+    );
+    let separations = probe["hypotheses"][0]["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no hypotheses array: {probe:?}"))
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        separations.iter().any(|text| text.contains("\\separated")),
+        "{separations:?}"
+    );
+
+    let _ = call_tool_json(&client, "delete_sandbox", json!({"sandbox_name": sandbox})).await;
+    let _ = client.cancel().await;
+}
+
+/// check digests its own AST even when the run it wrapped could not.
+///
+/// check forwards its caller's provers, and run_wp answers any call carrying
+/// provers with the isolated CLI retry, whose receipt records the marker
+/// instead of a digest: that run proved the files on disk in another process
+/// while the live AST here carries whatever this session injected. check is
+/// still connected to the project, so its own receipt can describe its own
+/// AST, and before it read the digest off the run it printed and digested
+/// exactly that. Reusing the marker would put it in a field that could carry a
+/// real digest, and two checks over different programs would then agree on it.
+#[tokio::test]
+async fn a_retry_that_cannot_digest_does_not_erase_the_checks_own_digest() {
+    let c_file = workspace_path("tests/fixtures/memory-model-hypothesis.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let retried = call_tool_json(
+        &client,
+        "check",
+        json!({"provers": ["alt-ergo"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    // The run really did take the retry path, or this asserts nothing.
+    assert_eq!(
+        retried["wp"]["proof_receipt"]["subject"]["ast_digest"],
+        json!(ISOLATED_RETRY_NO_AST),
+        "the run did not go through the isolated retry, so this test is vacuous: {retried:?}"
+    );
+
+    let digest = retried["proof_receipt"]["subject"]["ast_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("check's own receipt has no digest: {retried:?}"));
+    assert_ne!(digest, ISOLATED_RETRY_NO_AST, "{retried:?}");
+    assert!(
+        digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "not a sha256 over the printed AST: {digest}"
     );
 
     let _ = client.cancel().await;

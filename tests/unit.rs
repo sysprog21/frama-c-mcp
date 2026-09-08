@@ -10,6 +10,8 @@
 
 #[path = "support/receipt.rs"]
 mod receipt_fixture;
+#[path = "support/server.rs"]
+mod server_fixture;
 
 #[path = "unit/acsl-shapes.rs"]
 mod acsl_shapes;

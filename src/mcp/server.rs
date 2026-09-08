@@ -2330,6 +2330,12 @@ impl Drop for MainFramaCState {
 /// instead of a silently weaker answer. Every one of them fails open when a
 /// field is forgotten, which is why the discipline is stated once here rather
 /// than argued four times.
+///
+/// Serialize only. The memory-model probe takes its options from the value the
+/// session already holds, read under the WP lock that makes them agree with
+/// the goals, so nothing reads one back out of a receipt and a Deserialize
+/// here would be an unused door into a struct whose whole point is that every
+/// reader of it is a compile error away from the truth.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectLoadOptions {
     pub include_paths: Vec<String>,
@@ -3063,6 +3069,12 @@ impl FramaCMcpServer {
         source_files: Vec<String>,
         wp_goals: &[serde_json::Value],
         report_function: Option<&str>,
+
+        // What the caller's memory-model probe was run over, when it got that
+        // far. Passing it means one printSource for the run instead of two, and
+        // means the digest and the probe describe the same AST rather than two
+        // prints with a window between them.
+        ast_source: Option<&str>,
     ) -> Result<(), McpError> {
         // The raw rows, not fetch_properties: a receipt keys goals by their own
         // identity and never reads the ordered-instance vacuity warning, so the
@@ -3089,6 +3101,8 @@ impl FramaCMcpServer {
                     "wp_timeout_triage": response["wp_timeout_triage"].clone(),
                 }),
                 properties: &receipt_properties,
+                ast_source,
+                ast_digest: None,
             })
             .await;
         Ok(())
@@ -3419,22 +3433,43 @@ impl FramaCMcpServer {
         )
         .await?;
 
+        // One index over the fetched rows, read twice below. Both answers are
+        // per target name and both used to walk the whole array for each one,
+        // which is the same scan written twice.
+        let by_name: HashMap<&str, &serde_json::Value> = funcs
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(|name| (name, f)))
+            .collect();
+
         // Resolve every marker before starting any proof: a miss part-way
         // through would otherwise leave the sandbox holding goals from a
         // half-run, indistinguishable from a complete one.
         let decl_markers = target_names
             .iter()
             .map(|function| {
-                funcs
-                    .iter()
-                    .find_map(|f| {
-                        let name = f.get("name").and_then(|v| v.as_str());
-                        let decl = f.get("decl").and_then(|v| v.as_str());
-                        (name == Some(function.as_str())).then(|| decl.map(str::to_string))?
-                    })
+                by_name
+                    .get(function.as_str())
+                    .and_then(|f| f.get("decl").and_then(|v| v.as_str()).map(str::to_string))
                     .ok_or_else(|| McpError::from(FramaCError::FunctionNotFound(function.clone())))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // The defined subset, for the memory-model probe alone, filtered for
+        // the same reason the main path filters its own targets: -wp-fct on a
+        // declared-but-undefined name is "no function 'f'" and a Frama-C that
+        // aborts before printing anything. A sandbox can hold a bare
+        // declaration, since extraction leaves a callee that carries an
+        // explicit assigns as one, and a run aimed at that name would otherwise
+        // turn every probe into WP_MEMORY_MODEL_UNCHECKED.
+        let probe_functions = target_names
+            .iter()
+            .filter(|function| {
+                by_name.get(function.as_str()).is_some_and(|f| {
+                    f.get("defined").and_then(|v| v.as_bool()).unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
         // Read before any proof is scheduled: after the drain the average is
         // largely this run's own provers. See host_load_per_cpu.
@@ -3470,15 +3505,49 @@ impl FramaCMcpServer {
             host_load,
         });
 
-        // The property table read here is the sandbox's own, which is the only
-        // difference from the main path.
-        self.attach_run_wp_receipt(
-            &client,
-            &mut response,
+        // The same probe the main path runs, because a sandbox hands back a
+        // proof and a receipt like any other run and an unstated separation
+        // does not care which instance proved it. Three differences from the
+        // main path, all of them properties of what a sandbox is.
+        //
+        // Default project options, matching what sandbox_frama_c_command_line
+        // passes the sandbox process itself, which is nothing. Whenever that
+        // command line gains the project's machine model, this call needs the
+        // same value or the probe silently answers under a different model.
+        //
+        // The bare target names, not the prefixed ones, and only the defined
+        // ones. The sandbox process knows its functions by their own names, and
+        // -wp-fct takes those; the prefixed form is this server's addressing,
+        // not Frama-C's. See probe_functions above for why a declaration is
+        // kept off that command line.
+        //
+        // And run before the receipt, which consumes source_files.
+        //
+        // Over this sandbox's printed AST rather than its sandbox.c, and the
+        // sandbox is where that matters most: sandbox.c is written once, at
+        // creation, and the whole point of a sandbox is to iterate ACSL into
+        // the AST above it. Probing the file would describe the extraction as
+        // it was before the first annotation landed.
+        //
+        // The property table the receipt reads is the sandbox's own, which is
+        // the only difference from the main path.
+        //
+        // Defaults, matching what sandbox_frama_c_command_line passes the
+        // sandbox's own process. The narrowing to what a printed AST can use
+        // happens inside the probe rather than here, so if that command line
+        // ever gains the project's machine model this call inherits the same
+        // treatment instead of needing to be remembered.
+        self.attach_probe_and_receipt(crate::mcp::server::analysis::ProbeAndReceipt {
+            client: &client,
+            response: &mut response,
+            project_options: &ProjectLoadOptions::default(),
+            rte: true,
+            probe_functions: &probe_functions,
+            temp_dir_prefix: "frama-c-mcp-sandbox-probe-ast-",
             source_files,
-            &wp_goals,
+            wp_goals: &wp_goals,
             report_function,
-        )
+        })
         .await?;
         Ok(json_result(response))
     }
@@ -4544,7 +4613,7 @@ use receipt::{eva_config_absent, incomplete_digest, proof_receipt_goals, ProofRe
 pub mod eacsl;
 #[path = "wpcli.rs"]
 pub mod wpcli;
-use wpcli::{run_wp_counter_examples, run_why3_dump, run_wp_print, IsolatedWpRetry};
+use wpcli::{run_wp_counter_examples, run_wp_memory_model_probe, run_why3_dump, run_wp_print, IsolatedWpRetry};
 use eacsl::run_e_acsl_counterexample;
 
 #[path = "selfcheck.rs"]

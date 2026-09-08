@@ -140,6 +140,12 @@ that say a green-looking run is not one:
 - `PROPERTY_DEAD`: proved about code EVA showed is unreachable, so it
   constrains no run
 - `UNCONSTRAINED_ASSIGNS`: written, and nothing says what was written
+- `WP_MEMORY_MODEL_HYPOTHESIS`: WP's memory model needed a separation and
+  assumed it. Every goal can be valid while this is reported, and that is the
+  case it exists for: a function taking a pointer and writing a global proves
+  under `\separated(p, &g)`, and a caller passing `&g` proves too while the
+  postcondition is false at run time. The entry carries the clause; put it in
+  the function's own `requires` so callers have to discharge it
 - `INDIRECT_CALL_UNRESOLVED`: a call through a function pointer. Without a
   `calls` clause WP assumes the pointer may reach any function, including the
   enclosing one, so the goals underneath come back as timeouts that no extra
