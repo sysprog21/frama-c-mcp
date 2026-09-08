@@ -236,7 +236,7 @@ async fn self_check_shape_with_missing_frama_c() {
     let ast_requests = payload["ast_utils_registered_requests"]
         .as_array()
         .expect("ast-utils registered requests");
-    assert_eq!(ast_requests.len(), 28);
+    assert_eq!(ast_requests.len(), 29);
     assert!(ast_requests.iter().any(|r| r["request"] == "plugins.ast-utils.dumpProject"));
     assert!(ast_requests
         .iter()
@@ -378,7 +378,7 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
         .is_some_and(|warning| warning.contains("executed paths")
             && warning.contains("assigns clauses")));
     // Also pinned in test-process-lifecycle.rs; see the note there.
-    assert_eq!(payload["ast_utils"]["registered_request_count"], 28);
+    assert_eq!(payload["ast_utils"]["registered_request_count"], 29);
     assert!(payload["ast_utils"]["registered_requests"]
         .as_array()
         .expect("ast-utils requests")

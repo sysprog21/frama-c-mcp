@@ -1009,6 +1009,40 @@ impl FramaCMcpServer {
         Ok(json!(globals))
     }
 
+    /// The functions a proof of this program still needs a contract for.
+    ///
+    /// Whole-program and answered in one request, because the alternative is
+    /// one getContractContext per defined function: a thousand round trips for
+    /// a payload of a few hundred rows, which is one action one bounded payload
+    /// inverted.
+    ///
+    /// A list rather than a check gap. A function two hops down with no
+    /// contract is not a gap in any caller's proof, since WP used the direct
+    /// callee's contract and ASSUMED_CALLEE_CONTRACT already covers the case
+    /// where that contract is vacuous. What this answers is what a person still
+    /// has to write, which is a work list rather than a verdict.
+    async fn list_contract_frontier_payload(&self) -> Result<serde_json::Value, McpError> {
+        (self.require_client().await?)
+            .get("plugins.ast-utils.getContractFrontier", json!(null))
+            .await
+            .map_err(|error| {
+                // What actually happened first, then the likely cause. A
+                // request this plug-in does not register is the common failure
+                // and worth naming, but a timeout, a dropped connection and a
+                // plug-in error all arrive here too, and reporting those as a
+                // version mismatch sends the reader to reinstall something that
+                // is already correct.
+                McpError::internal_error(
+                    format!(
+                        "plugins.ast-utils.getContractFrontier failed: {error}. If the request is \
+                         unknown, the ast-utils plug-in installed in this switch is older than \
+                         this server"
+                    ),
+                    None,
+                )
+            })
+    }
+
     async fn list_declarations_payload(&self) -> Result<serde_json::Value, McpError> {
         (self.require_client().await?)
             .get("kernel.ast.getDeclarations", json!(null))
@@ -1128,6 +1162,7 @@ impl FramaCMcpServer {
             ListKind::Declarations => self.list_declarations_payload().await?,
             ListKind::Sandboxes => self.sandbox_list_payload().await?,
             ListKind::Conclusions => self.conclusions_payload(params.status, params.function).await?,
+            ListKind::ContractFrontier => self.list_contract_frontier_payload().await?,
         };
         Ok(json_result(result))
     }

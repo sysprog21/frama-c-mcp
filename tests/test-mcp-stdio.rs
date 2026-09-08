@@ -10324,3 +10324,129 @@ async fn a_direct_call_graph_carries_no_indirect_call_gap() {
 
     let _ = client.cancel().await;
 }
+
+/// The contract frontier, whole-program and in one call.
+///
+/// The question an agent has on a file it has not seen: which functions does a
+/// proof of this program still need a contract for. Answered by one request
+/// rather than one getContractContext per defined function, which on a
+/// thousand-function program is a thousand round trips for a payload of a few
+/// hundred rows.
+#[tokio::test]
+async fn the_contract_frontier_names_what_still_needs_a_contract() {
+    let c_file = workspace_path("tests/fixtures/contract-frontier.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let frontier = call_tool_json(&client, "list", json!({"kind": "contract_frontier"}))
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = frontier["missing"]
+        .as_array()
+        .expect("missing array")
+        .iter()
+        .filter_map(|entry| entry["function"].as_str())
+        .collect();
+
+    // The two functions two hops down, which ASSUMED_CALLEE_CONTRACT cannot
+    // see: it reads one hop from whatever a check happened to target.
+    assert_eq!(names, ["deep_a", "deep_b"], "{frontier:?}");
+
+    // And not the unreachable one. Seeding from every defined function rather
+    // than from the contracted ones would report it, which is the difference
+    // between a work list and a list of every function without a contract.
+    assert!(!names.contains(&"orphan"), "{frontier:?}");
+
+    assert_eq!(frontier["missing_count"], json!(2), "{frontier:?}");
+    assert_eq!(frontier["contracted_count"], json!(2), "{frontier:?}");
+    assert_eq!(frontier["defined_count"], json!(5), "{frontier:?}");
+
+    // Each row carries what a person needs to go and write the contract.
+    let first = &frontier["missing"][0];
+    assert_eq!(first["called_by"], json!(["helper"]), "{first:?}");
+    assert!(first["loc"]["line"].as_u64().is_some(), "{first:?}");
+
+    // A frontier computed over a call graph that dropped the indirect edges
+    // would be a work list that under-reports, and a short one looks the same
+    // as a complete one, so the walk says whether it followed everything.
+    assert_eq!(frontier["call_graph_complete"], json!(true), "{frontier:?}");
+    assert_eq!(frontier["unresolved_call_sites"], json!([]), "{frontier:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// Writing one of the missing contracts takes that function off the frontier
+/// and leaves the other, which is what makes it a work list rather than a
+/// static property of the file.
+#[tokio::test]
+async fn a_contract_written_leaves_the_frontier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let c_file = tmp.path().join("frontier.c");
+    std::fs::write(
+        &c_file,
+        r#"
+int deep_a(int x) { return x + 1; }
+
+/*@ assigns \nothing; ensures \result == x * 2; */
+int deep_b(int x) { return x * 2; }
+
+/*@ assigns \nothing; ensures \result >= 0; */
+int helper(int x)
+{
+    if (x < 0) return 0;
+    return deep_a(x) + deep_b(x);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let frontier = call_tool_json(&client, "list", json!({"kind": "contract_frontier"}))
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = frontier["missing"]
+        .as_array()
+        .expect("missing array")
+        .iter()
+        .filter_map(|entry| entry["function"].as_str())
+        .collect();
+    assert_eq!(names, ["deep_a"], "{frontier:?}");
+
+    let _ = client.cancel().await;
+}
+
+/// The frontier is a work list, not a verdict, so it produces no gap code.
+///
+/// Stated as a test because the opposite is the tempting change: a function
+/// two hops down with no contract is not a gap in any caller's proof, since WP
+/// used the direct callee's contract and ASSUMED_CALLEE_CONTRACT already
+/// covers the case where that contract is vacuous.
+#[tokio::test]
+async fn the_contract_frontier_is_not_a_check_gap() {
+    let c_file = workspace_path("tests/fixtures/contract-frontier.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "function": "entry", "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    let codes: Vec<&str> = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .filter_map(|item| item["code"].as_str())
+        .collect();
+    assert!(
+        !codes.iter().any(|code| code.contains("FRONTIER")),
+        "{codes:?}"
+    );
+
+    let _ = client.cancel().await;
+}

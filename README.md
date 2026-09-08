@@ -449,8 +449,21 @@ shell-active character (a parenthesized expression, a quoted string) is refused;
 ### `list` and `run_wp`
 
 `list` accepts a `kind` of `files`, `functions`, `globals`, `declarations`,
-`sandboxes`, or `conclusions`. For conclusions, `status` filters the summaries
-and `function` returns one full conclusion.
+`sandboxes`, `conclusions`, or `contract_frontier`.
+
+`list {kind: "contract_frontier"}` is the one to run before anything else on a
+file you have not seen. It answers, in one request, which defined functions are
+reachable from a function that already carries a contract and carry none
+themselves: the contracts a person still has to write. It is not a verdict and
+produces no `incomplete[]` code, because a function two hops down with no
+contract is not a gap in any caller's proof; `ASSUMED_CALLEE_CONTRACT` covers
+the case where a direct callee's contract is vacuous. The payload carries
+`unresolved_call_sites` alongside, since a frontier computed over a call graph
+that dropped the calls through function pointers is a work list that
+under-reports and a short one looks the same as a complete one.
+
+For conclusions, `status` filters the summaries and `function` returns one full
+conclusion.
 
 `run_wp` accepts `smoke: true` together with `provers` to run isolated CLI
 smoke tests.
