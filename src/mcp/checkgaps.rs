@@ -162,6 +162,7 @@ pub mod incomplete_code {
     pub const LEMMA_NOT_PROVED: &str = "LEMMA_NOT_PROVED";
     pub const ASSUMED_VALID: &str = "ASSUMED_VALID";
     pub const ASSUMED_CALLEE_CONTRACT: &str = "ASSUMED_CALLEE_CONTRACT";
+    pub const INDIRECT_CALL_UNRESOLVED: &str = "INDIRECT_CALL_UNRESOLVED";
     pub const UNCONSTRAINED_ASSIGNS: &str = "UNCONSTRAINED_ASSIGNS";
     pub const RESULT_UNCONSTRAINED: &str = "RESULT_UNCONSTRAINED";
     pub const UNPROVED_ASSUMPTION: &str = "UNPROVED_ASSUMPTION";
@@ -193,6 +194,7 @@ pub mod incomplete_code {
         LEMMA_NOT_PROVED,
         ASSUMED_VALID,
         ASSUMED_CALLEE_CONTRACT,
+        INDIRECT_CALL_UNRESOLVED,
         UNCONSTRAINED_ASSIGNS,
         RESULT_UNCONSTRAINED,
         UNPROVED_ASSUMPTION,
@@ -378,6 +380,15 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
             "Two emitters ruled opposite ways on this property, so the consolidated verdict cannot \
              be trusted in either direction. Find the disagreement before writing any annotation \
              that rests on it; a contract built on an inconsistent property proves nothing."
+        }
+        incomplete_code::INDIRECT_CALL_UNRESOLVED => {
+            "Two annotations close this, and one alone does not. Name the callee set at the call \
+             site, as in a calls clause listing every function the pointer may hold, which stops \
+             WP assuming it can reach anything including the caller itself. Then constrain the \
+             pointer in the function's own contract, because the calls clause leaves a goal \
+             proving the pointer really holds one of those functions and nothing has said so yet. \
+             Raising the prover timeout closes neither: the open goals are unprovable rather than \
+             slow."
         }
         _ => return serde_json::Value::Null,
     };
@@ -736,6 +747,28 @@ fn proofread_finding_gaps(
                     )),
                     "function": finding.get("function").cloned().unwrap_or_else(|| json!(null)),
                     "assigns_target": finding.get("assigns_target").cloned().unwrap_or_else(|| json!(null)),
+                }));
+                continue;
+            }
+            if category == Some("unresolved_call") {
+                // Not gated on any goal. WP's answer to a call it cannot name
+                // is to assume the worst callee set, which leaves goals that
+                // look like prover timeouts, so the run this has to fire on is
+                // exactly the one whose goals all carry another code already.
+                incomplete.push(json!({
+                    "code": incomplete_code::INDIRECT_CALL_UNRESOLVED,
+                    "reason": finding.get("message").cloned().unwrap_or_else(|| json!(
+                        "A call names no callee, so WP assumed it could reach any function."
+                    )),
+                    "function": finding.get("function").cloned().unwrap_or_else(|| json!(null)),
+                    "callee_expression": finding.get("callee_expression").cloned().unwrap_or_else(|| json!(null)),
+                    "stmt_id": finding.get("stmt_id").cloned().unwrap_or_else(|| json!(null)),
+                    "source_location": finding.get("source_location").cloned().unwrap_or_else(|| json!(null)),
+
+                    // Says plainly that this reads the call shape and not the
+                    // annotation, so a reader who has already written the
+                    // clause is not left thinking it did not take.
+                    "reports": "the call shape, not whether a calls clause is present",
                 }));
                 continue;
             }

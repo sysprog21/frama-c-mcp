@@ -1236,6 +1236,115 @@ pub fn assumed_callee_contract_findings(
         .collect()
 }
 
+/// The pointer a precondition has to constrain, from the callee expression the
+/// plug-in printed.
+///
+/// The plug-in prints the call's lhost, and CIL normalizes "f()" through a
+/// pointer formal to "( *f)()", so what arrives is "*f" rather than "f". A
+/// precondition constrains the pointer and not its target, so pasting the
+/// printed form would produce "requires *f == &seta;", which is a type error.
+/// The dereference comes off here, and the parentheses a nested expression
+/// prints with come off behind it, so "*(state->handler)" names
+/// "state->handler".
+fn pointer_expression(callee: &str) -> &str {
+    let inner = callee.trim();
+    let inner = inner.strip_prefix('*').unwrap_or(inner).trim();
+    match inner.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        Some(unwrapped) if !unwrapped.contains('(') && !unwrapped.contains(')') => {
+            unwrapped.trim()
+        }
+        _ => inner,
+    }
+}
+
+/// The calls this server could not name a callee for.
+///
+/// "direct_callee_visitor" in the plug-in records a call whose host is not a
+/// Var instead of skipping it, and "getContractContext" returns the list as
+/// "unresolved_callees" beside a "callee_resolution_complete" boolean. Nothing
+/// read either until this: the plug-in computed the answer, two tests agreed
+/// the fields were present, and no consumer ever looked at one being false.
+///
+/// It matters because of what WP does with such a call. Measured on Frama-C
+/// 32.1, over a function whose body is one call through a pointer formal: with
+/// no calls clause WP warns "no 'calls' specification for statement(s) ...
+/// Assuming that they can call 'run'", which makes the function recursive,
+/// pulls in a decreases obligation, and leaves 4 of 9 goals at Timeout. This
+/// server reports those as GOAL_NOT_VALID with PROVER_TIMEOUT beside them, so
+/// the cause a caller reads is the prover and the next action it invites, more
+/// time, cannot work. Adding "calls seta;" takes the same file to 9 of 10 and
+/// a precondition pinning the pointer takes it to 10 of 10.
+///
+/// This reports the call shape, not the annotation: the visitor walks the AST
+/// and a statement's own code annotations are not part of what it walks, so
+/// the finding stays after a calls clause is added. That over-reports in the
+/// direction the fail-loud rule asks for, and the message says so rather than
+/// leaving a reader to discover it.
+pub fn unresolved_call_findings(
+    caller: &str,
+    context: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(unresolved) = context
+        .get("unresolved_callees")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    unresolved
+        .iter()
+        .map(|call| {
+            let sid = call.get("sid").cloned().unwrap_or_else(|| json!(null));
+            let expression = call
+                .get("callee")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<unknown>");
+            let pointer = pointer_expression(expression);
+
+            // The statement id is in the id because a function can hold several
+            // indirect calls and each one needs its own clause. Findings are
+            // deduplicated by id downstream, so an id naming only the caller
+            // would report the first call and drop the rest.
+            json!({
+                "id": format!("unresolved-call:{caller}:{sid}"),
+                "severity": "high",
+                "category": "unresolved_call",
+                "function": caller,
+                "callee_expression": expression,
+                "stmt_id": sid,
+                "source_location": call.get("loc").cloned().unwrap_or_else(|| json!(null)),
+                "message": format!(
+                    "{caller} calls through {expression}, which names no callee. Without a calls \
+                     clause WP assumes the pointer may reach any function, including {caller} \
+                     itself, and the goals that follow are unprovable rather than slow."
+                ),
+
+                // Conditional, because this reads the call shape and not the
+                // annotation: the same finding is still produced once a calls
+                // clause and a precondition are in place and every goal is
+                // valid, and an unconditional sentence would then contradict
+                // the goals reported beside it.
+                "why_problem":
+                    "Unless a calls clause at this statement names the callee set, WP has no \
+                     contract to use here and assumes the worst one. The goals it then leaves \
+                     open are reported as prover timeouts, which names the prover for a defect \
+                     that is a missing annotation.",
+                "suggested_fix": format!(
+                    "Write the callee set at the call site, as in /*@ calls impl_a, impl_b; */ \
+                     before the statement, naming every function the pointer may hold. Then \
+                     constrain the pointer in {caller}'s own contract, as in \
+                     requires {pointer} == &impl_a;, naming the one it actually holds. The calls \
+                     clause alone leaves the call-point goal open, because nothing yet says \
+                     which function the pointer holds."
+                ),
+                "evidence": [{
+                    "field": "unresolved_callees[].callee",
+                    "value": expression,
+                }],
+            })
+        })
+        .collect()
+}
+
 async fn main_contract_shape_findings(
     client: &FramaCClient,
     function_names: &[String],
@@ -1251,6 +1360,11 @@ async fn main_contract_shape_findings(
         findings.extend(assumed_callee_contract_findings(function, &context));
         findings.extend(unconstrained_assigns_findings(function, &context));
         findings.extend(result_unconstrained_findings(function, &context));
+
+        // Appended last on purpose. This walk order is hashed into the proof
+        // receipt, so a new producer inserted among the others would change
+        // every receipt over a function that has one of the older findings.
+        findings.extend(unresolved_call_findings(function, &context));
     }
     findings
 }

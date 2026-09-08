@@ -140,6 +140,15 @@ that say a green-looking run is not one:
 - `PROPERTY_DEAD`: proved about code EVA showed is unreachable, so it
   constrains no run
 - `UNCONSTRAINED_ASSIGNS`: written, and nothing says what was written
+- `INDIRECT_CALL_UNRESOLVED`: a call through a function pointer. Without a
+  `calls` clause WP assumes the pointer may reach any function, including the
+  enclosing one, so the goals underneath come back as timeouts that no extra
+  time will close. For a call through the pointer formal `f`, name the callee
+  set with `/*@ calls impl_a, impl_b; */` at the site, then pin the pointer in
+  the contract with `requires f == &impl_a;`; the clause
+  alone leaves the call-point goal open. The code reports the call shape and
+  not the annotation, so it keeps firing once both are written and the goals
+  discharge; its `reports` field says so
 
 `run_wp {cache: "None"}` when you need the verdict computed now rather than
 replayed from an earlier run: `-wp-cache` defaults to `update`, and each goal

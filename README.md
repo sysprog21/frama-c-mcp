@@ -597,6 +597,7 @@ payload contract and the change rule. The full set:
 | `LEMMA_NOT_PROVED` | WP assumed a lemma everywhere without discharging it |
 | `ASSUMED_VALID` | Recorded valid by external assumption, an `axiom`, not by proof |
 | `ASSUMED_CALLEE_CONTRACT` | A callee's contract was taken on faith, with no finite `assigns` |
+| `INDIRECT_CALL_UNRESOLVED` | A call names no callee, so WP assumed it may reach any function and the goals it leaves open are unprovable rather than slow |
 | `UNCONSTRAINED_ASSIGNS` | The contract lists a location in `assigns` that no postcondition mentions, so proving the function says nothing about the value written there |
 | `RESULT_UNCONSTRAINED` | The contract bounds `\result` to a small range but never ties some of those values to the inputs, so proving it does not pin down what the function returns |
 | `UNPROVED_ASSUMPTION` | An assertion or postcondition WP could not prove, which it still hands to later goals as a hypothesis |

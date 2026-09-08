@@ -1595,3 +1595,61 @@ fn a_vacuously_discharged_property_is_reported_rather_than_counted_as_proved() {
     );
     assert!(clean.is_empty(), "{clean:?}");
 }
+
+/// An unresolved-call finding reaches the verdict as its own code.
+///
+/// The dispatch in proofread_finding_gaps ends with a negative guard, so a
+/// category added anywhere below it is dropped with no warning at all. This
+/// pins that the arm sits above that guard.
+#[test]
+fn an_unresolved_call_finding_becomes_an_incomplete_entry() {
+    let wp = json!({
+        "ok": true,
+        "proofread_report": {
+            "findings": [{
+                "id": "unresolved-call:run:5",
+                "severity": "high",
+                "category": "unresolved_call",
+                "function": "run",
+                "callee_expression": "*f",
+                "stmt_id": 5,
+                "source_location": {"file": "indirect-call.c", "line": 28},
+                "message": "run calls through *f, which names no callee.",
+            }]
+        }
+    });
+    let items = check_incomplete_items(
+        Some(true),
+        &json!({"ok": true}),
+        &json!({"ok": true}),
+        &json!([]),
+        &wp,
+        &json!({"entries": []}),
+        WantedAnalyses::BOTH,
+    );
+    let entry = items
+        .iter()
+        .find(|item| item["code"] == json!(incomplete_code::INDIRECT_CALL_UNRESOLVED))
+        .unwrap_or_else(|| panic!("no indirect-call entry: {items:?}"));
+    assert_eq!(entry["function"], json!("run"));
+    assert_eq!(entry["callee_expression"], json!("*f"));
+    assert_eq!(entry["stmt_id"], json!(5));
+    assert_eq!(entry["source_location"]["line"], json!(28));
+
+    // Says plainly what it read, so a caller who has already written the clause
+    // is not left thinking the annotation did not take.
+    assert!(
+        entry["reports"].as_str().is_some_and(|text| text.contains("call shape")),
+        "{entry:?}"
+    );
+}
+
+/// The guidance names both halves of the fix and rules out the one a prover
+/// timeout would suggest.
+#[test]
+fn the_indirect_call_guidance_rules_out_a_longer_timeout() {
+    let text = gap_guidance(incomplete_code::INDIRECT_CALL_UNRESOLVED);
+    let text = text.as_str().expect("guidance is a string");
+    assert!(text.contains("calls"), "{text}");
+    assert!(text.contains("timeout"), "{text}");
+}

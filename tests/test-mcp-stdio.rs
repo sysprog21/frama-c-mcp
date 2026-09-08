@@ -10210,3 +10210,117 @@ async fn naming_a_profile_does_not_turn_off_the_runtime_error_checks() {
         "{with_rte:?}"
     );
 }
+
+/// An indirect call is reported as a missing annotation, not as a slow prover.
+///
+/// The fixture is a function whose body is one call through a pointer formal.
+/// Measured on Frama-C 33.0, WP leaves goals open there because with no calls
+/// clause it assumes the pointer may reach any function, including the caller
+/// itself, which makes the caller recursive. Those open goals reach the caller
+/// as GOAL_NOT_VALID with PROVER_TIMEOUT beside them, and the next action a
+/// prover timeout invites, more time, cannot close them.
+#[tokio::test]
+async fn an_indirect_call_is_reported_as_its_own_gap() {
+    let c_file = workspace_path("tests/fixtures/indirect-call.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "function": "run", "want": ["wp"], "timeout": 5}),
+    )
+    .await
+    .unwrap();
+
+    let entry = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .find(|item| item["code"] == "INDIRECT_CALL_UNRESOLVED")
+        .unwrap_or_else(|| panic!("no indirect-call entry: {check:?}"));
+
+    assert_eq!(entry["function"], json!("run"), "{entry:?}");
+    assert!(
+        entry["callee_expression"].as_str().is_some_and(|text| text.contains('f')),
+        "{entry:?}"
+    );
+    assert!(entry["source_location"]["line"].as_u64().is_some(), "{entry:?}");
+
+    // The guidance names both halves of the fix and rules out the one a prover
+    // timeout would send a caller to.
+    let guidance = check["incomplete_guidance"]["INDIRECT_CALL_UNRESOLVED"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no guidance: {check:?}"));
+    assert!(guidance.contains("calls"), "{guidance}");
+    assert!(guidance.contains("timeout"), "{guidance}");
+
+    let _ = client.cancel().await;
+}
+
+/// The annotated fixture proves, and still carries the code.
+///
+/// That is the over-report this item accepts rather than hides: the plug-in
+/// walks the AST and a statement's own annotations are not part of what it
+/// walks, so the finding reports the call shape and says so in its own text.
+/// Pinned because the alternative, a code that silently stops firing, would be
+/// a claim about the annotation that nothing here checks.
+#[tokio::test]
+async fn an_annotated_indirect_call_proves_and_still_reports_the_call_shape() {
+    let c_file = workspace_path("tests/fixtures/indirect-call-annotated.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "function": "run", "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    let counts = check["wp_goals"]["counts"].as_object().expect("counts");
+    assert!(!counts.is_empty(), "{check:?}");
+    assert!(counts.keys().all(|key| key.ends_with("/valid")), "{check:?}");
+
+    let entry = check["incomplete"]
+        .as_array()
+        .expect("incomplete array")
+        .iter()
+        .find(|item| item["code"] == "INDIRECT_CALL_UNRESOLVED")
+        .unwrap_or_else(|| panic!("the call is still indirect: {check:?}"));
+    assert!(
+        entry["reports"].as_str().is_some_and(|text| text.contains("call shape")),
+        "{entry:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A function with no indirect call carries no such code, so it is not simply
+/// always on.
+#[tokio::test]
+async fn a_direct_call_graph_carries_no_indirect_call_gap() {
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let c_file = c_file.to_str().expect("fixture path is utf-8");
+    let client = spawn_mcp_client(c_file).await;
+
+    let check = call_tool_json(
+        &client,
+        "check",
+        json!({"files": [c_file], "function": "main", "want": ["wp"], "timeout": 10}),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !check["incomplete"]
+            .as_array()
+            .expect("incomplete array")
+            .iter()
+            .any(|item| item["code"] == "INDIRECT_CALL_UNRESOLVED"),
+        "{check:?}"
+    );
+
+    let _ = client.cancel().await;
+}
