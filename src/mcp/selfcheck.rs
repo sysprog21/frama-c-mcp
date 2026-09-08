@@ -36,6 +36,10 @@ pub const AST_UTILS_REQUESTS: &[AstUtilsSpec] = &[
     ("plugins.ast-utils.getCilContext", ProbeKind::Get, true),
     ("plugins.ast-utils.getContractContext", ProbeKind::Get, true),
 
+    // Whole-program, so it takes null rather than a function name and the
+    // default probe payload is already right for it.
+    ("plugins.ast-utils.getContractFrontier", ProbeKind::Get, true),
+
     // Backs list {kind: "declarations"} through clause_origin_payload. It was
     // absent here while the count assertions all read this table's own length,
     // so they compared the constant against itself and a plug-in too old to

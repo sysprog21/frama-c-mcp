@@ -701,12 +701,17 @@ pub enum ListKind {
     Declarations,
     Sandboxes,
     Conclusions,
+
+    // Not a doc comment, for the reason ContextKind below records: schemars
+    // turns an annotated variant into a oneOf of consts and that changes the
+    // published schema. The functions a proof still needs a contract for.
+    ContractFrontier,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListParams {
     /// List kind: "files", "functions", "globals", "declarations",
-    /// "sandboxes", or "conclusions".
+    /// "sandboxes", "conclusions", or "contract_frontier".
     pub kind: ListKind,
     /// Filter conclusions by status: "verified" | "failed" | "unsound" |
     /// "blocked_on_callee" | "in_progress".

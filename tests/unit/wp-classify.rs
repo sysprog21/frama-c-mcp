@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use serde_json::json;
+use crate::server_fixture::lazy_server;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
 use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
@@ -2764,5 +2765,640 @@ fn a_model_frama_c_accepts_is_not_called_invalid() {
         }
         // Still a closed set: a name Frama-C would reject is refused here too.
         assert!(support.validate("NotAModel").is_err());
+    }
+}
+
+/// One log record as the getLogs request returns it.
+///
+/// The category is an option because the measurement that motivated this says
+/// WP does not set one for the memory-model warning: "-wp-warn-key
+/// hypothesis=inactive" leaves the warning in place on 32.1, and only
+/// "-wp-no-warn-memory-model" removes it.
+fn wp_log(message: &str, category: Option<&str>) -> serde_json::Value {
+    let mut record = json!({
+        "kind": "WARNING",
+        "plugin": "wp",
+        "message": message,
+        "source": {"file": "sep.c", "line": 6},
+    });
+    if let Some(category) = category {
+        record["category"] = json!(category);
+    }
+    record
+}
+
+/// The warning WP prints, verbatim from a Frama-C 32.1 run over
+/// "void two(int *p) { g = 1; *p = 2; }" with a contract over both locations.
+const HYPOTHESIS_WARNING: &str = "Memory model hypotheses for function 'two':\n\
+                                  /*@ behavior wp_typed:\n\
+                                  \x20     requires \\separated(p, &g); */\n\
+                                  void two(int *p);";
+
+#[test]
+fn a_memory_model_hypothesis_is_read_off_the_message_stream() {
+    let found = wp_memory_model_hypotheses(&[wp_log(HYPOTHESIS_WARNING, None)]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["function"], json!("two"));
+    assert_eq!(found[0]["hypotheses"], json!(["requires \\separated(p, &g);"]));
+    assert_eq!(found[0]["matched_by"], json!("message_text"));
+
+    // The location comes off the record rather than the text, because the
+    // server strips the "file:line:" prefix into its own field.
+    assert_eq!(found[0]["source_location"]["line"], json!(6));
+}
+
+/// The behavior wrapper and the redeclared prototype are not clauses.
+///
+/// Pasting either into a contract is a syntax error, and the whole point of
+/// carrying the text is that a caller can paste it.
+#[test]
+fn only_the_clause_lines_of_the_hypothesis_block_are_kept() {
+    let found = wp_memory_model_hypotheses(&[wp_log(HYPOTHESIS_WARNING, None)]);
+    let clauses = found[0]["hypotheses"].as_array().expect("array").clone();
+    assert!(
+        clauses.iter().all(|clause| clause.as_str().is_some_and(|c| c.starts_with("requires "))),
+        "{clauses:?}"
+    );
+    assert!(
+        !clauses.iter().any(|clause| clause.as_str().is_some_and(|c| c.contains("behavior")
+            || c.contains("void two"))),
+        "{clauses:?}"
+    );
+}
+
+/// A future Frama-C giving this warning a key must not silently fall back to
+/// prose matching, so the branch that fired is on the entry.
+#[test]
+fn a_keyed_hypothesis_warning_reports_that_it_matched_structurally() {
+    let found = wp_memory_model_hypotheses(&[wp_log(HYPOTHESIS_WARNING, Some("hypothesis"))]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["matched_by"], json!("log_category"));
+    assert_eq!(found[0]["function"], json!("two"));
+}
+
+/// The other WP warnings on the same stream are not hypotheses.
+///
+/// drain_messages keeps every WARNING, so this classifier sees the abort
+/// wording wp_backend_diagnosis reads and the RTE nag beside it.
+#[test]
+fn other_wp_warnings_are_not_read_as_hypotheses() {
+    let noise = [
+        wp_log("Missing RTE guards", None),
+        wp_log("Goal Preservation: running prover alt-ergo failed (see logs)", None),
+        wp_log("Missing 'calls' for default behavior", None),
+    ];
+    assert!(wp_memory_model_hypotheses(&noise).is_empty());
+}
+
+/// WP prints this once per function, and a check drains once, so a repeat is
+/// a second run_wp in the same call rather than a second hypothesis.
+#[test]
+fn one_function_yields_one_hypothesis_entry() {
+    let found = wp_memory_model_hypotheses(&[
+        wp_log(HYPOTHESIS_WARNING, None),
+        wp_log(HYPOTHESIS_WARNING, None),
+    ]);
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// Two functions are two entries, in the order WP warned about them.
+#[test]
+fn each_function_with_a_hypothesis_gets_its_own_entry() {
+    let other = "Memory model hypotheses for function 'three':\n\
+                 /*@ behavior wp_typed:\n\
+                 \x20     requires \\separated(q, &h); */\n\
+                 void three(int *q);";
+    let found = wp_memory_model_hypotheses(&[wp_log(HYPOTHESIS_WARNING, None), wp_log(other, None)]);
+    assert_eq!(found.len(), 2, "{found:?}");
+
+    // By function name, not by the order WP happened to warn. This array is
+    // hashed into the receipt through the incomplete[] digest, and WP's warning
+    // order is not a property of the program.
+    assert_eq!(found[0]["function"], json!("three"));
+    assert_eq!(found[1]["function"], json!("two"));
+}
+
+/// A record matched on category alone with wording this does not parse is
+/// reported with a null function rather than dropped, because dropping it
+/// would be the silence the first standing constraint forbids.
+#[test]
+fn a_keyed_warning_this_cannot_parse_is_reported_rather_than_dropped() {
+    let found = wp_memory_model_hypotheses(&[wp_log("some future wording", Some("hypothesis"))]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["function"], json!(null));
+    assert_eq!(found[0]["hypotheses"], json!([]));
+    assert_eq!(found[0]["matched_by"], json!("log_category"));
+}
+
+/// The plugin field is part of the structural match, so another plug-in's
+/// "hypothesis" category is not WP's.
+#[test]
+fn another_plugins_hypothesis_category_is_not_a_wp_memory_model_hypothesis() {
+    let mut record = wp_log("some other hypothesis", Some("hypothesis"));
+    record["plugin"] = json!("eva");
+    assert!(wp_memory_model_hypotheses(&[record]).is_empty());
+}
+
+/// A clause line elsewhere in the record is not a hypothesis.
+///
+/// The parse is scoped to the block between the marker and the closing token
+/// of the behavior comment. Before that scoping, any line in the whole record
+/// that ended in a semicolon and began with a clause keyword was reported as an
+/// assumed separation, which is a claim about the proof that WP never made.
+#[test]
+fn a_clause_outside_the_hypothesis_block_is_not_a_hypothesis() {
+    let text = "requires \\valid(q);\n\
+                Memory model hypotheses for function 'two':\n\
+                /*@ behavior wp_typed:\n\
+                \x20     requires \\separated(p, &g); */\n\
+                void two(int *p);\n\
+                ensures \\result == 0;";
+    let found = wp_memory_model_hypotheses(&[wp_log(text, None)]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["hypotheses"], json!(["requires \\separated(p, &g);"]));
+}
+
+/// Two blocks in one record are two functions, each with its own clauses.
+///
+/// Taking the first marker and then every clause in the record paired the first
+/// function's name with the second function's separations.
+#[test]
+fn two_hypothesis_blocks_in_one_record_do_not_share_clauses() {
+    let text = "Memory model hypotheses for function 'alpha':\n\
+                /*@ behavior wp_typed:\n\
+                \x20     requires \\separated(p, &g); */\n\
+                void alpha(int *p);\n\
+                Memory model hypotheses for function 'beta':\n\
+                /*@ behavior wp_typed:\n\
+                \x20     requires \\separated(q, &h); */\n\
+                void beta(int *q);";
+    let found = wp_memory_model_hypotheses(&[wp_log(text, None)]);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0]["function"], json!("alpha"));
+    assert_eq!(found[0]["hypotheses"], json!(["requires \\separated(p, &g);"]));
+    assert_eq!(found[1]["function"], json!("beta"));
+    assert_eq!(found[1]["hypotheses"], json!(["requires \\separated(q, &h);"]));
+}
+
+/// WP wraps a long clause, and a wrapped clause is still one clause.
+///
+/// Splitting on lines dropped it silently, which is the worst shape for this:
+/// the entry still appeared, so a reader had no way to tell a function with no
+/// hypotheses from one whose hypothesis was too long to print on one line.
+#[test]
+fn a_clause_wrapped_over_two_lines_is_one_clause() {
+    let text = "Memory model hypotheses for function 'wide':\n\
+                /*@ behavior wp_typed:\n\
+                \x20     requires \\separated(p, &g, &h, &i,\n\
+                \x20                        &j, &k); */\n\
+                void wide(int *p);";
+    let found = wp_memory_model_hypotheses(&[wp_log(text, None)]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        found[0]["hypotheses"],
+        json!(["requires \\separated(p, &g, &h, &i, &j, &k);"])
+    );
+}
+
+/// A CRLF stream is the same stream.
+#[test]
+fn carriage_returns_do_not_change_the_parse() {
+    let text = "Memory model hypotheses for function 'two':\r\n\
+                /*@ behavior wp_typed:\r\n\
+                \x20     requires \\separated(p, &g); */\r\n\
+                void two(int *p);";
+    let found = wp_memory_model_hypotheses(&[wp_log(text, None)]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["function"], json!("two"));
+    assert_eq!(found[0]["hypotheses"], json!(["requires \\separated(p, &g);"]));
+}
+
+/// Another plug-in quoting this text is not a statement about WP's model.
+///
+/// The structural branch already required the plug-in; the text branch did not,
+/// so any plug-in whose message contained the marker produced an entry.
+#[test]
+fn another_plugins_message_carrying_the_marker_is_not_a_hypothesis() {
+    let mut record = wp_log(HYPOTHESIS_WARNING, None);
+    record["plugin"] = json!("kernel");
+    assert!(wp_memory_model_hypotheses(&[record]).is_empty());
+}
+
+/// Repeated warnings this cannot parse are counted, not listed.
+///
+/// One entry each would let a stream of them consume the bounded sample and
+/// push out the functions a reader can act on.
+#[test]
+fn unparsed_hypothesis_warnings_are_counted_in_one_entry() {
+    let found = wp_memory_model_hypotheses(&[
+        wp_log("some future wording", Some("hypothesis")),
+        wp_log("some other future wording", Some("hypothesis")),
+        wp_log(HYPOTHESIS_WARNING, None),
+    ]);
+    assert_eq!(found.len(), 2, "{found:?}");
+    let unparsed = found
+        .iter()
+        .find(|entry| entry["function"] == json!(null))
+        .expect("an entry for what could not be parsed");
+    assert_eq!(unparsed["unparsed_warning_count"], json!(2));
+    assert_eq!(unparsed["matched_by"], json!("log_category"));
+}
+
+/// The clause sample is bounded and says how many it dropped, because an
+/// assumption omitted without a count is an assumption nobody knows about.
+#[test]
+fn the_clause_sample_reports_what_it_dropped() {
+    let mut block = String::from(
+        "Memory model hypotheses for function 'many':\n/*@ behavior wp_typed:\n",
+    );
+    for n in 0..20 {
+        block.push_str(&format!("      requires \\separated(p, &g{n});\n"));
+    }
+    block.push_str("*/\nvoid many(int *p);");
+    let found = wp_memory_model_hypotheses(&[wp_log(&block, None)]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["hypothesis_count"], json!(20));
+    assert_eq!(found[0]["hypotheses"].as_array().expect("array").len(), 16);
+    assert_eq!(found[0]["hypotheses_truncated"], json!(true));
+}
+
+/// A function with one hypothesis says so rather than leaving the reader to
+/// infer it from the sample length.
+#[test]
+fn an_untruncated_clause_list_says_it_is_untruncated() {
+    let found = wp_memory_model_hypotheses(&[wp_log(HYPOTHESIS_WARNING, None)]);
+    assert_eq!(found[0]["hypothesis_count"], json!(1));
+    assert_eq!(found[0]["hypotheses_truncated"], json!(false));
+}
+
+/// The probe wrapper's failure path, exercised rather than hand-built.
+///
+/// A frama-c that exits nonzero has not shown that the run assumed nothing, so
+/// the wrapper reports "ran": false with the exit code and a capped excerpt of
+/// what it said, and still carries whatever it managed to parse first. The
+/// binary here is "false", which exits 1 and prints nothing: the cheapest way
+/// to reach that arm without a Frama-C.
+#[tokio::test]
+async fn a_probe_whose_frama_c_fails_is_not_a_clean_probe() {
+    let options = frama_c_mcp::mcp::server::ProjectLoadOptions::default();
+    let probe = frama_c_mcp::mcp::server::wpcli::run_wp_memory_model_probe(
+        "false",
+        &["a.c".to_string()],
+        &options,
+        false,
+        Some("Typed+nocast"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(probe["exit_code"], json!(1), "{probe:?}");
+    assert_eq!(probe["hypotheses"], json!([]), "{probe:?}");
+    assert!(
+        probe["reason"].as_str().is_some_and(|text| text.contains("exited 1")),
+        "{probe:?}"
+    );
+    assert_eq!(probe["stderr_truncated"], json!(false), "{probe:?}");
+}
+
+/// A binary that is not there at all is a probe that did not run, with the
+/// reason naming the failure rather than an empty list implying none.
+#[tokio::test]
+async fn a_probe_whose_binary_is_missing_is_not_a_clean_probe() {
+    let options = frama_c_mcp::mcp::server::ProjectLoadOptions::default();
+    let probe = frama_c_mcp::mcp::server::wpcli::run_wp_memory_model_probe(
+        "/nonexistent/frama-c-that-is-not-installed",
+        &["a.c".to_string()],
+        &options,
+        false,
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(probe["hypotheses"], json!([]), "{probe:?}");
+    assert!(
+        probe["reason"].as_str().is_some_and(|text| text.contains("could not be started")),
+        "{probe:?}"
+    );
+}
+
+/// No files is a probe with nothing to ask about, and it says so.
+#[tokio::test]
+async fn a_probe_with_no_files_does_not_run() {
+    let options = frama_c_mcp::mcp::server::ProjectLoadOptions::default();
+    let probe = frama_c_mcp::mcp::server::wpcli::run_wp_memory_model_probe(
+        "false", &[], &options, false, None, &[], None,
+    )
+    .await;
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(probe["reason"], json!("no source files available"), "{probe:?}");
+}
+
+/// A stand-in frama-c whose behaviour depends on which prover it was given.
+///
+/// The isolated retry runs one process per prover and reads the hypotheses out
+/// of their combined output, so pinning what it does with disagreeing attempts
+/// needs the attempts to disagree. Each arm is "printf then exit", which is the
+/// shape of a frama-c that warned and then either finished or died.
+fn fake_frama_c_per_prover(dir: &std::path::Path, arms: &[(&str, &str, i32)]) -> String {
+    let mut script = String::from("#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n");
+    for (prover, output, code) in arms {
+        script.push_str(&format!(
+            "    {prover}) printf '%s' \"{output}\"; exit {code};;\n"
+        ));
+    }
+    script.push_str("  esac\ndone\nexit 0\n");
+    write_executable(dir, &script)
+}
+
+/// Put an executable shell script in a directory and answer its path.
+///
+/// Shared because three tests here need a frama-c stand-in and the write plus
+/// chmod plus path conversion is the same three lines each time; only the
+/// script body differs.
+fn write_executable(dir: &std::path::Path, script: &str) -> String {
+    let path = dir.join("fake-frama-c");
+    std::fs::write(&path, script).expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    path.display().to_string()
+}
+
+async fn isolated_retry_probe(frama_c_path: String, provers: Vec<String>) -> serde_json::Value {
+    let server = lazy_server(frama_c_path);
+    let params = RunWpParams::default();
+    let result = server
+        .run_isolated_wp_retries(frama_c_mcp::mcp::server::wpcli::IsolatedWpRetry {
+            files: vec!["a.c".to_string()],
+            project_options: frama_c_mcp::mcp::server::ProjectLoadOptions::default(),
+            rte_enabled: false,
+            functions: vec!["two".to_string()],
+            reported_functions: vec!["two".to_string()],
+            provers,
+            params: &params,
+            scope: "main",
+        })
+        .await
+        .expect("the retry path answers with a payload");
+    result
+        .structured_content
+        .expect("a retry payload is an object")["memory_model_probe"]
+        .clone()
+}
+
+/// An isolated retry whose Frama-C attempts all failed has not read the
+/// assumptions, even if one of them emitted an empty diagnostic stream.
+///
+/// Driven through run_isolated_wp_retries rather than asserted on a
+/// hand-written payload. The earlier version built the object the production
+/// code produces and then checked that the gap readers agreed with it, which
+/// passed with the accumulation in wpcli.rs reverted entirely.
+#[tokio::test]
+async fn a_retry_with_only_failed_attempts_is_not_a_clean_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_frama_c_per_prover(dir.path(), &[("alt-ergo", "", 3)]);
+    let probe = isolated_retry_probe(fake, vec!["alt-ergo".to_string()]).await;
+
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(probe["hypotheses"], json!([]), "{probe:?}");
+    assert_eq!(
+        probe["read_from"],
+        json!("the isolated retry's own captured output"),
+        "{probe:?}"
+    );
+
+    assert!(frama_c_mcp::mcp::server::checkgaps::memory_model_hypothesis_gap(&probe).is_none());
+    let gap = frama_c_mcp::mcp::server::checkgaps::memory_model_unchecked_gap(
+        &probe,
+        frama_c_mcp::mcp::server::checkgaps::WantedAnalyses::BOTH,
+    )
+    .expect("an unread assumption is a gap");
+    assert!(
+        gap["reason"].as_str().is_some_and(|text| text.contains("could not read")),
+        "{gap:?}"
+    );
+}
+
+/// A successful attempt's reading outranks a failed attempt's partial one.
+///
+/// The two halves used to be independent: ran came from any attempt exiting 0
+/// and the list came from the first attempt to print anything, whoever that
+/// was. So a prover that printed one separation and then died, followed by one
+/// that succeeded and printed both, answered ran:true beside the short list,
+/// and a caller reading the flag was told a partial reading was complete. A
+/// frama-c that exits 0 read the whole program, so its answer wins even when
+/// the failed attempt printed more.
+#[tokio::test]
+async fn a_successful_attempt_supplies_the_hypotheses_over_a_failed_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let partial = "Memory model hypotheses for function 'two':\n                   /*@ behavior wp_typed:\n                   requires \\separated(p, &g); */\n";
+    let complete = "Memory model hypotheses for function 'two':\n                    /*@ behavior wp_typed:\n                    requires \\separated(p, &g);\n                    requires \\separated(p, &h); */\n";
+    let fake = fake_frama_c_per_prover(
+        dir.path(),
+        &[("alt-ergo", partial, 3), ("z3", complete, 0)],
+    );
+    let probe = isolated_retry_probe(fake, vec!["alt-ergo".to_string(), "z3".to_string()]).await;
+
+    assert_eq!(probe["ran"], json!(true), "{probe:?}");
+    let read = probe["hypotheses"][0]["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no hypotheses: {probe:?}"))
+        .len();
+    assert_eq!(read, 2, "the complete reading has to win: {probe:?}");
+}
+
+/// A failing Frama-C that still printed a hypothesis has that hypothesis kept.
+///
+/// The two halves are separate: what was read, and whether the reading was
+/// complete. A hypothesis Frama-C printed is one WP took, so dropping it
+/// because the process later failed would hide a real assumption, while the
+/// ran flag beside it already says the list may be short. Both the isolated
+/// retry and the standalone probe answer this the same way.
+#[tokio::test]
+async fn a_failed_probe_keeps_the_hypotheses_it_managed_to_read() {
+    // A shell that prints the warning and then exits non-zero, which is the
+    // shape of a Frama-C that warned and then died on a later phase.
+    let script = "printf '%s\\n' \"Memory model hypotheses for function 'two':\" \
+                  '/*@ behavior wp_typed:' '      requires \\separated(p, &g); */' \
+                  'void two(int *p);'; exit 3";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = write_executable(dir.path(), &format!("#!/bin/sh\n{script}\n"));
+
+    let probe = frama_c_mcp::mcp::server::wpcli::run_wp_memory_model_probe(
+        &fake,
+        &["a.c".to_string()],
+        &frama_c_mcp::mcp::server::ProjectLoadOptions::default(),
+        false,
+        None,
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+    assert_eq!(probe["exit_code"], json!(3), "{probe:?}");
+    assert_eq!(probe["hypotheses"][0]["function"], json!("two"), "{probe:?}");
+    assert_eq!(
+        probe["hypotheses"][0]["hypotheses"],
+        json!(["requires \\separated(p, &g);"]),
+        "{probe:?}"
+    );
+
+    // The gap builders read it the way the flag says: no hypothesis entry from
+    // an incomplete reading, and an unchecked-assumption entry instead.
+    assert!(frama_c_mcp::mcp::server::checkgaps::memory_model_hypothesis_gap(&probe).is_none());
+    assert!(frama_c_mcp::mcp::server::checkgaps::memory_model_unchecked_gap(
+        &probe,
+        frama_c_mcp::mcp::server::checkgaps::WantedAnalyses::BOTH,
+    )
+    .is_some());
+}
+
+/// Two failing attempts keep both readings, not whichever printed first.
+///
+/// The attempts die at different points, so each prints a different prefix of
+/// what WP had to say, and keeping only the first drops what a later one got
+/// further to reach. The reading over-reports nothing, because a hypothesis is
+/// a property of the function and the model rather than of the prover an
+/// attempt used. The ran flag still says the reading is incomplete.
+///
+/// Ordered by function name, not by which attempt printed first. The failing
+/// attempts are accumulated as text and parsed once, so the sort
+/// collect_memory_model_hypotheses applies is the sort here: this array is
+/// hashed into the receipt through incomplete[], and which prover died first
+/// is not a property of the program.
+#[tokio::test]
+async fn every_failed_attempt_contributes_what_it_printed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = "Memory model hypotheses for function 'two':\n                   /*@ behavior wp_typed:\n                   requires \\separated(p, &g); */\n";
+    let second = "Memory model hypotheses for function 'three':\n                   /*@ behavior wp_typed:\n                   requires \\separated(q, &h); */\n";
+    let fake = fake_frama_c_per_prover(
+        dir.path(),
+        &[("alt-ergo", first, 3), ("z3", second, 4)],
+    );
+    let probe = isolated_retry_probe(fake, vec!["alt-ergo".to_string(), "z3".to_string()]).await;
+
+    // Neither attempt exited 0, so the reading is still reported as partial.
+    assert_eq!(probe["ran"], json!(false), "{probe:?}");
+
+    let functions: Vec<&str> = probe["hypotheses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no hypotheses: {probe:?}"))
+        .iter()
+        .filter_map(|entry| entry["function"].as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["three", "two"],
+        "both readings, ordered by name rather than by attempt: {probe:?}"
+    );
+}
+
+/// The merge counts one unreadable warning once, however many attempts saw it.
+///
+/// Every attempt analyses the same program under the same model, so each prints
+/// the same warnings. Summing the sentinel counts would report one warning WP
+/// printed twice as two warnings this server could not read, which is the kind
+/// of over-claim the whole payload exists to avoid. The larger of the two is
+/// the honest answer.
+#[test]
+fn merging_two_readings_does_not_multiply_the_unread_count() {
+    let sentinel = |n: u64| {
+        json!([{
+            "function": null,
+            "hypotheses": [],
+            "hypothesis_count": 0,
+            "hypotheses_truncated": false,
+            "unparsed_warning_count": n,
+            "source_location": null,
+            "matched_by": "log_category",
+        }])
+    };
+    let merged = frama_c_mcp::mcp::server::wpclass::merge_memory_model_hypotheses(
+        sentinel(2).as_array().expect("array").clone(),
+        sentinel(2).as_array().expect("array").clone(),
+    );
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!(merged[0]["unparsed_warning_count"], json!(2), "{merged:?}");
+}
+
+/// The merge orders by function name and puts the sentinel last, because this
+/// array is hashed into the receipt and attempt order is not a property of the
+/// program.
+#[test]
+fn merging_two_readings_orders_by_name_with_the_sentinel_last() {
+    let named = |function: &str| {
+        json!([{
+            "function": function,
+            "hypotheses": [format!("requires \\separated({function}, &g);")],
+            "hypothesis_count": 1,
+            "hypotheses_truncated": false,
+            "source_location": null,
+            "matched_by": "message_text",
+        }])
+    };
+    let mut second = named("alpha").as_array().expect("array").clone();
+    second.push(json!({
+        "function": null,
+        "hypotheses": [],
+        "hypothesis_count": 0,
+        "hypotheses_truncated": false,
+        "unparsed_warning_count": 1,
+        "source_location": null,
+        "matched_by": "log_category",
+    }));
+    let merged = frama_c_mcp::mcp::server::wpclass::merge_memory_model_hypotheses(
+        named("zeta").as_array().expect("array").clone(),
+        second,
+    );
+    let order: Vec<&str> = merged
+        .iter()
+        .map(|entry| entry["function"].as_str().unwrap_or("<sentinel>"))
+        .collect();
+    assert_eq!(order, vec!["alpha", "zeta", "<sentinel>"], "{merged:?}");
+}
+
+/// Two readings of one function keep the one that got further into the block.
+///
+/// An attempt that died mid-block printed a prefix of it, so the readings are
+/// not interchangeable and first-wins drops clauses WP really emitted. That is
+/// the same under-report the merge exists to prevent, one level below the
+/// function it was written for.
+#[test]
+fn the_longer_reading_of_a_function_wins_over_the_first() {
+    let reading = |clauses: &[&str]| {
+        json!([{
+            "function": "two",
+            "hypotheses": clauses,
+            "hypothesis_count": clauses.len(),
+            "hypotheses_truncated": false,
+            "source_location": null,
+            "matched_by": "message_text",
+        }])
+        .as_array()
+        .expect("array")
+        .clone()
+    };
+    let died_early = reading(&["requires \\separated(p, &g);"]);
+    let got_further = reading(&["requires \\separated(p, &g);", "requires \\separated(p, &h);"]);
+
+    // Whichever order the attempts arrive in, the longer reading survives.
+    for (first, second) in [
+        (died_early.clone(), got_further.clone()),
+        (got_further.clone(), died_early.clone()),
+    ] {
+        let merged = frama_c_mcp::mcp::server::wpclass::merge_memory_model_hypotheses(first, second);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0]["hypothesis_count"], json!(2), "{merged:?}");
+        assert_eq!(
+            merged[0]["hypotheses"].as_array().map(Vec::len),
+            Some(2),
+            "a clause WP printed was dropped: {merged:?}"
+        );
     }
 }

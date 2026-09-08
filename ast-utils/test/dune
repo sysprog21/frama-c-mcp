@@ -17,3 +17,8 @@
  (alias runtest)
  (deps (source_tree regressions))
  (action (run ./regressions/run-payload-shapes.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions))
+ (action (run ./regressions/run-contract-frontier.sh)))

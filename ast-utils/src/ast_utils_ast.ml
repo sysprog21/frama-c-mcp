@@ -1078,6 +1078,176 @@ let direct_callers_of_kf target =
   ) []
   |> List.rev
 
+(* The functions a proof of this program still needs a contract for.
+
+   Seeded from every defined function that already carries a contract, walked
+   down the syntactic call graph, and reporting the defined functions reached
+   that way which carry none. That is the specification frontier of the
+   reviewed artifact: the work list a person has to write, as opposed to
+   ASSUMED_CALLEE_CONTRACT, which is one hop from whatever a check happened to
+   target and answers about one proof rather than about the program.
+
+   Emptiness of the funspec is the test rather than its presence. Frama-C
+   generates a default spec for every function, so "Annotations.has_funspec"
+   answers true for a function nobody ever specified, and seeding from that
+   would put the whole program in the reachable set and report nothing.
+
+   The unresolved call sites travel with it. A frontier computed over a call
+   graph that silently dropped the calls through function pointers is a work
+   list that under-reports, and the caller cannot tell that from a short one. *)
+
+let kf_is_defined kf =
+  try ignore (Kernel_function.get_definition kf); true
+  with Kernel_function.No_Definition -> false
+
+let kf_has_contract kf =
+  let spec = Annotations.funspec kf in
+  not (Cil.is_empty_funspec spec)
+
+let frontier_function_to_json kf callers =
+  `Assoc [
+    ("function", `String (Kernel_function.get_name kf));
+    ("loc", loc_to_json (Kernel_function.get_location kf));
+    ("called_by",
+     `List (List.map (fun caller -> `String (Kernel_function.get_name caller)) callers));
+  ]
+
+let unresolved_site_to_json kf site =
+  match site with
+  | `Assoc fields -> `Assoc (("function", `String (Kernel_function.get_name kf)) :: fields)
+  | other -> other
+
+let get_contract_frontier () : Yojson.Basic.t =
+  let defined = Globals.Functions.fold
+      (fun kf acc -> if kf_is_defined kf then kf :: acc else acc) []
+  in
+
+  (* The kernel's own collections over Kernel_function, rather than two local
+     Make applications of the comparator it already carries. *)
+  let module KfSet = Kernel_function.Set in
+  let module KfMap = Kernel_function.Map in
+
+  (* One AST walk per defined function, and only one. Three consumers below
+     read the call graph: the downward walk, the callers reported beside each
+     frontier entry, and the unresolved sites. Asking the visitor again for
+     each of them made the callers alone cost one walk per (missing, defined)
+     pair, so a thousand-function program with five hundred uncontracted
+     callees ran half a million whole-body visits inside the single request
+     this tool exists to answer in one round trip. *)
+  let call_info =
+    List.fold_left
+      (fun acc kf -> KfMap.add kf (direct_call_info_of_kf kf) acc)
+      KfMap.empty defined
+  in
+  let call_info_of kf =
+    match KfMap.find_opt kf call_info with Some pair -> pair | None -> ([], [])
+  in
+  let callees_of kf = fst (call_info_of kf) in
+  let unresolved_of kf = snd (call_info_of kf) in
+
+  (* Inverted once, in the traversal order the fold visits, so each entry's
+     "called_by" reads the way a per-function query used to answer. A function
+     never lists itself.
+
+     "defined" is already reverse-Globals order and "add" prepends, so folding
+     it directly puts each list in Globals order, which is what a per-function
+     query yields. Folding the reversal and reversing again on every lookup
+     reached the same order by doing the work twice. *)
+  let callers_of =
+    let add acc caller callee =
+      if Kernel_function.equal caller callee then acc
+      else
+        let previous = match KfMap.find_opt callee acc with Some l -> l | None -> [] in
+        if List.exists (Kernel_function.equal caller) previous then acc
+        else KfMap.add callee (caller :: previous) acc
+    in
+    let table =
+      List.fold_left
+        (fun acc caller -> List.fold_left (fun acc callee -> add acc caller callee)
+            acc (callees_of caller))
+        KfMap.empty defined
+    in
+    fun kf -> match KfMap.find_opt kf table with Some l -> l | None -> []
+  in
+
+  (* Worklist from the contracted functions downwards. A function is in the
+     reachable set when a contracted function calls it, directly or through
+     other functions; a contracted function is not itself in it, since the
+     question is what the contracts already written do not cover. *)
+  (* One funspec lookup per defined function. Annotations.funspec materialises
+     the default spec rather than answering from a cache, and this predicate was
+     asked three times for every function: once to seed the queue, once to
+     filter the missing list, once more to count. That is 2n avoidable calls in
+     the request whose whole claim is that it answers in one round trip, and the
+     call graph directly above already went to some trouble to be walked once. *)
+  let contracted =
+    List.fold_left
+      (fun acc kf -> if kf_has_contract kf then KfSet.add kf acc else acc)
+      KfSet.empty defined
+  in
+  let queue = Queue.create () in
+  List.iter (fun kf -> if KfSet.mem kf contracted then Queue.add kf queue) defined;
+  let reachable = ref KfSet.empty in
+
+  (* Every body the walk actually read: the contracted seeds plus everything
+     reached from them. Kept because the unresolved sites below are a statement
+     about this walk, and a function outside it was never looked down. *)
+  let walked = ref KfSet.empty in
+  while not (Queue.is_empty queue) do
+    let caller = Queue.take queue in
+    walked := KfSet.add caller !walked;
+    List.iter
+      (fun callee ->
+         if kf_is_defined callee && not (KfSet.mem callee !reachable) then begin
+           reachable := KfSet.add callee !reachable;
+           Queue.add callee queue
+         end)
+      (callees_of caller)
+  done;
+
+  let missing =
+    List.filter (fun kf -> KfSet.mem kf !reachable && not (KfSet.mem kf contracted)) defined
+  in
+  let missing =
+    List.sort
+      (fun a b ->
+         let file kf = Ast_utils_compat.loc_file (Kernel_function.get_location kf) in
+         let line kf = Ast_utils_compat.loc_line (Kernel_function.get_location kf) in
+         let c = String.compare (file a) (file b) in
+         if c <> 0 then c
+         else
+           let c = Int.compare (line a) (line b) in
+           if c <> 0 then c
+           else String.compare (Kernel_function.get_name a) (Kernel_function.get_name b))
+      missing
+  in
+  let unresolved =
+    List.concat_map
+      (fun kf -> List.map (unresolved_site_to_json kf) (unresolved_of kf))
+      (List.sort
+         (fun a b -> String.compare (Kernel_function.get_name a) (Kernel_function.get_name b))
+         (List.filter (fun kf -> KfSet.mem kf !walked) defined))
+  in
+  `Assoc [
+    ("contracted_count", `Int (KfSet.cardinal contracted));
+    ("defined_count", `Int (List.length defined));
+    ("missing_count", `Int (List.length missing));
+    ("missing",
+     `List (List.map (fun kf -> frontier_function_to_json kf (callers_of kf)) missing));
+
+    (* Not a detail of the list above. A call this walk could not follow is a
+       branch of the call graph nobody looked down, so a caller reading a short
+       missing list needs to know one was there.
+
+       Scoped to the bodies the walk read, for the same reason. An indirect
+       call in a function no contract reaches hid nothing from the frontier,
+       and reporting it would answer "call_graph_complete: false" on a program
+       whose frontier is complete, which is the field saying nothing at all on
+       any codebase with a callback anywhere in it. *)
+    ("unresolved_call_sites", `List unresolved);
+    ("call_graph_complete", `Bool (unresolved = []));
+  ]
+
 let get_contract_context (kf : kernel_function) : Yojson.Basic.t =
   let callees, unresolved_callees = direct_call_info_of_kf kf in
   `Assoc [

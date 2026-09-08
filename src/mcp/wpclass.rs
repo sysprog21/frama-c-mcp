@@ -1771,6 +1771,339 @@ pub fn wp_backend_diagnosis(
     })
 }
 
+/// The memory-model hypotheses WP assumed while discharging this run's goals.
+///
+/// WP's Typed model is sound for a function only under separation conditions it
+/// does not derive: a pointer formal and a global address in one frame are
+/// distinct locations to the model whether or not the caller keeps them apart.
+/// WP states them and proves the function anyway. Measured on Frama-C 32.1,
+/// "void two(int *p) { g = 1; *p = 2; }" with a contract over both locations
+/// proves every goal, and a caller passing "&g" proves too, while at run time
+/// the postcondition is false. So a goal record cannot carry this: every goal
+/// is valid, and the only evidence is the warning.
+///
+/// Read off the message stream for the same reason "wp_backend_diagnosis" is,
+/// and it is the whole reason "drain_messages" keeps WARNING records.
+///
+/// Two matchers, in that order, and both require the record to be WP's. The
+/// structural one is a "category" of "hypothesis", which is what the log record
+/// getLogs returns carries for a warning emitted under a warning key. Measured
+/// on 32.1 that is not this warning: "-wp-warn-key hypothesis=inactive" leaves
+/// it in place and only "-wp-no-warn-memory-model" removes it, so the category
+/// is absent and the text matcher is what fires. The structural branch is kept
+/// because it costs one comparison and a later Frama-C giving this warning a
+/// key would otherwise be a silent regression to prose matching. Each entry
+/// says which branch produced it, so an empty result and a missed category are
+/// different answers.
+///
+/// Ordered by function name rather than by arrival. The result reaches a
+/// receipt through the incomplete[] digest, which hashes this array as it
+/// stands, and WP's warning order is not a property of the program.
+pub fn wp_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    collect_memory_model_hypotheses(messages)
+}
+
+/// A hypothesis entry's function, borrowed.
+///
+/// as_str already yields a slice of the entry and every caller only reads it,
+/// so the owned form allocated and freed twice per comparison for an ordering
+/// that never needed one.
+fn hypothesis_function_name(entry: &serde_json::Value) -> &str {
+    entry.get("function").and_then(|value| value.as_str()).unwrap_or_default()
+}
+
+/// Two readings of the same program's hypotheses, merged.
+///
+/// For the isolated retry, which runs one frama-c per prover and can have
+/// several die at different points, each printing a different prefix of what
+/// WP had to say. Keeping one reading drops what another got further to reach,
+/// and keeping every attempt's raw output to parse at the end grows with the
+/// number of attempts times the size of a WP log.
+///
+/// The rules are the collector's, applied to records instead of to text.
+/// Deduplicated by function, because a hypothesis is a property of the
+/// function and the model rather than of the prover an attempt used.
+///
+/// Where both readings name one function the longer wins, not the first. An
+/// attempt that died inside a block printed a prefix of it, so two readings of
+/// one function are not interchangeable, and taking the first is the same
+/// under-report this merge exists to prevent, one level down. The whole entry
+/// is replaced rather than the clause lists unioned, because hypothesis_count,
+/// the bounded sample and the truncation flag are three views of one parse and
+/// mixing two parses makes them disagree.
+///
+/// The unparsed count is the larger of the two rather than the sum, because
+/// every attempt analyses the same program and prints the same unreadable
+/// warnings, so adding them would report one warning as several.
+///
+/// Sorted by name with the sentinel last, because this array is hashed into
+/// the receipt through incomplete[] and which prover died first is not a
+/// property of the program.
+pub fn merge_memory_model_hypotheses(
+    into: Vec<serde_json::Value>,
+    from: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let unparsed_of = |entries: &[serde_json::Value]| -> u64 {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64)
+            })
+            .sum()
+    };
+    let unparsed = unparsed_of(&into).max(unparsed_of(&from));
+    let named =
+        |entry: &serde_json::Value| entry.get("function").is_some_and(|name| !name.is_null());
+
+    let clauses = |entry: &serde_json::Value| -> u64 {
+        entry.get("hypothesis_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+    };
+    let mut merged: Vec<serde_json::Value> = into.into_iter().filter(named).collect();
+    for entry in from.into_iter().filter(named) {
+        match merged.iter_mut().find(|kept| kept.get("function") == entry.get("function")) {
+            Some(kept) if clauses(&entry) > clauses(kept) => *kept = entry,
+            Some(_) => {}
+            None => merged.push(entry),
+        }
+    }
+    merged
+        .sort_by(|left, right| hypothesis_function_name(left).cmp(hypothesis_function_name(right)));
+    if unparsed > 0 {
+        merged.push(json!({
+            "function": null,
+            "hypotheses": [],
+            "hypothesis_count": 0,
+            "hypotheses_truncated": false,
+            "unparsed_warning_count": unparsed,
+            "source_location": serde_json::Value::Null,
+            "matched_by": "log_category",
+        }));
+    }
+    merged
+}
+
+/// The same reading, over the raw output of a command-line Frama-C run.
+///
+/// This is the entry point that has input in practice. The socket never
+/// carries the warning, so the record-level reader above answers empty on
+/// every real session and is kept for the one path that does see WP warnings
+/// as records, and as the place the record shape is pinned by tests.
+///
+/// The text arrives as one blob rather than as log records, so it is wrapped in
+/// a single synthetic record carrying WP's plug-in name. The block scoping
+/// inside does the rest: a command-line run prints every function's block into
+/// one stream, and the parse is per block rather than per record.
+pub fn wp_memory_model_hypotheses_in_text(text: &str) -> Vec<serde_json::Value> {
+    collect_memory_model_hypotheses(&[json!({
+        "kind": "WARNING",
+        "plugin": "wp",
+        "message": text,
+    })])
+}
+
+fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    // The fixed prefix WP prints before the function name. Unlike the abort
+    // wording, this is not a label drawn from a table of goal kinds: it is
+    // emitted once per function, and the function's own name follows it in
+    // quotes, so the match identifies a function rather than a class of goals.
+    const MARKER: &str = "Memory model hypotheses for function";
+
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    let mut unparsed = 0usize;
+    let mut unparsed_source = json!(null);
+    let mut unparsed_matched_by = "log_category";
+
+    for message in messages {
+        // Both branches require WP. Another plug-in quoting this text in a
+        // message of its own is not a statement about WP's memory model, and
+        // another plug-in's "hypothesis" category is its own.
+        if message.get("plugin").and_then(|value| value.as_str()) != Some("wp") {
+            continue;
+        }
+        let text = message
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let by_category =
+            message.get("category").and_then(|value| value.as_str()) == Some("hypothesis");
+        let blocks = hypothesis_blocks(text, MARKER);
+        if !by_category && blocks.is_empty() {
+            continue;
+        }
+        let matched_by = if by_category { "log_category" } else { "message_text" };
+
+        // A record matched on category alone whose wording this cannot parse is
+        // counted rather than dropped, because dropping it would be the silence
+        // the fail-loud rule forbids, and counted rather than listed because
+        // repeats of it would otherwise consume the bounded sample below.
+        if blocks.is_empty() {
+            unparsed += 1;
+            if unparsed == 1 {
+                unparsed_source = message.get("source").cloned().unwrap_or_else(|| json!(null));
+                unparsed_matched_by = matched_by;
+            }
+            continue;
+        }
+
+        for (function, block) in blocks {
+            // One entry per function. WP prints this once per function per run,
+            // and a check drains once, so a repeat here is a second run_wp in
+            // the same call rather than a second hypothesis.
+            if found
+                .iter()
+                .any(|entry| entry.get("function").and_then(|f| f.as_str()) == Some(&*function))
+            {
+                continue;
+            }
+            let (hypotheses, total) = hypothesis_clauses(&block);
+            found.push(json!({
+                "function": function,
+                "hypotheses": hypotheses,
+                "hypothesis_count": total,
+                "hypotheses_truncated": total > hypotheses.len(),
+                "source_location": message.get("source").cloned().unwrap_or_else(|| json!(null)),
+                "matched_by": matched_by,
+            }));
+        }
+    }
+
+    found.sort_by(|left, right| {
+        hypothesis_function_name(left).cmp(hypothesis_function_name(right))
+    });
+
+    if unparsed > 0 {
+        found.push(json!({
+            "function": null,
+            "hypotheses": [],
+            "hypothesis_count": 0,
+            "hypotheses_truncated": false,
+            "unparsed_warning_count": unparsed,
+            "source_location": unparsed_source,
+            "matched_by": unparsed_matched_by,
+        }));
+    }
+    found
+}
+
+/// Every hypothesis block in one warning, as (function, block text) pairs.
+///
+/// Scoped to the block rather than to the record. A clause line anywhere else
+/// in the message is not a hypothesis, and a record carrying the marker twice
+/// would otherwise pair the first function with every clause in it.
+///
+/// The block runs from the marker to the closing "*/" of the behavior comment
+/// WP prints, or to the next marker when there is no closing token, so a
+/// truncated message yields the clauses it does carry rather than nothing.
+fn hypothesis_blocks(text: &str, marker: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(marker) {
+        let after = &rest[at + marker.len()..];
+        let Some(function) = quoted_name(after) else {
+            rest = after;
+            continue;
+        };
+        let stop = match (after.find("*/"), after.find(marker)) {
+            (Some(close), Some(next)) => close.min(next),
+            (Some(close), None) => close,
+            (None, Some(next)) => next,
+            (None, None) => after.len(),
+        };
+        blocks.push((function, after[..stop].to_string()));
+        rest = &after[stop..];
+    }
+    blocks
+}
+
+/// The name between the first pair of single quotes.
+///
+/// Returns None rather than a guess when the shape is not the one measured,
+/// which is what makes a category-only match visible in the payload instead of
+/// inventing a name.
+fn quoted_name(text: &str) -> Option<String> {
+    let open = text.find('\'')?;
+    let rest = &text[open + 1..];
+    let close = rest.find('\'')?;
+    let name = &rest[..close];
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Where a clause keyword starts in a collapsed segment, at a word boundary.
+///
+/// A boundary check rather than a bare find, so an identifier ending in one of
+/// these words does not open a clause that then swallows the text before it.
+fn clause_keyword_at(text: &str, keyword: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(at) = text[from..].find(keyword) {
+        let at = from + at;
+        let boundary = at == 0
+            || text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| !previous.is_alphanumeric() && previous != '_');
+        if boundary {
+            return Some(at);
+        }
+        from = at + keyword.len();
+    }
+    None
+}
+
+/// The clause list of one hypothesis block, with the untruncated count.
+///
+/// Split on the statement terminator rather than on lines, because a clause WP
+/// wraps over two lines is one clause and a line-wise reader drops it silently.
+/// The behavior wrapper and the redeclared prototype are not clauses: pasting
+/// either into a contract is a syntax error, and the point of carrying the text
+/// is that a caller can paste it.
+fn hypothesis_clauses(block: &str) -> (Vec<String>, usize) {
+    // Bounded because this goes in a payload. WP prints one clause per
+    // separated pair, so a function with many pointer formals over many globals
+    // is quadratic in principle; measured runs print one or two. The caller
+    // reports the untruncated count beside the sample.
+    const CLAUSE_SAMPLE: usize = 16;
+
+    let mut clauses: Vec<String> = Vec::new();
+
+    // Dedup against every clause seen, not against the bounded sample. Reading
+    // the sample was wrong past its cap: once it stops growing, a repeat of a
+    // clause that never made it in is no longer recognised as a repeat, and the
+    // count reported beside the sample rises for text WP printed twice.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    for statement in block.split(';') {
+        // Collapse the whitespace WP uses to indent a wrapped clause, so a
+        // two-line clause reads as the one line a caller pastes.
+        let collapsed = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The clause does not start the segment. WP opens the block with the
+        // function name and a "behavior wp_typed:" header, and the split leaves
+        // both glued to the first clause, so the keyword is found rather than
+        // matched at position zero. Earliest keyword, because the header
+        // precedes it; at a word boundary, so a predicate mentioning one of
+        // these words inside an identifier does not start a clause.
+        let Some(at) = ["requires ", "ensures ", "assigns "]
+            .iter()
+            .filter_map(|keyword| clause_keyword_at(&collapsed, keyword))
+            .min()
+        else {
+            continue;
+        };
+        let clause = format!("{};", &collapsed[at..]);
+        if !seen.insert(clause.clone()) {
+            continue;
+        }
+        total += 1;
+        if clauses.len() < CLAUSE_SAMPLE {
+            clauses.push(clause);
+        }
+    }
+    (clauses, total)
+}
+
 pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json::Value) -> &'static str {
     let triage_kind = triage
         .get("kind")

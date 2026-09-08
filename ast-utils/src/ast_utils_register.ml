@@ -139,6 +139,19 @@ let () =
          with Kernel_function.No_Definition ->
            error_json (Printf.sprintf "function '%s' has no definition" name))
 
+(* getContractFrontier *)
+
+let () =
+  Server.Request.register
+    ~package
+    ~kind:`GET
+    ~name:"getContractFrontier"
+    ~descr:(Markdown.plain
+              "Defined functions reachable from a contracted one that carry no contract")
+    ~input:(module Server.Data.Junit)
+    ~output:(module Server.Data.Jany)
+    (fun () -> Ast_utils_ast.get_contract_frontier ())
+
 (* getContractContext *)
 
 let () =

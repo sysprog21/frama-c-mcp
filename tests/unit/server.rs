@@ -1,10 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+
+use crate::server_fixture::{lazy_server, MISSING_FRAMA_C};
 use rmcp::ErrorData as McpError;
 use serde_json::json;
 use frama_c_mcp::error::FramaCError;
-use frama_c_mcp::state::SessionState;
 use frama_c_mcp::mcp::server::contracts::{result_unconstrained_findings, unconstrained_assigns_findings};
 use frama_c_mcp::mcp::server::eacsl::run_e_acsl_counterexample;
 use frama_c_mcp::mcp::server::wpclass::*;
@@ -13,7 +12,7 @@ use frama_c_mcp::mcp::server::checkgaps::{check_incomplete_items, WantedAnalyses
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
-    append_to_error_message, assumed_callee_contract_findings,
+    append_to_error_message, assumed_callee_contract_findings, unresolved_call_findings,
     finish_verify_program_step_response, goal_status_matches, present_statuses, reject_unknown_status,
     wp_timed_out,
     GOAL_STATUS_UNPROVED, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
@@ -204,12 +203,7 @@ fn wp_model_support_parses_bases_and_modifiers() {
 
 #[tokio::test]
 async fn self_check_shape_with_missing_frama_c() {
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(
-        state,
-        "__frama_c_mcp_missing_binary__".to_string(),
-        4,
-    );
+    let server = lazy_server(MISSING_FRAMA_C);
     let payload = server.self_check_payload().await;
     assert_eq!(payload["server"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(payload["frama_c"]["status"], "missing");
@@ -236,7 +230,7 @@ async fn self_check_shape_with_missing_frama_c() {
     let ast_requests = payload["ast_utils_registered_requests"]
         .as_array()
         .expect("ast-utils registered requests");
-    assert_eq!(ast_requests.len(), 28);
+    assert_eq!(ast_requests.len(), 29);
     assert!(ast_requests.iter().any(|r| r["request"] == "plugins.ast-utils.dumpProject"));
     assert!(ast_requests
         .iter()
@@ -335,12 +329,7 @@ fn probe_that_did_not_run_reports_why() {
 
 #[tokio::test]
 async fn self_check_capabilities_shape_with_missing_frama_c() {
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(
-        state,
-        "__frama_c_mcp_missing_binary__".to_string(),
-        4,
-    );
+    let server = lazy_server(MISSING_FRAMA_C);
     let payload = server.self_check_payload().await;
     let payload = &payload["capabilities"];
 
@@ -378,7 +367,7 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
         .is_some_and(|warning| warning.contains("executed paths")
             && warning.contains("assigns clauses")));
     // Also pinned in test-process-lifecycle.rs; see the note there.
-    assert_eq!(payload["ast_utils"]["registered_request_count"], 28);
+    assert_eq!(payload["ast_utils"]["registered_request_count"], 29);
     assert!(payload["ast_utils"]["registered_requests"]
         .as_array()
         .expect("ast-utils requests")
@@ -408,8 +397,7 @@ async fn self_check_live_reports_frama_c_when_available() {
     {
         return;
     }
-    let state = Arc::new(RwLock::new(SessionState::default()));
-    let server = FramaCMcpServer::new_lazy(state, "frama-c".to_string(), 4);
+    let server = lazy_server("frama-c");
     let payload = server.self_check_payload().await;
     assert_eq!(payload["frama_c"]["status"], "ok");
     assert_eq!(payload["temp_dir_writeability"]["status"], "ok");
@@ -2358,4 +2346,82 @@ fn concurrent_sandbox_writers_do_not_drop_each_others_entries() {
     let mut want: Vec<String> = (0..WRITERS).map(|n| format!("exp{n}")).collect();
     want.sort();
     assert_eq!(ids, want, "a concurrent writer's entry was dropped");
+}
+
+/// A getContractContext payload with one indirect call, as the plug-in builds
+/// it.
+fn context_with_indirect_call() -> serde_json::Value {
+    json!({
+        "function": {"function": "run", "contract": {"assigns": {"kind": "list", "assigns": []}}},
+        "callers": [],
+        "callees": [],
+        "unresolved_callees": [
+            {"sid": 5, "loc": {"file": "indirect-call.c", "line": 28, "col": 2}, "callee": "*f"}
+        ],
+        "callee_resolution_complete": false,
+    })
+}
+
+#[test]
+fn an_indirect_call_becomes_a_finding() {
+    let findings = unresolved_call_findings("run", &context_with_indirect_call());
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["category"], json!("unresolved_call"));
+    assert_eq!(findings[0]["function"], json!("run"));
+    assert_eq!(findings[0]["callee_expression"], json!("*f"));
+    assert_eq!(findings[0]["stmt_id"], json!(5));
+    assert_eq!(findings[0]["source_location"]["line"], json!(28));
+}
+
+/// Both halves of the fix, because the calls clause alone leaves the
+/// call-point goal open. Measured: 5 of 9 bare, 9 of 10 with calls, 10 of 10
+/// with the precondition too.
+#[test]
+fn the_suggested_fix_names_the_calls_clause_and_the_precondition() {
+    let findings = unresolved_call_findings("run", &context_with_indirect_call());
+    let fix = findings[0]["suggested_fix"].as_str().expect("suggested_fix");
+    assert!(fix.contains("calls"), "{fix}");
+    assert!(fix.contains("requires"), "{fix}");
+}
+
+/// A function with every callee resolved carries no finding, so the code is
+/// not simply always on.
+#[test]
+fn a_fully_resolved_call_graph_yields_no_unresolved_finding() {
+    let context = json!({
+        "function": {"function": "caller"},
+        "callees": [{"function": "inc", "contract": {"assigns": {"kind": "list", "assigns": []}}}],
+        "unresolved_callees": [],
+        "callee_resolution_complete": true,
+    });
+    assert!(unresolved_call_findings("caller", &context).is_empty());
+}
+
+/// A payload from a plug-in too old to carry the field is not a payload with
+/// no indirect calls, and returning findings for it would invent them.
+#[test]
+fn a_context_without_the_field_yields_no_finding() {
+    let context = json!({"function": {"function": "caller"}, "callees": []});
+    assert!(unresolved_call_findings("caller", &context).is_empty());
+}
+
+/// Two indirect calls in one function need two clauses, so they need two
+/// findings with distinct ids: findings are deduplicated by id downstream and
+/// an id naming only the caller would drop the second call.
+#[test]
+fn two_indirect_calls_in_one_function_get_distinct_ids() {
+    let context = json!({
+        "function": {"function": "run"},
+        "callees": [],
+        "unresolved_callees": [
+            {"sid": 5, "loc": {"file": "a.c", "line": 10, "col": 2}, "callee": "*f"},
+            {"sid": 9, "loc": {"file": "a.c", "line": 12, "col": 2}, "callee": "*g"}
+        ],
+        "callee_resolution_complete": false,
+    });
+    let findings = unresolved_call_findings("run", &context);
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert_ne!(findings[0]["id"], findings[1]["id"], "{findings:?}");
+    assert_eq!(findings[0]["stmt_id"], json!(5));
+    assert_eq!(findings[1]["stmt_id"], json!(9));
 }

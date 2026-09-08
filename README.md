@@ -449,8 +449,21 @@ shell-active character (a parenthesized expression, a quoted string) is refused;
 ### `list` and `run_wp`
 
 `list` accepts a `kind` of `files`, `functions`, `globals`, `declarations`,
-`sandboxes`, or `conclusions`. For conclusions, `status` filters the summaries
-and `function` returns one full conclusion.
+`sandboxes`, `conclusions`, or `contract_frontier`.
+
+`list {kind: "contract_frontier"}` is the one to run before anything else on a
+file you have not seen. It answers, in one request, which defined functions are
+reachable from a function that already carries a contract and carry none
+themselves: the contracts a person still has to write. It is not a verdict and
+produces no `incomplete[]` code, because a function two hops down with no
+contract is not a gap in any caller's proof; `ASSUMED_CALLEE_CONTRACT` covers
+the case where a direct callee's contract is vacuous. The payload carries
+`unresolved_call_sites` alongside, since a frontier computed over a call graph
+that dropped the calls through function pointers is a work list that
+under-reports and a short one looks the same as a complete one.
+
+For conclusions, `status` filters the summaries and `function` returns one full
+conclusion.
 
 `run_wp` accepts `smoke: true` together with `provers` to run isolated CLI
 smoke tests.
@@ -597,6 +610,7 @@ payload contract and the change rule. The full set:
 | `LEMMA_NOT_PROVED` | WP assumed a lemma everywhere without discharging it |
 | `ASSUMED_VALID` | Recorded valid by external assumption, an `axiom`, not by proof |
 | `ASSUMED_CALLEE_CONTRACT` | A callee's contract was taken on faith, with no finite `assigns` |
+| `INDIRECT_CALL_UNRESOLVED` | A call names no callee, so WP assumed it may reach any function and the goals it leaves open are unprovable rather than slow |
 | `UNCONSTRAINED_ASSIGNS` | The contract lists a location in `assigns` that no postcondition mentions, so proving the function says nothing about the value written there |
 | `RESULT_UNCONSTRAINED` | The contract bounds `\result` to a small range but never ties some of those values to the inputs, so proving it does not pin down what the function returns |
 | `UNPROVED_ASSUMPTION` | An assertion or postcondition WP could not prove, which it still hands to later goals as a hypothesis |
@@ -604,6 +618,8 @@ payload contract and the change rule. The full set:
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
 | `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
+| `WP_MEMORY_MODEL_HYPOTHESIS` | WP's memory model needed separations it assumed rather than proved, so a valid goal is valid only for callers that satisfy them |
+| `WP_MEMORY_MODEL_UNCHECKED` | The separate run that reads WP's memory-model hypotheses did not complete, so whether the proof rests on an unstated separation is unknown |
 | `AST_ASM_CLOBBER` | Frama-C assumed inline assembly has no effects beyond its operands, so the analyzed statement is weaker than the compiled one |
 | `AST_UNKNOWN_ATTRIBUTE` | Frama-C ignored an unknown attribute, so the analyzed declaration differs from the source |
 | `AST_UNCLASSIFIED_WARNING` | Frama-C emitted parse warnings in categories this server has not classified, so their effect on the analyzed program is unknown |

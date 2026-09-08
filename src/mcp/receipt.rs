@@ -257,6 +257,29 @@ pub struct ProofReceiptRequest<'a> {
     pub goals_status_source: &'a str,
     pub reported: serde_json::Value,
     pub properties: &'a HashMap<String, serde_json::Value>,
+
+    /// The printed AST this run already has in hand, when the caller printed it
+    /// for another purpose.
+    ///
+    /// printSource ships the whole AST over the socket and is given sixty
+    /// seconds for it, so a caller that has already paid once should not pay
+    /// again. run_wp is that caller: it prints to give the memory-model probe
+    /// the program the proofs actually ran against, and the digest below wants
+    /// the identical bytes. Sharing them is not only cheaper, it is what makes
+    /// the receipt's digest and the probe describe one AST rather than two
+    /// prints that a concurrent injection could have separated.
+    ///
+    /// None means print it here, which is what every caller that has no copy
+    /// does.
+    pub ast_source: Option<&'a str>,
+
+    /// The digest of that AST, when a nested run already computed it.
+    ///
+    /// check is the caller: it runs WP through run_wp, which prints the AST
+    /// once for its memory-model probe and digests it for its own receipt, so
+    /// by the time check builds its receipt the answer is already in the WP
+    /// payload. Taking it means one print per check instead of two.
+    pub ast_digest: Option<&'a str>,
 }
 
 /// The same thing once the server has resolved what it alone can: the
@@ -374,6 +397,14 @@ pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// What a receipt records where a field cannot describe the run at all.
+///
+/// The isolated CLI retry proves the files on disk in a separate process while
+/// the live AST here carries whatever this session injected, so neither the
+/// contracts nor the AST digest describe it. Spelled once, because a typo in
+/// any of the comparisons against it fails open.
+pub const ISOLATED_RETRY_NO_AST: &str = "unavailable_isolated_cli_retry";
+
 /// Why a receipt carries no EVA configuration.
 ///
 /// Same argument as ast_digest_unavailable_reason below: a receipt travels and
@@ -382,6 +413,28 @@ pub fn incomplete_digest(incomplete: &serde_json::Value) -> serde_json::Value {
 /// and four different runs collapse into one shape.
 pub fn eva_config_absent(reason: &str) -> serde_json::Value {
     json!({"ran": false, "reason": reason})
+}
+
+/// One printed AST, as the receipt records it: a digest, or the reason there is
+/// none.
+///
+/// Shared because the supplied-text arm and the print arm must agree exactly.
+/// A receipt that digests differently depending on whether the caller happened
+/// to have a print in hand is a receipt that cannot be compared, which is the
+/// only thing a receipt is for.
+///
+/// Empty covers both a request that answered with something other than a
+/// string, which print_source reports as "", and a project with nothing in it.
+/// Neither is a digest, and telling them apart would mean print_source
+/// returning the raw Value, which no other caller wants.
+fn digest_of_printed_ast(text: &str) -> (serde_json::Value, serde_json::Value) {
+    if text.is_empty() {
+        return (serde_json::Value::Null, json!("request_answered_empty"));
+    }
+    (
+        json!(sha256_hex(canonical_ast_for_digest(text).as_bytes())),
+        serde_json::Value::Null,
+    )
 }
 
 /// Not a pure function of its input: a null ast_digest draws a fresh nonce, so
@@ -587,8 +640,8 @@ impl FramaCMcpServer {
         // session, which that run never saw, so snapshotting it would put a
         // contract in the receipt that is not the one proved. The same reason
         // that path already reports its goals source as unavailable.
-        if goals_status_source == "unavailable_isolated_cli_retry" {
-            return json!("unavailable_isolated_cli_retry");
+        if goals_status_source == ISOLATED_RETRY_NO_AST {
+            return json!(ISOLATED_RETRY_NO_AST);
         }
 
         let functions = wp_config
@@ -700,16 +753,45 @@ impl FramaCMcpServer {
     /// printSource runs the printer over the whole AST and ships the result
     /// back over the socket. On a large project ten seconds expires, and the
     /// failure is silent: every receipt from then on carries a fresh nonce.
+    ///
+    /// A caller that already printed the AST hands the text over instead, and
+    /// then no request is issued at all. See ProofReceiptRequest::ast_source.
     pub async fn proof_receipt_ast_digest(
         &self,
         client: Option<&FramaCClient>,
         goals_status_source: &str,
+        ast_source: Option<&str>,
+        ast_digest: Option<&str>,
     ) -> (serde_json::Value, serde_json::Value) {
-        if goals_status_source == "unavailable_isolated_cli_retry" {
-            return (
-                json!("unavailable_isolated_cli_retry"),
-                serde_json::Value::Null,
-            );
+        if goals_status_source == ISOLATED_RETRY_NO_AST {
+            return (json!(ISOLATED_RETRY_NO_AST), serde_json::Value::Null);
+        }
+
+        // A digest the caller already computed over this AST. check reaches
+        // here through run_wp, which printed the AST for its memory-model probe
+        // and digested it for its own receipt; nothing between the two mutates
+        // the AST, so printing it again would ship the whole thing over the
+        // socket a second time under a sixty-second budget, on the tool agents
+        // call most.
+        //
+        // The marker above is not a digest, and a nested receipt carrying it is
+        // not an answer this one can reuse. check forwards its caller's
+        // provers, so run_wp routes the run to the isolated CLI retry and
+        // records that its receipt cannot describe an AST. check still can: it
+        // is connected to the project that retry ran beside, and before this
+        // argument existed it printed and digested exactly that. Accepting the
+        // marker here would put it in a field that could have carried a real
+        // digest, and two checks over different programs would then agree on
+        // it.
+        if let Some(digest) = ast_digest.filter(|digest| *digest != ISOLATED_RETRY_NO_AST) {
+            return (json!(digest), serde_json::Value::Null);
+        }
+
+        // Checked before the reload-failed arm below only because a supplied
+        // text cannot coexist with one: a caller has a print in hand exactly
+        // when its run reached the AST.
+        if let Some(source) = ast_source {
+            return digest_of_printed_ast(source);
         }
 
         // A failed reload leaves Frama-C's previous project resident. Its AST
@@ -734,17 +816,7 @@ impl FramaCMcpServer {
             },
         };
         match client.print_source().await {
-            Ok(text) if !text.is_empty() => (
-                json!(sha256_hex(canonical_ast_for_digest(&text).as_bytes())),
-                serde_json::Value::Null,
-            ),
-
-            // Empty covers both a request that answered with something other
-            // than a string, which print_source reports as "", and a project
-            // with nothing in it. Neither is a digest, and telling them apart
-            // would mean print_source returning the raw Value, which no other
-            // caller wants.
-            Ok(_) => (serde_json::Value::Null, json!("request_answered_empty")),
+            Ok(text) => digest_of_printed_ast(&text),
 
             // One reason covers the plug-in being absent and the print
             // outrunning its budget, because the client reports both as a
@@ -772,6 +844,8 @@ impl FramaCMcpServer {
             goals_status_source,
             reported,
             properties,
+            ast_source,
+            ast_digest,
         } = request;
 
         // Probed per receipt, deliberately, and not cached across them. Doing
@@ -802,7 +876,8 @@ impl FramaCMcpServer {
             .proof_receipt_contracts(&wp_config, goals_status_source)
             .await;
         let (ast_digest, ast_digest_unavailable_reason) =
-            self.proof_receipt_ast_digest(client, goals_status_source).await;
+            self.proof_receipt_ast_digest(client, goals_status_source, ast_source, ast_digest)
+                .await;
         let project_load = self
             .main_frama_c_state
             .lock()
