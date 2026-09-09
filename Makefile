@@ -177,15 +177,17 @@ if [ -n "$$want_shfmt" ] && [ "$$want_shfmt" != "$$have_shfmt" ]; then
 fi
 git ls-files -z '*.sh' '*.hook' | xargs -0 shfmt -w
 if command -v commentflow >/dev/null 2>&1; then
-    # Sources only. Test fixtures are analysis inputs, not code to format:
-    # reflowing a header comment there adds a line, and the suites pin source
-    # positions in them. Doing it once shifted the ACSL error in
-    # acsl-type-error.c from line 11 to 12 and broke two stdio tests, one of
-    # which asserts the line by number and one of which resolves a marker at a
-    # position. Same reason for ast-utils/test, whose .c files are the plugin's
-    # regression inputs.
-    git ls-files -z '*.rs' '*.c' '*.h' '*.sh' \
-        ':!:tests/fixtures/**' ':!:ast-utils/test/**' | xargs -0 commentflow
+    # The fixtures too, which they were not until they were reflowed once and
+    # the suites taught the new positions. Reflowing a header comment there
+    # adds a line, and the suites pin source positions in them: the ACSL error
+    # in acsl-type-error.c moved from line 11 to 12, uncontracted-callee.c
+    # shifted by one throughout, and a loop annotation whose closing marker
+    # took its own line pushed the loop past it. Excluding them was right while
+    # the tree was unreflowed and is not now, because the exclusion would let
+    # the next fixture edit drift back out of the shape the tree is in, with no
+    # gate to catch it. A shift that reaches a test fails the suite, which is
+    # how all nine of those coordinates were found.
+    git ls-files -z '*.rs' '*.c' '*.h' '*.sh' | xargs -0 commentflow
 else
     echo "indent: commentflow not found, comments left alone"
 fi

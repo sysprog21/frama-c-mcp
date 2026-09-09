@@ -26,14 +26,14 @@ fn main() {
     // Asked as a question about this directory rather than as a comparison of
     // two paths. --show-prefix prints the path from the worktree top down to
     // here, so empty output means this is the top, and git answers it having
-    // already resolved whatever symlinks or "." components the path was
-    // reached through. Comparing --show-toplevel against CARGO_MANIFEST_DIR as
-    // strings did not: git resolves symlinks and cargo does not, so a
-    // symlinked checkout compared unequal and stamped itself unknown, which is
-    // this guard turning the feature off rather than protecting it.
+    // already resolved whatever symlinks or "." components the path was reached
+    // through. Comparing --show-toplevel against CARGO_MANIFEST_DIR as strings
+    // did not: git resolves symlinks and cargo does not, so a symlinked
+    // checkout compared unequal and stamped itself unknown, which is this guard
+    // turning the feature off rather than protecting it.
     //
-    // Read through command() rather than git(), because git() maps empty
-    // output to None and empty is the answer being looked for.
+    // Read through command() rather than git(), because git() maps empty output
+    // to None and empty is the answer being looked for.
     let in_own_checkout = command(&manifest, &["rev-parse", "--show-prefix"])
         .output()
         .ok()
@@ -55,16 +55,17 @@ fn main() {
     // signal for a tracked file: missing from the working tree means the tree
     // is dirty, the cost is a few git calls and a relink, and it stops the
     // moment the file comes back. It is the wrong signal for a ref file, whose
-    // absence is normal, and watched_paths probes those for that reason. Dropping the path instead was a one-way door, since
-    // restoring the file did not re-run this script and the stamp stayed
-    // "-dirty" over a tree that had become clean.
+    // absence is normal, and watched_paths probes those for that reason.
+    // Dropping the path instead was a one-way door, since restoring the file
+    // did not re-run this script and the stamp stayed "-dirty" over a tree that
+    // had become clean.
     //
-    // Substituting the nearest existing ancestor, which is what this did
-    // first, is the worst of the three. Cargo prices a directory as a
-    // recursive walk, so a deleted top-level file resolves to the manifest
-    // root and watches target/ with it: measured at 9.6 GB and 131,902 files
-    // here, dirty on every no-op build afterwards, which is the whole-tree
-    // watch the doc below records as having been removed once already.
+    // Substituting the nearest existing ancestor, which is what this did first,
+    // is the worst of the three. Cargo prices a directory as a recursive walk,
+    // so a deleted top-level file resolves to the manifest root and watches
+    // target/ with it: measured at 9.6 GB and 131,902 files here, dirty on
+    // every no-op build afterwards, which is the whole-tree watch the doc below
+    // records as having been removed once already.
     for path in watched_paths(&manifest).unwrap_or_default() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -103,6 +104,7 @@ fn watched_paths(manifest: &Path) -> Option<Vec<PathBuf>> {
         paths.push(Path::new(&git_dir).join("HEAD"));
         paths.push(Path::new(&git_dir).join("index"));
     }
+
     // --path-format wants git 2.31. On an older one the whole query fails, and
     // the answer without it is a path relative to the current directory, which
     // is the manifest dir here, so joining it gives the same result. Without
@@ -122,12 +124,12 @@ fn watched_paths(manifest: &Path) -> Option<Vec<PathBuf>> {
         // normal state of a healthy repository: packed-refs does not exist
         // until refs are packed, and the loose ref does not exist once they
         // are. Naming either unconditionally re-runs this script and relinks
-        // the server on every build, forever, which is the cost this whole
-        // list was rewritten to avoid.
+        // the server on every build, forever, which is the cost this whole list
+        // was rewritten to avoid.
         //
-        // One of the two always exists, so the branch HEAD points at is
-        // watched either way: pack the refs and the loose file goes but
-        // packed-refs appears, unpack them and the reverse.
+        // One of the two always exists, so the branch HEAD points at is watched
+        // either way: pack the refs and the loose file goes but packed-refs
+        // appears, unpack them and the reverse.
         let head_ref = git(manifest, &["symbolic-ref", "--quiet", "HEAD"]);
         let refs = [Some(common_dir.join("packed-refs")), head_ref.map(|r| common_dir.join(r))];
         paths.extend(refs.into_iter().flatten().filter(|path| path.exists()));
@@ -137,10 +139,10 @@ fn watched_paths(manifest: &Path) -> Option<Vec<PathBuf>> {
 
 fn build_commit(manifest: &Path) -> String {
     // The full object id, not --short. Git picks the abbreviation length from
-    // the object database and lengthens it as the database grows, so two
-    // builds of the same commit can stamp different strings and a caller
-    // comparing them would read a difference that is not one. The full id is
-    // the only spelling that is a function of the commit alone.
+    // the object database and lengthens it as the database grows, so two builds
+    // of the same commit can stamp different strings and a caller comparing
+    // them would read a difference that is not one. The full id is the only
+    // spelling that is a function of the commit alone.
     let Some(commit) = git(manifest, &["rev-parse", "HEAD"]) else {
         return "unknown".to_string();
     };

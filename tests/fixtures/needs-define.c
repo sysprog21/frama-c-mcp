@@ -1,4 +1,5 @@
-/* A source Frama-C cannot parse unless the caller supplies a define.
+/*
+ * A source Frama-C cannot parse unless the caller supplies a define.
  *
  * _Atomic is the real case this fixture stands for: Frama-C 33's front end
  * stops at it with a syntax error, and a codebase that uses it for one struct

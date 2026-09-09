@@ -1,4 +1,5 @@
-/* A callee with no body and no contract.
+/*
+ * A callee with no body and no contract.
  *
  * Frama-C generates a default `assigns` for `helper` and warns that it did so.
  * That warning is the whole reason this fixture exists: a generated assigns is

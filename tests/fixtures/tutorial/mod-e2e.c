@@ -1,6 +1,8 @@
-/* Whole-program MCP workflow fixture extending the modular tutorial group.
-   It keeps function names unique so persisted conclusions from other tutorial
-   tests cannot affect bottom-up scheduling assertions. */
+/*
+ * Whole-program MCP workflow fixture extending the modular tutorial group. It
+ * keeps function names unique so persisted conclusions from other tutorial
+ * tests cannot affect bottom-up scheduling assertions.
+ */
 
 #include <limits.h>
 
@@ -12,7 +14,8 @@ int mod_e2e_global_limit = 16;
 */
 int mod_e2e_abs(int val)
 {
-    if (val < 0) return -val;
+    if (val < 0)
+        return -val;
     return val;
 }
 
@@ -69,8 +72,6 @@ int mod_e2e_weak_caller(int x)
 
 int mod_e2e_entry(int *values, int n, int x)
 {
-    return mod_e2e_loop_abs_max(values, n)
-        + mod_e2e_even(n)
-        + mod_e2e_weak_caller(x)
-        + mod_e2e_global_limit;
+    return mod_e2e_loop_abs_max(values, n) + mod_e2e_even(n) +
+           mod_e2e_weak_caller(x) + mod_e2e_global_limit;
 }

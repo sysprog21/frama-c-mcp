@@ -25,6 +25,7 @@ trap 'rm -rf "$WORK"' EXIT
 fail=0
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
+
     # Every extract fixture is driven by its own block below, with its own
     # assertions. The name is the selector, so adding one costs nothing here.
     if [[ "$name" == extract_* ]]; then
@@ -194,8 +195,8 @@ fi
 # Regression: how a callee is emitted decides what WP may assume about it. A
 # callee with no assigns must arrive as an empty body, never as a bare
 # declaration (default assigns \nothing, unsound) and never as its own
-# definition. A callee that states assigns keeps its definition. Both halves
-# are asserted, because either one alone passes while the other is inverted.
+# definition. A callee that states assigns keeps its definition. Both halves are
+# asserted, because either one alone passes while the other is inverted.
 echo "[regression] extractFunctionWithDeps_uncontracted_callee"
 cp "$HERE/extract_uncontracted_callee.c" "$WORK/"
 rm -f "$WORK/batch_extract_uncontracted.json"

@@ -1,11 +1,13 @@
-/* From framac.md: struct contracts and named behavior groups from frama-c-practice.
-   Exercises: struct/enum in contracts, two orthogonal named behavior groups,
-   `disjoint behaviors <list>`, and the b*b + c*c overflow guard the naive
-   per-term precondition set misses. */
+/*
+ * From framac.md: struct contracts and named behavior groups from
+ * frama-c-practice. Exercises: struct/enum in contracts, two orthogonal named
+ * behavior groups, `disjoint behaviors <list>`, and the b*b + c*c overflow
+ * guard the naive per-term precondition set misses.
+ */
 
 #include <limits.h>
 
-enum Sides  { EQUILATERAL, ISOSCELE, SCALENE };
+enum Sides { EQUILATERAL, ISOSCELE, SCALENE };
 enum Angles { OBTUSE, RIGHT, ACUTE };
 
 struct TriangleInfo {
@@ -49,13 +51,19 @@ struct TriangleInfo {
 */
 int classify(int a, int b, int c, struct TriangleInfo *info)
 {
-    if (a == b && b == c)            info->sides = EQUILATERAL;
-    else if (a == b || a == c || b == c) info->sides = ISOSCELE;
-    else                             info->sides = SCALENE;
+    if (a == b && b == c)
+        info->sides = EQUILATERAL;
+    else if (a == b || a == c || b == c)
+        info->sides = ISOSCELE;
+    else
+        info->sides = SCALENE;
 
-    if (a*a > b*b + c*c)             info->angles = OBTUSE;
-    else if (a*a == b*b + c*c)       info->angles = RIGHT;
-    else                             info->angles = ACUTE;
+    if (a * a > b * b + c * c)
+        info->angles = OBTUSE;
+    else if (a * a == b * b + c * c)
+        info->angles = RIGHT;
+    else
+        info->angles = ACUTE;
 
     return 0;
 }

@@ -1,7 +1,9 @@
-/* From framac.md: modular WP verification.
-   Contracts live on the prototypes in the headers, not on the definitions.
-   Sandbox extraction of mod_max_abs must carry the callee contracts from the
-   headers; taking them from the .c definitions would find nothing. */
+/*
+ * From framac.md: modular WP verification. Contracts live on the prototypes in
+ * the headers, not on the definitions. Sandbox extraction of mod_max_abs must
+ * carry the callee contracts from the headers; taking them from the .c
+ * definitions would find nothing.
+ */
 
 #include <limits.h>
 #include "mod-abs.h"

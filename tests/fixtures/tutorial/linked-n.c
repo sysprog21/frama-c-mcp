@@ -1,16 +1,20 @@
-/* From framac.md: Linux EAS scheduler case study from linux-eas-verif.
-   Adapted to a self-contained node type so it parses without kernel headers;
-   the ACSL shape is unchanged.
-
-   Exercises: inductive predicate over a pointer chain, axiomatic uninterpreted
-   logic function modelling an opaque resource, GHOST FUNCTION PARAMETERS, and
-   a callee whose contract deliberately states the same fact twice (bit-level
-   and logic-level) so the solver can pick either view. */
+/*
+ * From framac.md: Linux EAS scheduler case study from linux-eas-verif. Adapted
+ * to a self-contained node type so it parses without kernel headers; the ACSL
+ * shape is unchanged.
+ *
+ * Exercises: inductive predicate over a pointer chain, axiomatic uninterpreted
+ * logic function modelling an opaque resource, GHOST FUNCTION PARAMETERS, and a
+ * callee whose contract deliberately states the same fact twice (bit-level and
+ * logic-level) so the solver can pick either view.
+ */
 
 #include <limits.h>
 #include <stddef.h>
 
-struct mask { int bits[64]; };
+struct mask {
+    int bits[64];
+};
 
 struct node {
     struct node *parent;
@@ -51,7 +55,8 @@ struct node {
 struct mask *node_span_of(struct node *sd);
 
 /* Dual postcondition: the bit-level view and the logic view of the same fact.
-   framac.md notes the proof only closes when both are present. */
+ * framac.md notes the proof only closes when both are present.
+ */
 /*@ requires \valid_read(m);
     requires 0 <= cpu < 64;
     requires \valid_read(m->bits + (0..63));

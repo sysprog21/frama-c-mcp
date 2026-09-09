@@ -1,4 +1,5 @@
-/* An ACSL type error, which Frama-C treats as fatal at load.
+/*
+ * An ACSL type error, which Frama-C treats as fatal at load.
  *
  * `\bogus_predicate` is not bound to anything, so Frama-C aborts before the
  * server socket exists. There is no session to ask for logs, which makes the
