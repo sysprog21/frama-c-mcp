@@ -1,6 +1,7 @@
-// Iterative verification workflow test — RAW version (no ACSL)
+// Iterative verification workflow test, RAW version (no ACSL)
+//
 // Source: adapted from RTE-Guided-Specification-Generation benchmark
-//         (pointers/dir8_div_rem.c)
+// (pointers/dir8_div_rem.c)
 //
 // EVA expected alarms:
 //   safe_div:     division_by_zero (b could be 0)
@@ -12,15 +13,18 @@
 int arr[SIZE];
 volatile int nondet;
 
-int safe_div(int a, int b) {
+int safe_div(int a, int b)
+{
     return a / b;
 }
 
-int array_read(int idx) {
+int array_read(int idx)
+{
     return arr[idx];
 }
 
-int main(void) {
+int main(void)
+{
     arr[0] = 100;
     arr[5] = 200;
     int x = safe_div(nondet, nondet);

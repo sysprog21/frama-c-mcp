@@ -1,12 +1,14 @@
-/* From framac.md: Linux kernel string-function case study from verker.
-   Exercises: axiomatic block wrapping a predicate + recursive logic function,
-   a logic function sharing a C function's name, ghost variable pinning a
-   loop-destroyed length, and pointer arithmetic on void * (GNU extension).
-
-   framac.md records that memset here does NOT fully prove under today's WP
-   (17/24 on v33.0, identical across Typed / Typed+cast / Bytes). Keep it as a
-   negative fixture: the server must report the shortfall honestly, and must be
-   able to select all three models to reproduce the comparison. */
+/*
+ * From framac.md: Linux kernel string-function case study from verker.
+ * Exercises: axiomatic block wrapping a predicate + recursive logic function, a
+ * logic function sharing a C function's name, ghost variable pinning a
+ * loop-destroyed length, and pointer arithmetic on void * (GNU extension).
+ *
+ * framac.md records that memset here does NOT fully prove under today's WP
+ * (17/24 on v33.0, identical across Typed / Typed+cast / Bytes). Keep it as a
+ * negative fixture: the server must report the shortfall honestly, and must be
+ * able to select all three models to reproduce the comparison.
+ */
 
 #include <stddef.h>
 
@@ -57,9 +59,11 @@ void *kmemset(void *s, int c, size_t count)
         loop variant count;
      */
     while (count--)
-        *xs++ = (char)c;
+        *xs++ = (char) c;
+
     /* Not redundant: `while (count--)` tests the pre-decrement value, so count
-       wraps to SIZE_MAX on exit. */
+     * wraps to SIZE_MAX on exit.
+     */
     //@ assert count == (size_t)(-1);
     return s;
 }

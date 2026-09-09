@@ -1,4 +1,5 @@
-/* Align-up by the standard bit trick, which is how allocators round sizes.
+/*
+ * Align-up by the standard bit trick, which is how allocators round sizes.
  *
  * Every postcondition here is true and none is provable: WP encodes bitwise-or
  * on machine integers as an uninterpreted function rather than a bitvector, so

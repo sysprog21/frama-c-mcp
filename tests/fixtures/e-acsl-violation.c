@@ -1,4 +1,5 @@
-/* A postcondition that fails at runtime, for E-ACSL to catch.
+/*
+ * A postcondition that fails at runtime, for E-ACSL to catch.
  *
  * `shrink(1)` returns 0, so `ensures \result > 0` is false on the one path
  * `main` takes. WP would report the goal unproved; the point here is different,

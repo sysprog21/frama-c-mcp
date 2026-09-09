@@ -1981,6 +1981,7 @@ fn the_goal_floor_is_asked_only_of_a_receipt_covering_the_whole_target() {
         nostdinc: true,
         ..Default::default()
     });
+
     // Goals carry "fct", which is what a receipt this build writes looks like.
     // Without it every assertion below would exercise the compatibility branch
     // for older receipts instead of the rule this test is named for.

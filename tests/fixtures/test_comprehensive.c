@@ -28,7 +28,7 @@
 
 int data[CAPACITY];
 int count = 0;
-int error_code = 0;   // 0=ok, -1=full, -2=oob
+int error_code = 0;  // 0=ok, -1=full, -2=oob
 
 // ── buf_push: behaviors + assigns — WP provable ──
 
@@ -48,7 +48,8 @@ int error_code = 0;   // 0=ok, -1=full, -2=oob
     complete behaviors;
     disjoint behaviors;
 */
-int buf_push(int val) {
+int buf_push(int val)
+{
     if (count >= CAPACITY) {
         error_code = -1;
         return -1;
@@ -66,7 +67,8 @@ int buf_push(int val) {
     assigns \nothing;
     ensures \result == data[idx];
 */
-int buf_get(int idx) {
+int buf_get(int idx)
+{
     return data[idx];
 }
 
@@ -75,7 +77,8 @@ int buf_get(int idx) {
 /*@ requires 0 <= count <= CAPACITY;
     assigns \nothing;
 */
-int buf_sum(void) {
+int buf_sum(void)
+{
     int s = 0;
     /*@ loop invariant 0 <= i <= count;
         loop assigns i, s;
@@ -92,7 +95,8 @@ int buf_sum(void) {
 /*@ requires 0 < count <= CAPACITY;
     assigns \nothing;
 */
-int buf_avg(void) {
+int buf_avg(void)
+{
     return buf_sum() / count;
 }
 
@@ -103,25 +107,29 @@ int buf_avg(void) {
     ensures correct: \result == x;
     ensures wrong: \result > 0;
 */
-int echo(int x) {
+int echo(int x)
+{
     return x;
 }
 
 // ── unsafe_read: NO precondition — EVA array bounds alarm ──
 
-int unsafe_read(int idx) {
-    return data[idx];   // EVA alarm: idx may be out of bounds
+int unsafe_read(int idx)
+{
+    return data[idx];  // EVA alarm: idx may be out of bounds
 }
 
 // ── unsafe_avg: NO precondition — EVA division-by-zero alarm ──
 
-int unsafe_avg(void) {
-    return buf_sum() / count;   // EVA alarm: count could be 0 at this point
+int unsafe_avg(void)
+{
+    return buf_sum() / count;  // EVA alarm: count could be 0 at this point
 }
 
 // ── run: Level 1 — orchestrates buffer operations ──
 
-int run(int a, int b, int c) {
+int run(int a, int b, int c)
+{
     buf_push(a);
     buf_push(b);
     buf_push(c);
@@ -134,21 +142,22 @@ int run(int a, int b, int c) {
 
 volatile int nondet;
 
-int main(void) {
+int main(void)
+{
     // Phase 1: known values
     int result = run(10, 20, 30);
 
     // Phase 2: potential alarms
-    int idx = nondet;               // EVA: unknown value
-    int val = unsafe_read(idx);     // EVA alarm: array bounds
+    int idx = nondet;            // EVA: unknown value
+    int val = unsafe_read(idx);  // EVA alarm: array bounds
 
     int saved_count = count;
-    count = 0;                      // force count=0
-    int avg = unsafe_avg();         // EVA alarm: division by zero
+    count = 0;               // force count=0
+    int avg = unsafe_avg();  // EVA alarm: division by zero
     count = saved_count;
 
     // Phase 3: WP test
-    int e = echo(0);                // WP: ensures wrong: \result > 0 fails
+    int e = echo(0);  // WP: ensures wrong: \result > 0 fails
 
     return result + val + avg + e;
 }

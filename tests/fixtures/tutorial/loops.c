@@ -1,6 +1,9 @@
-/* From framac.md: loops and loop invariants from minus-loop, find, and max-element.
-   Exercises: loop invariant / loop assigns / loop variant, named invariants,
-   \forall over an array range, `terminates`/`exits` contract clauses. */
+/*
+ * From framac.md: loops and loop invariants from minus-loop, find, and
+ * max-element. Exercises: loop invariant / loop assigns / loop variant, named
+ * invariants, \forall over an array range, `terminates`/`exits` contract
+ * clauses.
+ */
 
 #include <stddef.h>
 
@@ -42,19 +45,19 @@ void minus_loop(void)
 */
 size_type find(const value_type *a, size_type n, value_type v)
 {
-  /*@
+    /*@
     loop invariant 0 <= i <= n;
     loop invariant \forall integer k; 0 <= k < i ==> a[k] != v;
     loop assigns i;
     loop variant n-i;
    */
-  for (size_type i = 0u; i < n; i++) {
-    if (a[i] == v) {
-      return i;
+    for (size_type i = 0u; i < n; i++) {
+        if (a[i] == v) {
+            return i;
+        }
     }
-  }
 
-  return n;
+    return n;
 }
 
 /* Named loop invariants (bound/max/upper/first) carrying a running optimum. */
@@ -64,10 +67,10 @@ size_type find(const value_type *a, size_type n, value_type v)
 */
 size_type max_element(const value_type *a, size_type n)
 {
-  if (0u < n) {
-    size_type max = 0u;
+    if (0u < n) {
+        size_type max = 0u;
 
-    /*@
+        /*@
       loop invariant bound: 0 <= i <= n;
       loop invariant max:   0 <= max <  n;
       loop invariant upper: \forall integer k; 0 <= k < i   ==> a[k] <= a[max];
@@ -75,14 +78,14 @@ size_type max_element(const value_type *a, size_type n)
       loop assigns max, i;
       loop variant n-i;
     */
-    for (size_type i = 1u; i < n; i++) {
-      if (a[max] < a[i]) {
-        max = i;
-      }
+        for (size_type i = 1u; i < n; i++) {
+            if (a[max] < a[i]) {
+                max = i;
+            }
+        }
+
+        return max;
     }
 
-    return max;
-  }
-
-  return n;
+    return n;
 }

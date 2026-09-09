@@ -1301,7 +1301,7 @@ async fn a_load_failure_names_the_acsl_error() {
         "the reason has to survive to the caller: {error}"
     );
     assert!(
-        error.contains("acsl-type-error.c:11"),
+        error.contains("acsl-type-error.c:12"),
         "and so does the line: {error}"
     );
 
@@ -1323,7 +1323,7 @@ async fn context_marker_at_resolves_a_source_position() {
     let file = fixture.to_str().unwrap();
 
     // `return helper(n);`, the body of compute.
-    let statement = lookup_position(&client, file, 17, Some(11)).await;
+    let statement = lookup_position(&client, file, 18, Some(11)).await;
     assert_eq!(statement["marker_kind"], "statement", "{statement:?}");
     let stmt_id = statement["stmt_id"]
         .as_i64()
@@ -1335,7 +1335,7 @@ async fn context_marker_at_resolves_a_source_position() {
     );
 
     // The signature line resolves to the function, not to a statement.
-    let declaration = lookup_position(&client, file, 15, Some(4)).await;
+    let declaration = lookup_position(&client, file, 16, Some(4)).await;
     assert_eq!(declaration["marker_kind"], "declaration", "{declaration:?}");
     assert_eq!(declaration["stmt_id"], json!(null), "{declaration:?}");
 
@@ -1354,12 +1354,12 @@ async fn context_marker_at_resolves_a_source_position() {
     // A prototype belongs to the function it declares, which is worth pinning
     // because it looks like the no-function case and is not: `int helper(int
     // n);` at file scope answers `helper`.
-    let prototype = lookup_position(&client, file, 10, Some(4)).await;
+    let prototype = lookup_position(&client, file, 11, Some(4)).await;
     assert_eq!(prototype["function"], "helper", "{prototype:?}");
 
     // Column defaults to 0, which is the whole point: the caller thinks in
     // lines. Same answer as the explicit column above.
-    let line_only = lookup_position(&client, file, 17, None).await;
+    let line_only = lookup_position(&client, file, 18, None).await;
     assert_eq!(line_only["marker"], statement["marker"], "{line_only:?}");
 
     // A comment line has nothing under it, and that is reported rather than
@@ -1371,7 +1371,7 @@ async fn context_marker_at_resolves_a_source_position() {
     // A path Frama-C never loaded returns the same nothing, and those are
     // opposite answers. Distinguished, and the loaded paths come back so the
     // caller can see what it should have asked for.
-    let wrong_path = lookup_position(&client, "uncontracted-callee.c", 17, None).await;
+    let wrong_path = lookup_position(&client, "uncontracted-callee.c", 18, None).await;
     assert_eq!(wrong_path["marker_kind"], "unknown_file", "{wrong_path:?}");
     assert!(
         wrong_path["loaded_files"]
@@ -8039,7 +8039,7 @@ async fn every_want_answers_under_its_own_name() {
     let at = call_tool_json(&client, "context", json!({
         "want": ["marker_at"],
         "file": file,
-        "line": 9,
+        "line": 11,
     }))
     .await
     .unwrap();
@@ -8068,7 +8068,7 @@ async fn every_want_answers_under_its_own_name() {
         "call_chain",
     ];
 
-    // Line 9 is the loop, so marker_at resolves a statement rather than
+    // Line 11 is the loop, so marker_at resolves a statement rather than
     // answering marker_kind none, which is what a blank line would get and
     // would still fill the key. Nothing here reads the number back, so a
     // fixture edit that moves the loop costs the want its work, not the test.
@@ -8078,7 +8078,7 @@ async fn every_want_answers_under_its_own_name() {
         "property_marker": marker,
         "marker": statement_marker,
         "file": file,
-        "line": 9,
+        "line": 11,
         "direction": "callees",
         "max_depth": 2,
     }))
@@ -8150,8 +8150,8 @@ async fn a_source_position_answers_what_a_variable_holds_there() {
         .unwrap();
     assert_eva_run_shape(&checked["eva"]);
 
-    // Column 4 of "total = n * 2;", the assignment inside the branch.
-    let at = lookup_position(&client, fixture.to_str().unwrap(), 5, Some(4)).await;
+    // Column 8 of "total = n * 2;", the assignment inside the branch.
+    let at = lookup_position(&client, fixture.to_str().unwrap(), 5, Some(8)).await;
     assert_eq!(at["marker_kind"], "statement", "{at:?}");
     let marker = at["marker"]
         .as_str()

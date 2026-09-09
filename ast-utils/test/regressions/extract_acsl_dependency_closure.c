@@ -1,19 +1,21 @@
-/* Regression for extractFunctionWithDeps's ACSL-aware dependency closure.
-   The wrapper body only calls helper. The helper contract and ambient ACSL
-   theory mention C types, C globals, logic functions, predicates, axiomatic
-   declarations, logic types, and inductive predicates that are otherwise
-   absent from wrapper's C body. */
+/*
+ * Regression for extractFunctionWithDeps's ACSL-aware dependency closure. The
+ * wrapper body only calls helper. The helper contract and ambient ACSL theory
+ * mention C types, C globals, logic functions, predicates, axiomatic
+ * declarations, logic types, and inductive predicates that are otherwise absent
+ * from wrapper's C body.
+ */
 
 typedef struct public_state {
-  int visible;
+    int visible;
 } public_state;
 
 struct private_state;
 typedef struct private_state private_state;
 
 struct private_state {
-  public_state pub;
-  int hidden;
+    public_state pub;
+    int hidden;
 };
 
 int lower_bound;
@@ -51,10 +53,12 @@ int callback(int x);
     assigns contract_state;
     ensures contract_state == \old(contract_state) + 1;
  */
-int helper(public_state *p) {
-  return p->visible;
+int helper(public_state *p)
+{
+    return p->visible;
 }
 
-int wrapper(public_state *p) {
-  return helper(p);
+int wrapper(public_state *p)
+{
+    return helper(p);
 }

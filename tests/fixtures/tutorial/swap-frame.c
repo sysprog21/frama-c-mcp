@@ -1,6 +1,8 @@
-/* From framac.md: pointers, side effects, aliasing, and memory history.
-   Exercises: \valid, \valid_read, \old, \at + labels, assigns frame condition,
-   \separated, aliasing. */
+/*
+ * From framac.md: pointers, side effects, aliasing, and memory history.
+ * Exercises: \valid, \valid_read, \old, \at + labels, assigns frame condition,
+ * \separated, aliasing.
+ */
 
 #include <limits.h>
 
@@ -19,7 +21,8 @@ void swap(int *a, int *b)
     *b = tmp;
 }
 
-/* Without `assigns`, WP must assume h may change and the second assert fails. */
+/* Without `assigns`, WP must assume h may change and the second assert fails.
+ */
 int main(void)
 {
     int a = 37;
@@ -55,7 +58,8 @@ void at_labels(int *x, int *p)
 {
     *p = 2;
     //@ assert x[2] == \at(x[2], Pre);
-    /* Provable only for the first assert: \at(x[*p], Pre) evaluates *p at Pre. */
+    /* Provable only for the first assert: \at(x[*p], Pre) evaluates *p at Pre.
+     */
 }
 
 /* order_3: \separated over three pointers, behaviour under permutation. */
@@ -67,7 +71,19 @@ void at_labels(int *x, int *p)
 */
 void order_3(int *a, int *b, int *c)
 {
-    if (*a > *b) { int tmp = *b; *b = *a; *a = tmp; }
-    if (*a > *c) { int tmp = *c; *c = *a; *a = tmp; }
-    if (*b > *c) { int tmp = *b; *b = *c; *c = tmp; }
+    if (*a > *b) {
+        int tmp = *b;
+        *b = *a;
+        *a = tmp;
+    }
+    if (*a > *c) {
+        int tmp = *c;
+        *c = *a;
+        *a = tmp;
+    }
+    if (*b > *c) {
+        int tmp = *b;
+        *b = *c;
+        *c = tmp;
+    }
 }

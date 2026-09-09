@@ -1,4 +1,5 @@
-/* A successor pointer computed by byte arithmetic, which is how an intrusive
+/*
+ * A successor pointer computed by byte arithmetic, which is how an intrusive
  * allocator reaches the next block header.
  *
  * Under Typed+nocast the cast does not fail safely: Why3 aborts with

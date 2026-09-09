@@ -1,4 +1,5 @@
-/* A separation that exists only once a contract has been injected.
+/*
+ * A separation that exists only once a contract has been injected.
  *
  * "bump" writes the global and never touches "p", so the file as written gives
  * the Typed model no reason to relate the two and Frama-C prints no memory
@@ -18,5 +19,5 @@ int g;
 
 void bump(int *p)
 {
-  g = 1;
+    g = 1;
 }

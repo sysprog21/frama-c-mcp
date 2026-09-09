@@ -1,4 +1,5 @@
-/* A false postcondition that only an axiom discharges.
+/*
+ * A false postcondition that only an axiom discharges.
  *
  * `uncalled` returns n, so `ensures \result == n + 1` is false. It is not
  * reachable from `main`, which is the point: EVA leaves it alone rather than
