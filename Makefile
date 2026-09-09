@@ -152,14 +152,31 @@ export REGISTER_SCRIPT
 register:
 	@bash -c "$$REGISTER_SCRIPT"
 
-# Formatting, not reformatting. shfmt is what ci.yml already enforces for shell,
-# and commentflow reflows comments in the sources that carry them. cargo fmt is
-# deliberately absent: it rewrites 834 sites across nearly every file in src/,
-# which is a rewrite of the tree rather than a formatting pass, and no gate in
-# this repository asks for it.
+# Formatting, not reformatting. Each of these is a gate ci.yml already runs, so
+# this target exists to satisfy them rather than to have opinions of its own:
+# clang-format for C, shfmt for shell, and commentflow for the comments neither
+# of those two owns. cargo fmt is deliberately absent: it rewrites 834 sites
+# across nearly every file in src/, which is a rewrite of the tree rather than a
+# formatting pass, and no gate in this repository asks for it.
 define INDENT_SCRIPT
 set -euo pipefail
 cd "$$ROOT"
+# The version comes from .ci/llvm-version, which scripts/check-c-formatting.sh
+# and the installer CI runs read too. Majors disagree on output, so formatting
+# with the wrong one produces a tree that fails the gate this target exists to
+# satisfy, which is a worse outcome than refusing to format at all.
+want_clang=$$(cat .ci/llvm-version)
+clang_format=$${CLANG_FORMAT:-clang-format-$$want_clang}
+if ! command -v "$$clang_format" >/dev/null 2>&1; then
+    echo "indent: $$clang_format not found, no C file formatted" >&2
+    exit 1
+fi
+have_clang=$$("$$clang_format" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ "$${have_clang%%.*}" != "$$want_clang" ]; then
+    echo "indent: clang-format $$have_clang but this tree wants $$want_clang.x; formatting would fail the gate" >&2
+    exit 1
+fi
+git ls-files -z '*.c' '*.h' | xargs -0 "$$clang_format" -i
 if ! command -v shfmt >/dev/null 2>&1; then
     echo "indent: shfmt not found, nothing formatted" >&2
     exit 1

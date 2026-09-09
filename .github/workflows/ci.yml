@@ -87,6 +87,17 @@ jobs:
         if: runner.os == 'Linux'
         run: .ci/check-shell-formatting.sh
 
+      # Linux only, for the reason the shell gate above is: both read tracked
+      # files through a pinned formatter, so the macOS leg would compare the
+      # same bytes against the same binary. The pin is the point, since
+      # clang-format majors disagree on output and the gate is measuring a
+      # style rather than running a tool.
+      - name: C formatting (clang-format, .clang-format)
+        if: runner.os == 'Linux'
+        run: |
+          .ci/install-clang-format.sh
+          scripts/check-c-formatting.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

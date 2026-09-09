@@ -68,7 +68,7 @@ run()
 
 selected=("$@")
 if [ "${selected[0]:-}" = "fast" ]; then
-    selected=(shfmt clippy unit release)
+    selected=(shfmt cfmt clippy unit release)
 fi
 
 want()
@@ -85,6 +85,7 @@ want()
 # the shfmt gate below rejects, so this file failed the gate it exists to run.
 want shfmt && run shfmt bash -c "git ls-files -z '*.sh' '*.hook' | xargs -0 shfmt -d"
 want clippy && run clippy cargo clippy --all-targets
+want cfmt && run cfmt scripts/check-c-formatting.sh
 want unit && run unit cargo test --test unit
 want release && run release cargo build --release --tests
 want dune && run dune bash -c 'cd ast-utils && dune runtest --force'
