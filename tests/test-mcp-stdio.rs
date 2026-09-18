@@ -8634,13 +8634,14 @@ async fn a_run_can_be_capped_or_cancelled_when_its_timeout_was_too_high() {
 /// Retrying a timed-out goal at double the timeout, and putting the timeout
 /// back afterwards.
 ///
-/// The goal here is one no prover discharges, so it times out again and the
-/// flip set stays empty; that branch is covered by the unit test
-/// "a_flip_is_a_goal_that_timed_out_and_then_proved", since a real flip needs a
-/// goal provable in more than T and less than 2T, which is a fact about the
-/// machine rather than about the fixture. What this pins is everything around
-/// it: that the retry runs at all, at the doubled timeout, only when asked, and
-/// that it does not leave the doubled timeout behind.
+/// The assertion here is one no prover discharges, so it times out again and
+/// never flips. The overflow obligations RTE adds are provable, and whether one
+/// exceeds T and proves within 2T is a fact about the machine: on a riscv64 VM
+/// one does. So flips are counted rather than forbidden, and the unit test
+/// "a_flip_is_a_goal_that_timed_out_and_then_proved" covers a flip itself. What
+/// this pins is everything around it: that the retry runs at all, at the
+/// doubled timeout, only when asked, and that it does not leave the doubled
+/// timeout behind.
 #[tokio::test]
 async fn a_timed_out_goal_is_retried_at_double_the_timeout() {
     let fixture = workspace_path("tests/fixtures/prover-timeout.c");
@@ -8669,13 +8670,19 @@ async fn a_timed_out_goal_is_retried_at_double_the_timeout() {
     assert_eq!(retry["timeout_seconds"]["first_pass"], 1, "{retry:?}");
     assert_eq!(retry["timeout_seconds"]["retry"], 2, "{retry:?}");
 
-    // No prover discharges this goal, so nothing flips however long it runs.
-    // The count itself is not pinned: how many of the overflow obligations
-    // exhaust one second is a fact about the machine.
+    // The counts are not pinned, because how many overflow obligations exhaust
+    // one second is a fact about the machine. At least one goal has to time
+    // out, or there is nothing to retry.
     let timed_out = retry["timed_out_first_pass"].as_u64().unwrap_or(0);
+    let flipped = retry["flipped"].as_array().expect("flipped array");
     assert!(timed_out >= 1, "nothing timed out to retry: {retry:?}");
-    assert_eq!(retry["still_unproved"], json!(timed_out), "{retry:?}");
-    assert_eq!(retry["flipped"], json!([]), "{retry:?}");
+
+    // Exact, not a prefix: the overflow obligations are named
+    // typed_nocast_slow_assert_rte_signed_overflow.
+    assert!(
+        flipped.iter().all(|goal| goal["wpo_id"] != "typed_nocast_slow_assert"),
+        "the unprovable assertion flipped: {retry:?}"
+    );
 
     // The retry has to force the cache off, and this is what says it did. WP
     // caches a timeout like any other verdict, so a retry that inherits the
@@ -8684,17 +8691,23 @@ async fn a_timed_out_goal_is_retried_at_double_the_timeout() {
     let goals = call_tool_json(&client, "get_wp_goals", json!({"function": "slow"}))
         .await
         .unwrap();
+
+    // The assertion pinned by name, or the flip check above passes vacuously
+    // once the goal is renamed, and the filter below has nothing to reject.
+    let assertion = goals
+        .as_array()
+        .expect("goal array")
+        .iter()
+        .find(|goal| goal["wpo_id"] == "typed_nocast_slow_assert")
+        .unwrap_or_else(|| panic!("the assertion's goal is missing: {goals:?}"));
+    assert_eq!(assertion["normalized_status"], "timeout", "{assertion:?}");
+
     let timeouts: Vec<_> = goals
         .as_array()
         .expect("goal array")
         .iter()
         .filter(|goal| goal["normalized_status"] == "timeout")
         .collect();
-
-    // Asserted non-empty first, or the filter below has nothing to reject and
-    // the cache regression this exists to catch would pass on a goal list of
-    // the wrong shape.
-    assert!(!timeouts.is_empty(), "no goal came back timeout: {goals:?}");
     let replayed: Vec<_> = timeouts
         .iter()
         .filter(|goal| goal["from_cache"] == true)

@@ -116,8 +116,8 @@ fn wp_goal_identity(goal: &serde_json::Value) -> Option<&str> {
 ///
 /// Split out from the retry so the flip can be tested at all: it needs a goal
 /// provable in more than the first timeout and less than double it, which is a
-/// property of the machine rather than of the fixture, so the live test only
-/// ever reaches this with an empty flip set.
+/// property of the machine rather than of the fixture, so the live test cannot
+/// be made to produce a flip on demand.
 pub fn timeout_retry_report(
     timed_out: &BTreeSet<String>,
     retried: &[serde_json::Value],
