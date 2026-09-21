@@ -432,7 +432,7 @@ fn fragment_names(fragment: &str) -> Vec<String> {
     let declared = fragment.split('=').next().unwrap_or(fragment);
     let start = declared.rfind(['{', '}']).map_or(0, |at| at + 1);
     let body = &fragment[start..];
-    if body.contains('(') {
+    if declared_part(body).contains('(') {
         return Vec::new();
     }
     let parts = split_top_level(body);
@@ -450,10 +450,26 @@ fn declarator_name(part: &str) -> Option<String> {
     (is_identifier(name) && !KEYWORDS.contains(&name)).then(|| name.to_string())
 }
 
+/// The text a declaration declares in, which is everything before its
+/// initializer. A macro or a call on the right of the "=" says nothing about
+/// whether the left declares an object.
+fn declared_part(statement: &str) -> &str {
+    statement.split('=').next().unwrap_or(statement)
+}
+
 /// Whether a cleaned line is a plain data declaration: it ends a statement and
-/// opens no call, which excludes a prototype and a function pointer alike.
+/// its declarator opens no call, which excludes a prototype and a function
+/// pointer alike.
+///
+/// The parenthesis test reads the declarator rather than the line, because an
+/// initializer routinely holds a call: "int limit = SEC(5);" declares limit,
+/// and rejecting it on the parentheses made the global disappear along with
+/// every access to it.
 fn is_declaration(line: &str) -> bool {
-    line.ends_with(';') && !line.contains('(') && !line.starts_with('#') && !line.is_empty()
+    line.ends_with(';')
+        && !declared_part(line).contains('(')
+        && !line.starts_with('#')
+        && !line.is_empty()
 }
 
 /// The name of the function a header declares, given the text from the end of
@@ -596,9 +612,14 @@ fn structure(path: &str, lines: Vec<String>) -> FileScan {
         // a loop whose brace sits on the next one, the Allman form, with a body
         // nothing marked, so a pool spawned inside it was reported as a single
         // thread that cannot race with itself.
-        let carried = pending_loop;
+        // A loop header with its body beside it is a loop on this line, not
+        // on the next: "for (...) pthread_create(...);" spawns a pool, and
+        // hanging the mark on the following line alone reported it as a thread
+        // that runs once and cannot race with itself.
+        let same_line_body = opens_loop(&line) && matches!(branch_on(&line), Branch::SameLine);
+        let carried = pending_loop || same_line_body;
         scan.in_loop[index] = carried || blocks.loops.iter().any(|is_loop| *is_loop);
-        pending_loop = opens_loop(&line) && !line.contains('{');
+        pending_loop = opens_loop(&line) && matches!(branch_on(&line), Branch::NextLine);
         let opened = line.matches('{').count();
         let closed = line.matches('}').count();
         for _ in 0..opened {
@@ -1340,6 +1361,20 @@ fn event_json(event: &Event) -> serde_json::Value {
     })
 }
 
+/// Read one source, refusing anything that is not a regular file.
+///
+/// A fifo, a character device or a directory is not a translation unit, and
+/// read_to_string on the first two does not return. Refusing by file type
+/// reports the reason instead of hanging, and a scan that names one still
+/// reports every other file it was given.
+fn read_source_file(path: &str) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    fs::read_to_string(path).map_err(|error| error.to_string())
+}
+
 /// Read every file, then screen them together: a thread entry is routinely
 /// defined in a different translation unit from the pthread_create naming it.
 pub fn scan_sources(
@@ -1377,13 +1412,19 @@ fn scan_to_deadline(
 ) -> serde_json::Value {
     let mut scans = Vec::new();
     let mut unreadable = Vec::new();
+    let mut read_within_deadline = true;
     for file in files {
-        // Not metadata: a file that stats cleanly and is not UTF-8 used to
-        // contribute nothing and be reported as scanned, which reads as a file
-        // with no races in it.
-        match fs::read_to_string(file) {
+        // The budget covers reading too. It used to start at the emission
+        // pass, so a caller naming a fifo or a character device blocked in
+        // read_to_string forever, and since a blocking task cannot be
+        // cancelled that thread was never coming back.
+        if deadline.passed() {
+            read_within_deadline = false;
+            break;
+        }
+        match read_source_file(file) {
             Ok(text) => scans.push(structure(file, strip_noise(&text))),
-            Err(error) => unreadable.push(json!({"file": file, "error": error.to_string()})),
+            Err(error) => unreadable.push(json!({"file": file, "error": error})),
         }
     }
     let program = survey(&scans);
@@ -1401,8 +1442,11 @@ fn scan_to_deadline(
         limit: max_events,
     };
     let mut lock_order = Vec::new();
-    let mut within_deadline = true;
+    let mut within_deadline = read_within_deadline;
     for file in &scans {
+        if !within_deadline {
+            break;
+        }
         within_deadline = emit_file(
             file,
             &context,
@@ -1412,9 +1456,6 @@ fn scan_to_deadline(
             },
             deadline,
         );
-        if !within_deadline {
-            break;
-        }
     }
     // Any spawn at all, not only the ones whose entry resolved. Reading this
     // off "entries" made a program whose pthread_create wraps its argument

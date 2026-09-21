@@ -1140,14 +1140,72 @@ fn a_scan_that_runs_out_of_budget_says_the_counts_are_a_floor() {
     std::fs::write(&file, &source).expect("write fixture");
     let path = [file.to_string_lossy().into_owned()];
 
+    // A budget this small expires before the first line is emitted, so the
+    // scan stops at once. That is what makes the two flags deterministic; it
+    // is not a partial count, and an earlier version of this test compared the
+    // two runs' event counts as though it were, which only ever asserted that
+    // some number exceeds zero.
     let stopped = scan_within(&path, 10_000, 2_000, false, std::time::Duration::from_nanos(1));
     assert_eq!(stopped["scan_complete"], false, "{stopped:?}");
     assert_eq!(stopped["candidate_enumeration_complete"], false, "{stopped:?}");
+    assert_eq!(stopped["event_count"], 0, "{stopped:?}");
 
     let whole = scan_within(&path, 10_000, 2_000, false, std::time::Duration::from_secs(120));
     assert_eq!(whole["scan_complete"], true, "{whole:?}");
-    assert!(
-        whole["event_count"].as_u64().expect("count")
-            > stopped["event_count"].as_u64().expect("count")
+    assert!(whole["event_count"].as_u64().expect("count") > 0);
+}
+
+/// A pool spawned by a loop whose body sits beside its head. Marking only the
+/// following line reported the entry as a thread that runs once, so four
+/// threads writing one global produced no candidate at all.
+#[test]
+fn a_loop_that_spawns_on_its_own_line_may_repeat() {
+    let payload = scan(
+        r#"
+int shared;
+void *worker(void *a) { shared = 1; return 0; }
+int main(void)
+{
+    pthread_t t[4];
+    int i;
+    for (i = 0; i < 4; i++) pthread_create(&t[i], 0, worker, 0);
+    return 0;
+}
+"#,
     );
+    let entry = payload["thread_entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["entry"] == "worker")
+        .expect("worker is a thread entry");
+    assert_eq!(entry["spawned_in_loop"], true, "{entry:?}");
+    assert_eq!(entry["may_repeat"], true, "{entry:?}");
+    assert!(!candidates(&payload).is_empty(), "{payload:?}");
+}
+
+/// An initializer is allowed parentheses. Testing the whole statement for them
+/// rejected the declaration, and the global went with it.
+#[test]
+fn a_global_initialized_by_a_macro_call_is_still_a_global() {
+    let payload = scan("int limit = SEC(5);\nvoid f(void) { limit = 1; }\n");
+    assert_eq!(zones(&payload), BTreeSet::from(["limit".to_string()]));
+}
+
+/// A fifo is not a translation unit, and reading one does not return. It is
+/// named as unreadable rather than hung on.
+#[test]
+fn a_file_that_is_not_regular_is_reported_rather_than_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("subdir.c");
+    std::fs::create_dir(&path).expect("make a directory where a file is named");
+    let payload = scan_sources(
+        &[path.to_string_lossy().into_owned()],
+        10_000,
+        2_000,
+        false,
+    );
+    let unreadable = payload["unreadable_files"].as_array().expect("unreadable");
+    assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+    assert_eq!(unreadable[0]["error"], "not a regular file", "{unreadable:?}");
 }
