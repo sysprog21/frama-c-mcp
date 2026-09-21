@@ -305,8 +305,10 @@ jobs:
         id: stdio
         # Parallel, unlike the gates above: every test in this suite owns its
         # server, its frama-c and its state directory. See scripts/run-gates.sh
-        # for the measurement. libtest's default is available parallelism, so
-        # this follows the runner rather than pinning a count.
+        # for the measurement. Four rather than libtest's default of available
+        # parallelism, because the default started losing the heaviest tests to
+        # connection failures as the suite grew past 89. On a 4-core runner the
+        # pin is what libtest would pick anyway.
         env:
           # A bind/listen race the retry absorbs is reported as a tracing warn,
           # and the default EnvFilter admits ERROR only, so without this the one
@@ -315,7 +317,7 @@ jobs:
           RUST_LOG: frama_c_mcp=warn
         run: |
           set -o pipefail
-          cargo test --test test-mcp-stdio --release 2>&1 | tee "$RUNNER_TEMP/mcp-stdio.log"
+          cargo test --test test-mcp-stdio --release -- --test-threads=4 2>&1 | tee "$RUNNER_TEMP/mcp-stdio.log"
 
       # Not success(): a refusal is one of the things that fails the suite, so
       # the scan has to happen on exactly the runs where the step above went

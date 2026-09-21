@@ -1837,6 +1837,54 @@ fn run_gates_runs_every_ci_gate() {
     );
 }
 
+/// The stdio suite's thread count is a number in two files, and the pin it
+/// carries went a fortnight without being applied in either: the decision was
+/// written down, the flag was in neither command, and each file's comment
+/// argued for the default the decision had rejected. This repository's answer
+/// to a fact that must agree in two places is a guard, which is what
+/// ci_runs_every_test_target and documented_gate_list_covers_ci already are;
+/// without one, the fix for a drift between two documents is a third document.
+///
+/// It reads the count rather than asserting a value, so raising the pin stays a
+/// one-line change in each file rather than a change here too. What it refuses
+/// is the two disagreeing, and either one dropping the flag.
+#[test]
+fn the_stdio_suite_is_pinned_to_one_thread_count_everywhere() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = vec![root.join("scripts/run-gates.sh")];
+    sources.extend(workflow_files(root));
+
+    let mut counts: Vec<(String, String)> = Vec::new();
+    for path in sources {
+        // read_source rather than a read that skips what it cannot open: a
+        // guard that skips a file reports on the part of the tree it happened
+        // to reach.
+        let text = read_source(&path);
+        let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+        // One predicate, stating the rule the doc comment above describes: a
+        // command, not a comment, and not any line that merely names the suite.
+        let runs = text.lines().map(str::trim_start).filter(|code| {
+            !code.starts_with('#') && code.contains("cargo test") && code.contains("test-mcp-stdio")
+        });
+        for code in runs {
+            let Some(rest) = code.split("--test-threads=").nth(1) else { continue };
+            let count: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            counts.push((shown.clone(), count));
+        }
+    }
+
+    assert_eq!(
+        counts.len(),
+        2,
+        "the stdio suite is run in two places and both must pin a thread count: {counts:?}"
+    );
+    assert!(
+        counts[0].1 == counts[1].1 && !counts[0].1.is_empty(),
+        "the two runs of the stdio suite pin different thread counts, so one of \
+         them is not the measurement the other was chosen by: {counts:?}"
+    );
+}
+
 /// The gate list in the documentation covers everything CI runs over a whole
 /// suite.
 ///
