@@ -3880,7 +3880,12 @@ impl FramaCMcpServer {
     /// points at the socket rather than at the program.
     fn report_lost_process(state: Option<&MainFramaCState>, client: Option<&Arc<FramaCClient>>) {
         let Some(state) = state else { return };
-        if !state.poisoned && !client.is_some_and(|client| client.is_poisoned()) {
+        // The transport's own flag, and not the session's. A reload whose
+        // sources moved underneath it, and a reload that returned an error,
+        // both set state.poisoned with the connection intact, so reading that
+        // here announced a lost process about one that is still running and
+        // attached log tails that explain nothing.
+        if !client.is_some_and(|client| client.is_poisoned()) {
             return;
         }
         tracing::warn!(
