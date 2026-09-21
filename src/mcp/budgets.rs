@@ -45,14 +45,14 @@ pub(crate) const PROBE_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// quickly is not going to answer at all.
 pub(crate) const TOOL_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Ceiling on an external command that does real work: a WP print run, a why3
 /// Ceiling on parsing one C file for the parse-surface report.
 ///
 /// The same number as AST_COMPUTE_BUDGET and for the same reason: a probe runs
 /// the front end over one translation unit, which is the work that budget
 /// covers for a whole project. It is not EXTERNAL_COMMAND_BUDGET, which is for
 /// a tool this server shells out to rather than the analyzer itself.
-pub(crate) const PARSE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const PARSE_PROBE_BUDGET: Duration = Duration::from_secs(120);
 
+/// Ceiling on an external command that does real work: a WP print run, a why3
 /// dump, an e-acsl compile.
 pub(crate) const EXTERNAL_COMMAND_BUDGET: Duration = Duration::from_secs(60);
