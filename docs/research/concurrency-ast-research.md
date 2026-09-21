@@ -36,7 +36,7 @@ statement; the unit of a line scanner is a line. `pending_loop` exists because
 a brace-less loop body is the next statement. `fragment_names` splitting on
 `;` is statement-splitting done locally. `header_function` accumulating a
 header buffer across lines is the same job a third time. `KEYWORDS` is a
-24-word list asked to stand in for a type table, and it cannot be completed,
+25-word list asked to stand in for a type table, and it cannot be completed,
 because what it is really trying to express is "this token is a type name",
 which is unanswerable without a typedef table.
 
@@ -175,7 +175,7 @@ structured tree from `stmt_to_json`, loop bodies, per-occurrence read and write
 with the `global` flag, and callees resolved by `extract_callee_name`. What
 stays text-derived is two trims over CIL printer output: is the third actual of
 a `pthread_create` the token `worker`, and strip the `& ` from `& m`. That is
-not the 24-word keyword list standing in for a type table that §1 condemns; it
+not the 25-word keyword list standing in for a type table that §1 condemns; it
 is printed CIL with no comments, no macros and no typedefs in it.
 
 B's real costs are latency, N round trips each re-serializing the whole-program
@@ -187,7 +187,7 @@ spelling rather than a base and an offset.
 
 Add `getConcurrentEvents` to ast-utils, taking `Junit` and returning every
 defined function's concurrent events in one response. `getContractFrontier`
-(`ast_utils_register.ml:158`) is the existing precedent for exactly this shape,
+(`ast_utils_register.ml:148`) is the existing precedent for exactly this shape,
 so the registration is boilerplate this tree already contains. It is a
 precedent for the shape only: what it computes, a contract-reachability
 frontier, has nothing to do with events.

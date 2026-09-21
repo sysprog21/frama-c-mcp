@@ -55,7 +55,7 @@ Side effects: none. It reads the AST and allocates JSON.
 
 It reuses `cil_context_visitor` for accesses and calls rather than walking the
 AST a second way, and `lval_touches_global` for the global question. It adds the
-five resolutions the research report identified, which do not exist today:
+five resolutions the research report identified, plus the entry sid the fixpoint starts from, none of which exist today:
 
 | addition | from | why not reuse |
 |---|---|---|
