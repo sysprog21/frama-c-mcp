@@ -4,11 +4,8 @@ use crate::server_fixture::{lazy_server, MISSING_FRAMA_C};
 use frama_c_mcp::error::FramaCError;
 
 use frama_c_mcp::mcp::server::*;
-use frama_c_mcp::mcp::server::analysis::{
-    goal_needs_failure_classification,
-    property_is_dead, render_sequent,
-    wp_backend_anomaly_left_goal_unjudged,
-};
+use frama_c_mcp::mcp::server::analysis::wp_backend_anomaly_left_goal_unjudged;
+use frama_c_mcp::mcp::server::verdicts::{goal_needs_failure_classification, property_is_dead, render_sequent};
 
 // The band this file was named after now has a module of its own in src/, for
 // the same reason this file came out of tests/unit/server.rs.

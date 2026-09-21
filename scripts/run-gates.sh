@@ -104,15 +104,19 @@ want artifacts && run artifacts scripts/check-artifacts.sh
 want corpus && run corpus scripts/check-tutorial-corpus.sh
 want svcomp && run svcomp scripts/check-svcomp-fixture.sh
 
-# No --test-threads=1, unlike every other Frama-C gate here. Each of this
-# suite's 89 tests spawns its own server, its own frama-c and its own state
-# directory, so nothing is shared to serialise. Measured cold on 8 cores:
-# 1160.81s serial against 218.42s at libtest's default, both 89/89. The default
-# is available parallelism rather than a pinned number, so a 4-core runner gets
-# 4 and this does not oversubscribe whatever machine it lands on. RUST_LOG
-# matches the stdio step in .github/workflows/ci.yml: without it the
-# recovered-race warn the check below counts is filtered out before the log.
-want stdio && run stdio env RUST_LOG=frama_c_mcp=warn cargo test --test test-mcp-stdio --release
+# Parallel, unlike every other Frama-C gate here: each of this suite's tests
+# spawns its own server, its own frama-c and its own state directory, so
+# nothing is shared to serialise. Four, not libtest's default of available
+# parallelism. The default was right while the suite held 89 tests and stopped
+# being one as it grew: five full runs at the default produced two failures,
+# both on the heaviest calls and both with an infrastructure symptom rather
+# than an assertion. Four buys that back for about 140s, and on a 4-core runner
+# it is what libtest would have chosen anyway, so it costs CI nothing. This
+# comment and the one in .github/workflows/ci.yml said the opposite until
+# 2026-09-21, which is how the pin went a fortnight without being applied in
+# either place. RUST_LOG matches that step too: without it the recovered-race
+# warn the check below counts is filtered out before the log.
+want stdio && run stdio env RUST_LOG=frama_c_mcp=warn cargo test --test test-mcp-stdio --release -- --test-threads=4
 # Keyed on the same "want stdio", so the suite cannot be run without its check.
 want stdio && run stdio-refusal env STDIO_LOG="$logs/stdio.log" scripts/check-stdio-refusal.sh
 

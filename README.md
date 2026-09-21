@@ -270,6 +270,7 @@ The server exposes the following tool groups:
 | Domain | Tools | Purpose |
 |--------|-------|---------|
 | Project | `reload_project`, `list`, `context`, `self_check`, `parse_surface` | Load source, inspect declarations, navigate call relationships, report server capabilities, and measure how much of a file set Frama-C can parse at all |
+| Concurrency | `analyze_concurrency` | Screen source text for concurrent events, lock order, and race candidates. Level-0 syntax: candidates are never verdicts, and an absent candidate is not one either |
 | EVA/WP | `check`, `run_wp`, `get_wp_goals`, `proof_coverage`, `run_e_acsl` | Run verification, read its conclusions, report stored proof coverage, and execute runtime counterexamples |
 | Annotations | `inject_all_annotations`, `propose_annotations` | Dry-run validate and inject ACSL annotations, and propose the frame conditions the code determines |
 | Sandbox | `create_sandbox`, `delete_sandbox` | Isolate annotation experiments |

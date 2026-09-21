@@ -1064,6 +1064,25 @@ pub struct SelfCheckParams {
     pub canary: Option<bool>,
 }
 
+/// Inputs for the cheap, source-grounded concurrency evidence pass.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeConcurrencyParams {
+    /// C sources to inspect. When omitted, use the files in the loaded project.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub files: Option<Vec<String>>,
+    /// Maximum number of CEIR events returned. Defaults to 10,000 and is
+    /// capped at 100,000, so a larger value is silently the cap rather than
+    /// the number asked for.
+    pub max_events: Option<usize>,
+    /// Maximum number of race candidates returned. Pairing is quadratic in the
+    /// accesses to one memory zone, so this is a bound on the response as well
+    /// as on the work behind it. Defaults to 2,000 and is capped at 20,000.
+    pub max_candidates: Option<usize>,
+    /// Include non-global/local memory events in the syntactic evidence.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub include_unshared: Option<bool>,
+}
+
 // Print source
 
 // Sandbox tools

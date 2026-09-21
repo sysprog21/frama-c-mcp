@@ -2815,7 +2815,7 @@ fn scope_for_function(function: &str) -> FunctionScope<'_> {
 /// once to text and once back into a Value that was a deep copy of the tree the
 /// caller was about to discard. On a check with detail "full" that copy is
 /// around 21,000 nodes.
-fn json_result(value: serde_json::Value) -> CallToolResult {
+pub(crate) fn json_result(value: serde_json::Value) -> CallToolResult {
     let mut result = CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap_or_default(),
     )]);
@@ -3358,6 +3358,7 @@ impl FramaCMcpServer {
     pub fn tool_router() -> ToolRouter<Self> {
         Self::project_router()
             + Self::analysis_router()
+            + Self::concurrency_router()
             + Self::coverage_router()
             + Self::annotations_router()
             + Self::sandbox_router()
@@ -3861,6 +3862,40 @@ impl FramaCMcpServer {
         }
     }
 
+    /// Say what a Frama-C that died mid-session left behind, before its state
+    /// is replaced.
+    ///
+    /// The transport reports EOF as "connection closed" and nothing more,
+    /// because it owns a socket and not a child: it cannot tell an
+    /// out-of-memory kill from a kernel fatal from a prover that took the
+    /// process down with it. So a mid-session death reached the log as an
+    /// unexplained disconnect, and the one flake this suite has seen could only
+    /// be described as "an infrastructure symptom rather than an assertion".
+    ///
+    /// The spawn path already reports this way, through startup_failure_tail,
+    /// and the rule that Frama-C writes its diagnostics to stdout rather than
+    /// stderr applies exactly as hard to a process that dies later. Liveness is
+    /// read with kill(pid, 0) rather than waited for, because the child is
+    /// owned elsewhere; a process that is gone says so, and one still running
+    /// points at the socket rather than at the program.
+    fn report_lost_process(state: Option<&MainFramaCState>, client: Option<&Arc<FramaCClient>>) {
+        let Some(state) = state else { return };
+        // The transport's own flag, and not the session's. A reload whose
+        // sources moved underneath it, and a reload that returned an error,
+        // both set state.poisoned with the connection intact, so reading that
+        // here announced a lost process about one that is still running and
+        // attached log tails that explain nothing.
+        if !client.is_some_and(|client| client.is_poisoned()) {
+            return;
+        }
+        tracing::warn!(
+            pid = state.pid,
+            alive = process_is_alive(state.pid),
+            tail = %startup_failure_tail(&state.stdout_log_path, &state.stderr_log_path, 20),
+            "frama-c connection lost mid-session; respawning"
+        );
+    }
+
     /// Bring the main Frama-C instance up to date with the requested files and
     /// options, spawning it if needed.
     ///
@@ -3912,6 +3947,10 @@ impl FramaCMcpServer {
                     || !parse_record_survives(s, &identity)
             }
         };
+
+        // Only when a transport went, and before the state that explains it is
+        // replaced by the new process's.
+        Self::report_lost_process(main_lock.as_ref(), client_lock.as_ref());
 
         if !needs_respawn {
             let client = client_lock.as_ref().expect("invariant: client ⇔ state").clone();
@@ -4788,7 +4827,14 @@ pub mod wpclass;
 use wpclass::*;
 #[path = "analysis.rs"]
 pub mod analysis;
+#[path = "concurrency.rs"]
+pub mod concurrency;
 use analysis::unproved_assumption_findings;
+/// What a recorded status means: the predicates that read one property or one
+/// goal and answer a single question about its verdict. Split from analysis.rs
+/// for the same reason checkgaps was; see the module's own header.
+#[path = "verdicts.rs"]
+pub mod verdicts;
 /// What makes a check incomplete, and the guidance behind each gap code.
 /// Split from analysis.rs, whose free functions outgrew the impl block they
 /// serve; see the module's own header.

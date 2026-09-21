@@ -11,11 +11,10 @@ use frama_c_mcp::mcp::server::analysis::unproved_assumption_findings;
 use frama_c_mcp::mcp::server::checkgaps::{check_incomplete_items, WantedAnalyses};
 
 use frama_c_mcp::mcp::server::*;
-use frama_c_mcp::mcp::server::analysis::{
-    append_to_error_message, assumed_callee_contract_findings, unresolved_call_findings,
-    finish_verify_program_step_response, goal_status_matches, present_statuses, reject_unknown_status,
-    wp_timed_out,
-    GOAL_STATUS_UNPROVED, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
+use frama_c_mcp::mcp::server::analysis::{assumed_callee_contract_findings, unresolved_call_findings, finish_verify_program_step_response, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES};
+use frama_c_mcp::mcp::server::verdicts::{
+    append_to_error_message, goal_status_matches, present_statuses, reject_unknown_status,
+    wp_timed_out, GOAL_STATUS_UNPROVED,
 };
 use frama_c_mcp::mcp::server::contracts::int_literal_before;
 use frama_c_mcp::mcp::server::propose::{expected_clause_text, normalize_clause_text};
@@ -338,7 +337,7 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
     // tautology dressed as a check. The pin that matters, self_check against
     // the declared surface, lives in the lifecycle suite; this one is here so
     // the pure-Rust lane notices a count that moved without anyone saying so.
-    assert_eq!(payload["server"]["tool_count"], 16);
+    assert_eq!(payload["server"]["tool_count"], 17);
     assert_eq!(payload["server"]["protocol_version"], "2024-11-05");
 
     // The revisions this server agrees to, reported rather than assumed. 2026

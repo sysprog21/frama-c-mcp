@@ -4,9 +4,7 @@ use crate::server_fixture::lazy_server;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
 use frama_c_mcp::mcp::server::property_status_map;
-use frama_c_mcp::mcp::server::analysis::{
-    profile_covers_exactly, profile_matches_loaded_project, proof_goal_diff,
-};
+use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project, proof_goal_diff};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
 use frama_c_mcp::mcp::server::WpRunResponse;

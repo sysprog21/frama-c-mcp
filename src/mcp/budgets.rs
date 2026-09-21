@@ -45,14 +45,26 @@ pub(crate) const PROBE_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// quickly is not going to answer at all.
 pub(crate) const TOOL_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Ceiling on an external command that does real work: a WP print run, a why3
 /// Ceiling on parsing one C file for the parse-surface report.
 ///
 /// The same number as AST_COMPUTE_BUDGET and for the same reason: a probe runs
 /// the front end over one translation unit, which is the work that budget
 /// covers for a whole project. It is not EXTERNAL_COMMAND_BUDGET, which is for
 /// a tool this server shells out to rather than the analyzer itself.
-pub(crate) const PARSE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const PARSE_PROBE_BUDGET: Duration = Duration::from_secs(120);
 
+/// Ceiling on an external command that does real work: a WP print run, a why3
 /// dump, an e-acsl compile.
 pub(crate) const EXTERNAL_COMMAND_BUDGET: Duration = Duration::from_secs(60);
+
+/// Ceiling on the Level-0 concurrency scan of one project's sources.
+///
+/// Not EXTERNAL_COMMAND_BUDGET: nothing is shelled out to. Not
+/// PARSE_PROBE_BUDGET either, though it carries the same number, because that
+/// one bounds Frama-C's front end and this bounds work this server does itself
+/// over text whose shape it does not control.
+///
+/// Read the caveat at its use site before trusting it: a blocking task cannot
+/// be cancelled, so this bounds the caller's wait and the scan carries its own
+/// cooperative deadline for the work.
+pub(crate) const CONCURRENCY_SCAN_BUDGET: Duration = Duration::from_secs(120);

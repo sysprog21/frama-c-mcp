@@ -9,7 +9,7 @@
 //! are comparable exactly when their hashes match.
 
 use super::*;
-use crate::mcp::server::analysis::goal_is_vacuously_proved;
+use crate::mcp::server::verdicts::goal_is_vacuously_proved;
 use crate::state::sha256_hex;
 
 /// What a receipt calls a source file.
