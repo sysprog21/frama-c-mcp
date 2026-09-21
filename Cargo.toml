@@ -73,13 +73,17 @@ rmcp = { version = "3", features = ["client", "transport-child-process"] }
 # than in the gate's command line keeps a plain `cargo clippy` honest too, which
 # is what anyone actually types before pushing.
 [lints.rust]
-# The general instrument for an item nothing reaches. It fired on the day a
+# The instrument for a private item nothing reaches. It fired on the day a
 # guard was split from its #[test] attribute and became an ordinary function,
 # and it fired as a warning nothing fails on, so the suite went green with one
-# fewer guard in it. As a deny it covers every orphan shape: an attribute that
-# moved, a helper whose last caller went, a test renamed out of a #[path]
-# module. What it cannot cover is a doc comment that attaches to the wrong
-# item, because both items still exist; that stays a review question.
+# fewer guard in it.
+#
+# As a deny it fails the build on that shape: an attribute that moved, a
+# helper whose last caller went, a test renamed out of a #[path] module. It is
+# not a general orphan check. A pub item in this library is never reported,
+# because the unit tests link the crate from outside and everything they reach
+# is published; and a doc comment that attaches to the wrong item is invisible
+# to it, since both items still exist. That one stays a review question.
 dead_code = "deny"
 
 [lints.clippy]
