@@ -11,11 +11,10 @@ use frama_c_mcp::mcp::server::analysis::unproved_assumption_findings;
 use frama_c_mcp::mcp::server::checkgaps::{check_incomplete_items, WantedAnalyses};
 
 use frama_c_mcp::mcp::server::*;
-use frama_c_mcp::mcp::server::analysis::{
-    append_to_error_message, assumed_callee_contract_findings, unresolved_call_findings,
-    finish_verify_program_step_response, goal_status_matches, present_statuses, reject_unknown_status,
-    wp_timed_out,
-    GOAL_STATUS_UNPROVED, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES,
+use frama_c_mcp::mcp::server::analysis::{assumed_callee_contract_findings, unresolved_call_findings, finish_verify_program_step_response, VERIFY_PROGRAM_STEP_RESPONSE_CAP_BYTES};
+use frama_c_mcp::mcp::server::verdicts::{
+    append_to_error_message, goal_status_matches, present_statuses, reject_unknown_status,
+    wp_timed_out, GOAL_STATUS_UNPROVED,
 };
 use frama_c_mcp::mcp::server::contracts::int_literal_before;
 use frama_c_mcp::mcp::server::propose::{expected_clause_text, normalize_clause_text};

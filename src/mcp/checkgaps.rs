@@ -12,6 +12,8 @@
 //! separable when the rest of that file is a sequence over the live instance.
 
 use super::*;
+// The verdict predicates, split out of analysis.rs.
+use super::verdicts::*;
 
 // The band this came out of. The dependency runs one way at the item level, but
 // analysis.rs also calls back into here, so both carry a glob rather than a

@@ -4789,6 +4789,11 @@ use wpclass::*;
 #[path = "analysis.rs"]
 pub mod analysis;
 use analysis::unproved_assumption_findings;
+/// What a recorded status means: the predicates that read one property or one
+/// goal and answer a single question about its verdict. Split from analysis.rs
+/// for the same reason checkgaps was; see the module's own header.
+#[path = "verdicts.rs"]
+pub mod verdicts;
 /// What makes a check incomplete, and the guidance behind each gap code.
 /// Split from analysis.rs, whose free functions outgrew the impl block they
 /// serve; see the module's own header.
