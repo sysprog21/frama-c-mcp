@@ -750,6 +750,7 @@ fn tool_registry_count_matches_declared_snapshots() {
 /// unannounced fails a test; a number kept beside the list can be edited to
 /// green without anyone reading the surface it claims to describe.
 const DECLARED_TOOLS: &[&str] = &[
+    "analyze_concurrency",
     "check",
     "context",
     "create_sandbox",

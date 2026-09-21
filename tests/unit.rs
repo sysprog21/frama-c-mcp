@@ -17,6 +17,8 @@ mod server_fixture;
 mod acsl_shapes;
 #[path = "unit/check-gaps.rs"]
 mod check_gaps;
+#[path = "unit/concurrency.rs"]
+mod concurrency;
 #[path = "unit/coverage.rs"]
 mod coverage;
 #[path = "unit/repo-guards.rs"]

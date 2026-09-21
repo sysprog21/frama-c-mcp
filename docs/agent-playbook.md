@@ -215,6 +215,20 @@ name. The formulas are WP terms, not source ACSL, so names are mangled (`x_0`
 for a parameter `x`) and types read as predicates (`is_sint32`); to get back to
 source, join a hypothesis `sid` to `getFunctionAst`.
 
+## Concurrency Screening Loop
+
+For concurrent C, call `analyze_concurrency {files?, max_events?, max_candidates?, include_unshared?}` after loading the project, or with explicit source files. It reads the source as text: no Frama-C, no AST, no aliasing.
+
+What comes back and how to read it:
+
+- `events` are the Concurrent Event IR: thread create and join, lock and unlock, and reads and writes of each memory zone, each with the thread entries that reach its function, its lexical lockset, and its callsite.
+- `candidates` are pairs this pass cannot order. Every one has `status: "potential"`, and that is the only status there is. A `lock_evidence` naming a lock both accesses hold is evidence and not protection: acquisition is not path sensitive here, and two spellings are not proof of one mutex.
+- `threads_detected` is false when nothing calls `pthread_create`. There are no candidates in that case, because nothing here is concurrent. It counts the calls, not the entries resolved from them, so a spawn this pass cannot read is still a spawn: `unresolved_spawn_sites` is how many of them named no entry, and each one is a thread missing from `thread_entries` whose functions pair only as unattributed ones.
+- `event_count` and `candidate_count` are what was found; `events_omitted` and `candidates_omitted` are what the limits dropped. `candidate_enumeration_complete` is false whenever the scan was cut short, which makes `candidate_count` a floor rather than a total. Three things cut it short: the pair budget, which a larger `max_candidates` raises; a `max_events` too small to keep the accesses the pairing runs over, which no `max_candidates` can repair; and a file in `unreadable_files`, which truncates the input itself.
+- `unreadable_files` names every file that did not decode, which is the only honest way to report one.
+
+The rule that matters: an absent candidate is not evidence of an absent race. `evidence.unsupported` lists what this pass cannot see, and any of those entries can hide one. Take a candidate to Eva or Mthread outside this surface before calling a defect; `refinement.tool` is null because no tool here confirms one.
+
 ## Specification-First Loop
 
 For a function with no annotations at all, where the frame has to exist before

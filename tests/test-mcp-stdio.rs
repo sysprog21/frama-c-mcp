@@ -12444,3 +12444,91 @@ async fn a_retry_that_cannot_digest_does_not_erase_the_checks_own_digest() {
 
     let _ = client.cancel().await;
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// analyze_concurrency over the loaded project
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The screen against a real concurrent program, through the MCP surface and
+/// the loaded project rather than a direct call.
+///
+/// This test used to run on abs-int-fixed.c, which has no thread, no mutex and
+/// no global in it, and assert three schema strings the payload writes
+/// unconditionally. It passed against a function returning that JSON literal
+/// and nothing else, so it reported a working tool while every shape below was
+/// being screened wrong.
+#[tokio::test]
+async fn analyze_concurrency_screens_a_concurrent_program() {
+    let c_file = workspace_path("tests/fixtures/concurrency-race.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let report = call_tool_json(&client, "analyze_concurrency", json!({}))
+        .await
+        .expect("concurrency report");
+
+    assert_eq!(report["schema"], "frama-c-mcp.concurrency.v1");
+    assert_eq!(report["analysis_level"], 0);
+    assert_eq!(report["analysis"], "syntactic_screening");
+    assert_eq!(report["threads_detected"], true, "{report:?}");
+
+    // The files come from the loaded project: the call named none.
+    let files = report["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{files:?}");
+
+    // One textual pthread_create inside a loop is a pool, not one thread.
+    let worker = report["thread_entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["entry"] == "worker")
+        .unwrap_or_else(|| panic!("worker is not a thread entry: {report:?}"));
+    assert_eq!(worker["spawn_sites"], 1, "{worker:?}");
+    assert_eq!(worker["spawned_in_loop"], true, "{worker:?}");
+    assert_eq!(worker["may_repeat"], true, "{worker:?}");
+
+    let events = report["events"].as_array().expect("events");
+
+    // The update is a write, it is inside the helper, and the helper belongs to
+    // the thread that reaches it rather than to no thread at all.
+    let update = events
+        .iter()
+        .find(|event| event["memory_zone"] == "shared_counter")
+        .unwrap_or_else(|| panic!("no access to shared_counter: {report:?}"));
+    assert_eq!(update["kind"], "WRITE", "{update:?}");
+    assert_eq!(update["function"], "bump", "{update:?}");
+    assert_eq!(update["threads"], json!(["worker"]), "{update:?}");
+
+    // A write on the same line as no pthread call, holding the lock taken on
+    // the line before it.
+    let guarded = events
+        .iter()
+        .find(|event| event["memory_zone"] == "flag" && event["kind"] == "WRITE")
+        .unwrap_or_else(|| panic!("no write to flag: {report:?}"));
+    assert_eq!(guarded["lockset"], json!(["lock"]), "{guarded:?}");
+
+    // Both declarators of "static int flag, spare;" are zones, so the one that
+    // is written is not invisible for having been declared second.
+    let declared: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["memory_zone"].as_str())
+        .collect();
+    assert!(declared.contains(&"flag"), "{declared:?}");
+
+    // The pool races with itself, and no candidate is ever downgraded to
+    // something that reads as a verdict.
+    let candidates = report["candidates"].as_array().expect("candidates");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["memory_zone"] == "shared_counter"),
+        "{candidates:?}"
+    );
+    // Not a bare loop over the list: an empty list satisfies one, which is the
+    // way the first version of this test asserted nothing at all.
+    assert!(!candidates.is_empty(), "{report:?}");
+    for candidate in candidates {
+        assert_eq!(candidate["status"], "potential", "{candidate:?}");
+    }
+    assert_eq!(report["refinement"]["tool"], Value::Null, "{report:?}");
+
+    let _ = client.cancel().await;
+}

@@ -2815,7 +2815,7 @@ fn scope_for_function(function: &str) -> FunctionScope<'_> {
 /// once to text and once back into a Value that was a deep copy of the tree the
 /// caller was about to discard. On a check with detail "full" that copy is
 /// around 21,000 nodes.
-fn json_result(value: serde_json::Value) -> CallToolResult {
+pub(crate) fn json_result(value: serde_json::Value) -> CallToolResult {
     let mut result = CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap_or_default(),
     )]);
@@ -3358,6 +3358,7 @@ impl FramaCMcpServer {
     pub fn tool_router() -> ToolRouter<Self> {
         Self::project_router()
             + Self::analysis_router()
+            + Self::concurrency_router()
             + Self::coverage_router()
             + Self::annotations_router()
             + Self::sandbox_router()
@@ -4821,6 +4822,8 @@ pub mod wpclass;
 use wpclass::*;
 #[path = "analysis.rs"]
 pub mod analysis;
+#[path = "concurrency.rs"]
+pub mod concurrency;
 use analysis::unproved_assumption_findings;
 /// What a recorded status means: the predicates that read one property or one
 /// goal and answer a single question about its verdict. Split from analysis.rs
