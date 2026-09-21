@@ -1861,13 +1861,28 @@ fn the_stdio_suite_is_pinned_to_one_thread_count_everywhere() {
         // to reach.
         let text = read_source(&path);
         let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string();
-        // One predicate, stating the rule the doc comment above describes: a
-        // command, not a comment, and not any line that merely names the suite.
-        let runs = text.lines().map(str::trim_start).filter(|code| {
-            !code.starts_with('#') && code.contains("cargo test") && code.contains("test-mcp-stdio")
-        });
-        for code in runs {
-            let Some(rest) = code.split("--test-threads=").nth(1) else { continue };
+        // Continuations are joined before anything is matched. A command may
+        // be wrapped over several lines, by a trailing backslash in the shell
+        // or by a YAML block scalar, and reading it line by line made a purely
+        // cosmetic rewrap look like a dropped pin: the flag landed on a line
+        // that no longer named the suite, the count fell to one, and a gate
+        // that promises to refuse only a disagreement went red over layout.
+        let joined = text.replace("\\\n", " ");
+        let logical: Vec<String> = joined
+            .lines()
+            .map(|line| line.trim_start().to_string())
+            .collect();
+        for (number, code) in logical.iter().enumerate() {
+            if code.starts_with('#') || !code.contains("test-mcp-stdio") {
+                continue;
+            }
+            // The flag may sit on the command's line or on one of the lines
+            // the same block continues onto.
+            let window = logical[number..logical.len().min(number + 3)].join(" ");
+            if !window.contains("cargo test") {
+                continue;
+            }
+            let Some(rest) = window.split("--test-threads=").nth(1) else { continue };
             let count: String = rest.chars().take_while(char::is_ascii_digit).collect();
             counts.push((shown.clone(), count));
         }
