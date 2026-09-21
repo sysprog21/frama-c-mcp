@@ -3861,6 +3861,35 @@ impl FramaCMcpServer {
         }
     }
 
+    /// Say what a Frama-C that died mid-session left behind, before its state
+    /// is replaced.
+    ///
+    /// The transport reports EOF as "connection closed" and nothing more,
+    /// because it owns a socket and not a child: it cannot tell an
+    /// out-of-memory kill from a kernel fatal from a prover that took the
+    /// process down with it. So a mid-session death reached the log as an
+    /// unexplained disconnect, and the one flake this suite has seen could only
+    /// be described as "an infrastructure symptom rather than an assertion".
+    ///
+    /// The spawn path already reports this way, through startup_failure_tail,
+    /// and the rule that Frama-C writes its diagnostics to stdout rather than
+    /// stderr applies exactly as hard to a process that dies later. Liveness is
+    /// read with kill(pid, 0) rather than waited for, because the child is
+    /// owned elsewhere; a process that is gone says so, and one still running
+    /// points at the socket rather than at the program.
+    fn report_lost_process(state: Option<&MainFramaCState>, client: Option<&Arc<FramaCClient>>) {
+        let Some(state) = state else { return };
+        if !state.poisoned && !client.is_some_and(|client| client.is_poisoned()) {
+            return;
+        }
+        tracing::warn!(
+            pid = state.pid,
+            alive = process_is_alive(state.pid),
+            tail = %startup_failure_tail(&state.stdout_log_path, &state.stderr_log_path, 20),
+            "frama-c connection lost mid-session; respawning"
+        );
+    }
+
     /// Bring the main Frama-C instance up to date with the requested files and
     /// options, spawning it if needed.
     ///
@@ -3912,6 +3941,10 @@ impl FramaCMcpServer {
                     || !parse_record_survives(s, &identity)
             }
         };
+
+        // Only when a transport went, and before the state that explains it is
+        // replaced by the new process's.
+        Self::report_lost_process(main_lock.as_ref(), client_lock.as_ref());
 
         if !needs_respawn {
             let client = client_lock.as_ref().expect("invariant: client ⇔ state").clone();
