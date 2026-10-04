@@ -2474,3 +2474,35 @@ fn structured_content_follows_the_negotiated_protocol_version() {
         "and the text block as well, which the result schema is written against: {new_result:?}"
     );
 }
+
+/// A declined server/discover probe leaves the session usable over initialize.
+///
+/// Claude Code opens with server/discover at 2026-07-28 and, when this server
+/// declines that revision, falls back to initialize on the same stdio session.
+/// rmcp alone commits the session to per-request _meta as soon as the first
+/// message is not initialize, so the fallback handshake succeeded and then
+/// tools/list was refused for missing _meta: "/mcp" showed "connected, tools
+/// fetch failed". self_check also pins that the session remembers the
+/// negotiated revision, since structuredContent goes only to a peer whose
+/// revision is known.
+#[test]
+fn a_declined_discover_probe_falls_back_to_initialize() {
+    let frama_c = std::env::var("FRAMA_C_BIN").unwrap_or_else(|_| "frama-c".into());
+    let (mut mcp, probe, init) = McpHandle::spawn_test_binary_after_discover_probe(&frama_c);
+
+    assert_eq!(probe["error"]["code"], -32022, "{probe:?}");
+    assert_eq!(probe["error"]["data"]["requested"], "2026-07-28", "{probe:?}");
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init:?}");
+
+    let tools = mcp.request("tools/list", "{}");
+    assert!(
+        tools["result"]["tools"].as_array().is_some_and(|t| !t.is_empty()),
+        "tools/list after the fallback handshake: {tools:?}"
+    );
+
+    let check = mcp.call_tool("self_check", "{}");
+    assert!(
+        check["result"]["structuredContent"].is_object(),
+        "the fallback session lost its negotiated revision: {check:?}"
+    );
+}
