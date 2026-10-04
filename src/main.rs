@@ -10,6 +10,82 @@ use frama_c_mcp::CheckParams;
 use frama_c_mcp::mcp::server::FramaCMcpServer;
 use frama_c_mcp::state::SessionState;
 
+/// Keeps a session on the initialize lifecycle when the client probes with
+/// server/discover first.
+///
+/// A 2026-07-28 client opens with server/discover and, when the server declines
+/// that revision, falls back to initialize on the same stdio session. rmcp
+/// commits a session to per-request metadata the moment its first message is
+/// not initialize, before the probe is rejected, and never clears it; so the
+/// fallback handshake succeeds and then every request without _meta, starting
+/// with tools/list, is refused. This server declines 2026-07-28 (see
+/// EXCLUDED_PROTOCOL_VERSIONS), so it answers a probe for a declined revision
+/// here, with the unsupported-version error rmcp sends for a well-formed one,
+/// and rmcp sees initialize first. A probe naming a revision this server does
+/// speak is the client choosing that lifecycle, and goes through to rmcp.
+struct LegacyLifecycle<T> {
+    inner: T,
+    initialized: bool,
+}
+
+impl<T: rmcp::transport::Transport<rmcp::RoleServer>> rmcp::transport::Transport<rmcp::RoleServer>
+    for LegacyLifecycle<T>
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::model::ServerJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::model::ClientJsonRpcMessage> {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, ErrorData, GetMeta};
+        loop {
+            let msg = self.inner.receive().await?;
+            if self.initialized {
+                return Some(msg);
+            }
+            let ClientJsonRpcMessage::Request(req) = &msg else {
+                return Some(msg);
+            };
+            if matches!(req.request, ClientRequest::InitializeRequest(_)) {
+                self.initialized = true;
+            }
+            if !matches!(req.request, ClientRequest::DiscoverRequest(_)) {
+                return Some(msg);
+            }
+
+            // server/discover exists only in 2026-07-28, so a probe that names
+            // no revision is still asking for that one.
+            let requested = req
+                .request
+                .get_meta()
+                .protocol_version()
+                .unwrap_or(rmcp::model::ProtocolVersion::V_2026_07_28);
+            let supported = frama_c_mcp::mcp::server::SUPPORTED_PROTOCOL_VERSIONS;
+            if supported.contains(&requested) {
+                return Some(msg);
+            }
+            let error = ErrorData::unsupported_protocol_version(requested, supported);
+            let reply = rmcp::model::ServerJsonRpcMessage::error(error, Some(req.id.clone()));
+
+            // A failed write on stdio means the client end is gone. End the
+            // session, but say why; forwarding the probe instead would hand
+            // rmcp the very message this wrapper exists to keep from it.
+            if let Err(error) = self.inner.send(reply).await {
+                tracing::warn!("could not answer a declined server/discover probe: {error}");
+                return None;
+            }
+        }
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
 #[derive(clap::Parser)]
 #[command(name = "frama-c-mcp")]
 #[command(about = "MCP server for Frama-C formal verification (lazy spawn)")]
@@ -150,7 +226,12 @@ async fn async_main() -> anyhow::Result<()> {
     let sandboxes = server.sandbox_registry();
     let main_instance = server.main_frama_c_state();
 
-    let service = server.serve(rmcp::transport::io::stdio()).await?;
+    let stdio = rmcp::transport::IntoTransport::<rmcp::RoleServer, std::io::Error, _>::into_transport(
+        rmcp::transport::io::stdio(),
+    );
+    let service = server
+        .serve(LegacyLifecycle { inner: stdio, initialized: false })
+        .await?;
     tracing::info!("MCP server running on stdio");
 
     // Graceful shutdown: cancel rmcp's service token on SIGTERM/SIGINT/SIGHUP.
