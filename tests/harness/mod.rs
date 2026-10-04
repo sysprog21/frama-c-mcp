@@ -185,6 +185,26 @@ impl McpHandle {
         handle
     }
 
+    /// Spawn and connect the way a 2026-07-28 client does: a server/discover
+    /// probe first, then the initialize fallback once the probe is declined.
+    /// The answers to the probe and to initialize come back with the
+    /// hand-shaken handle.
+    pub fn spawn_test_binary_after_discover_probe(
+        frama_c: &str,
+    ) -> (Self, serde_json::Value, serde_json::Value) {
+        let mut handle = Self::spawn_uninitialized(
+            PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp")),
+            frama_c,
+            None,
+        );
+        let probe = handle.request(
+            "server/discover",
+            r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"stdio-test","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}"#,
+        );
+        let init = handle.initialize_with_protocol("2025-11-25");
+        (handle, probe, init)
+    }
+
     pub fn spawn_test_binary_with_frama_c(frama_c: &str) -> Self {
         Self::spawn_with_binary_and_frama_c(
             PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp")),
@@ -253,7 +273,7 @@ impl McpHandle {
 
     /// Hand-shake naming a protocol revision, for the tests that care which one
     /// was negotiated rather than only that a session exists.
-    pub fn initialize_with_protocol(&mut self, protocol_version: &str) {
+    pub fn initialize_with_protocol(&mut self, protocol_version: &str) -> serde_json::Value {
         let init = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{protocol_version}","capabilities":{{}},"clientInfo":{{"name":"stdio-test","version":"0"}}}}}}"#
         );
@@ -265,6 +285,7 @@ impl McpHandle {
         stdin.flush().ok();
         let mut buf = String::new();
         self.stdout.read_line(&mut buf).unwrap();
+        serde_json::from_str(&buf).expect("parse initialize response")
     }
 
     pub fn call_tool(&mut self, name: &str, args_json: &str) -> serde_json::Value {
