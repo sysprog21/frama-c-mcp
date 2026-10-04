@@ -5,11 +5,12 @@ edition = "2021"
 
 [dependencies]
 # MCP protocol (official Rust SDK).
-# The range is "3" rather than an exact version: Cargo.lock is tracked and the
+# The range is "3.4" rather than an exact version: Cargo.lock is tracked and the
 # build job passes --locked, so the published binaries are already a function of
 # the commit that names them, and a minimum-version bump with no API behind it
-# only makes this file disagree with every other entry.
-rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
+# only makes this file disagree with every other entry. 3.4 has API behind it:
+# ServerConfig first appears there, and get_info returns one.
+rmcp = { version = "3.4", features = ["server", "transport-io", "macros"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -66,7 +67,7 @@ libc = "0.2"
 # MCP client side + child-process transport for end-to-end stdio JSON-RPC tests.
 # Used by tests/mcp_stdio_test.rs to spawn the server binary and drive it
 # through the actual MCP wire protocol (no internal-API shortcuts).
-rmcp = { version = "3", features = ["client", "transport-child-process"] }
+rmcp = { version = "3.4", features = ["client", "transport-child-process"] }
 
 # The clippy gate ran as `cargo clippy --all-targets` with no -D, so a warning
 # left the exit status at 0 and the runner printed "passed". Denying here rather
@@ -85,6 +86,11 @@ rmcp = { version = "3", features = ["client", "transport-child-process"] }
 # is published; and a doc comment that attaches to the wrong item is invisible
 # to it, since both items still exist. That one stays a review question.
 dead_code = "deny"
+
+# A dependency bump that deprecates something we use should fail on the bump
+# itself. rmcp 3.4 deprecated ServerInfo in favor of ServerConfig, and the bump
+# merged green because a warning fails nothing here.
+deprecated = "deny"
 
 [lints.clippy]
 all = "deny"
