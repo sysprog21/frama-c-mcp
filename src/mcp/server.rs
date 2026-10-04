@@ -6,7 +6,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde_json::json;
 
@@ -1192,7 +1192,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 ///
 /// Spelled as an exclusion rather than left implicit in what the list above
 /// omits, so supported_protocol_versions_cover_every_known_revision can check
-/// the two against rmcp's own set. Cargo.toml asks for rmcp "3", so a cargo
+/// the two against rmcp's own set. Cargo.toml asks for rmcp "3.4", so a cargo
 /// update can add a revision with no diff here; without that test a new one
 /// would be declined silently and clients would negotiate down without anyone
 /// deciding to.
@@ -5084,8 +5084,8 @@ impl ServerHandler for FramaCMcpServer {
         Ok(response)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        // ServerInfo (alias for InitializeResult) is #[non_exhaustive], so this
+    fn get_info(&self) -> ServerConfig {
+        // ServerConfig (alias for InitializeResult) is #[non_exhaustive], so this
         // goes via ::new plus with_* builders rather than a struct literal.
         //
         // with_protocol_version sets the FALLBACK, not a pin. rmcp's
@@ -5097,7 +5097,7 @@ impl ServerHandler for FramaCMcpServer {
         // 3.x, so anything reasoned from it was wrong. The revisions this
         // server will actually agree to are below, in
         // supported_protocol_versions.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "Frama-C formal verification server. Provides EVA abstract interpretation, \
                  WP deductive verification, and CIL AST navigation."

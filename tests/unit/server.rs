@@ -2250,8 +2250,8 @@ fn unconstrained_assigns_prefers_the_resolved_leaf() {
 
 /// Every revision rmcp knows is either supported or excluded on purpose.
 ///
-/// Cargo.toml asks for rmcp "3", so `cargo update` can extend
-/// `ProtocolVersion::KNOWN_VERSIONS` without any diff in this repository. The
+/// Cargo.toml asks for rmcp "3.4", so a cargo update can extend
+/// ProtocolVersion::KNOWN_VERSIONS without any diff in this repository. The
 /// list of supported revisions would then quietly stop covering what the SDK
 /// offers, clients asking for the new one would negotiate down to the fallback,
 /// and nothing would say so. The assertion that used to stand here compared the
