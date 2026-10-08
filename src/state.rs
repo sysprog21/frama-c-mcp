@@ -324,6 +324,31 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
     out
 }
 
+/// The runtime-error switches a sandbox's Frama-C runs under, taken from the
+/// main project when the sandbox is made.
+///
+/// A sandbox proves annotations that are merged back, so it has to generate
+/// the obligations the main project would: a sandbox that checked fewer could
+/// call an annotation verified that fails the main project's pointer-formation
+/// or unsigned goals after the merge. RTE itself is always on in a sandbox.
+/// The default is the setting every sandbox had before this was recorded, so
+/// metadata written then reads back as what that sandbox actually ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxRte {
+    /// Unsigned wraparound and narrowing checks: off only for a project loaded
+    /// with rte_unsigned: false.
+    pub unsigned: bool,
+    /// Pointer-formation checks: on only for a project loaded with
+    /// rte_pointer: true.
+    pub pointer: bool,
+}
+
+impl Default for SandboxRte {
+    fn default() -> Self {
+        SandboxRte { unsigned: true, pointer: false }
+    }
+}
+
 /// Serializable metadata for a sandbox Frama-C instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMetadata {
@@ -352,6 +377,8 @@ pub struct SandboxMetadata {
     pub stderr_log_path: Option<PathBuf>,
     #[serde(default)]
     pub startup_stderr_tail: Option<String>,
+    #[serde(default)]
+    pub rte: SandboxRte,
 }
 
 /// How many receipts a session keeps for diffing. A caller compares against a
@@ -433,6 +460,16 @@ pub struct VerificationProfile {
     /// wrap by design, and a run under it reports RTE_REDUCED.
     #[serde(default)]
     pub rte_unsigned: Option<bool>,
+
+    /// Whether the target's rte also checks pointer formation. Unset and false
+    /// both mean not checked, which is Frama-C's default.
+    #[serde(default)]
+    pub rte_pointer: Option<bool>,
+
+    /// Whether the target loads with this server's builtin models. Unset and
+    /// false both mean not.
+    #[serde(default)]
+    pub builtin_models: Option<bool>,
 
     /// The command that makes this target's verdict outside this server.
     ///

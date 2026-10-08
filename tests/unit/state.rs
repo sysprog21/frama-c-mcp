@@ -21,6 +21,7 @@ fn sandbox_metadata_serializes_without_runtime_handles() {
         stdout_log_path: None,
         stderr_log_path: None,
         startup_stderr_tail: None,
+        rte: Default::default(),
     };
 
     let value = serde_json::to_value(&metadata).unwrap();
@@ -2220,4 +2221,18 @@ fn a_blank_build_gate_is_refused_and_a_padded_one_is_trimmed() {
     let padded = json!({"t": {"functions": ["f"], "sources": ["a.c"], "build_gates": [" check.py "]}});
     let p = parse_verification_profiles(&padded).unwrap();
     assert_eq!(p["t"].build_gates, vec!["check.py".to_string()]);
+}
+
+/// Metadata written before the sandbox recorded its RTE switches reads back as
+/// the switches every sandbox ran with then: unsigned on, pointer off.
+#[test]
+fn sandbox_metadata_without_rte_reads_back_as_the_old_fixed_switches() {
+    let rte: frama_c_mcp::state::SandboxRte = Default::default();
+    assert!(rte.unsigned && !rte.pointer);
+    let old = serde_json::json!({
+        "experiment_id": "e", "original_function": "f", "sandbox_dir": "/tmp/x",
+        "sandbox_socket": "/tmp/x/s", "sandbox_pid": 1, "declaration_marker": "#F1",
+    });
+    let metadata: SandboxMetadata = serde_json::from_value(old).expect("old metadata parses");
+    assert_eq!(metadata.rte, rte);
 }

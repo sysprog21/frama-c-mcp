@@ -476,6 +476,15 @@ impl FramaCMcpServer {
                 .rte_unsigned
                 .or_else(|| profile.and_then(|profile| profile.rte_unsigned))
                 == Some(false),
+            pointer_rte_requested: params
+                .rte_pointer
+                .or_else(|| profile.and_then(|profile| profile.rte_pointer))
+                == Some(true),
+            builtin_models: (params
+                .builtin_models
+                .or_else(|| profile.and_then(|profile| profile.builtin_models))
+                == Some(true))
+            .then(crate::mcp::server::builtin_models_digest),
         };
         validate_project_options(&options)?;
         Ok((requested_files, options))
@@ -492,7 +501,7 @@ impl FramaCMcpServer {
     async fn files_for_this_load(
         &self,
         requested_files: Option<Vec<String>>,
-        compilation_database: Option<&String>,
+        compilation_database: Option<&CompileDatabase>,
     ) -> Result<Vec<String>, McpError> {
     // Determine file list:
     // - explicit files: use
@@ -615,8 +624,15 @@ impl FramaCMcpServer {
             }
         };
 
+        // Read once for both readers below: the file list, when files were not
+        // given, and the dropped-flag report, which Frama-C's own import makes
+        // necessary either way.
+        let database = project_options
+            .compilation_database
+            .as_deref()
+            .map(CompileDatabase::read);
         let files = self
-            .files_for_this_load(requested_files, project_options.compilation_database.as_ref())
+            .files_for_this_load(requested_files, database.as_ref())
             .await?;
 
         // Before the spawn reads it, so an edit during the analysis that
@@ -645,6 +661,11 @@ impl FramaCMcpServer {
         ] {
             client.set(setter, json!(unsigned)).await.map_err(McpError::from)?;
         }
+        // Both ways on every load too, for the same reason.
+        client
+            .set("kernel.parameters.setWarnInvalidPointer", json!(project_options.pointer_rte()))
+            .await
+            .map_err(McpError::from)?;
 
         // Read and memoize under one lock. Splitting the two across the
         // ast_reload_health await let a concurrent reload reset the offsets in
@@ -759,6 +780,12 @@ impl FramaCMcpServer {
             "machdep": project_options.machdep,
             "machdep_digest": machdep_digest,
             "compilation_database": project_options.compilation_database,
+
+            // Null with no database. Read whether or not files were given,
+            // because Frama-C takes a database's flags either way.
+            "compilation_database_dropped_flags": database
+                .as_ref()
+                .map(CompileDatabase::dropped_flags),
             "source_location_stability": {
                 "checked": previous_markers.is_some() && current_markers.is_some(),
                 "stale_marker_count": stale_marker_count,
@@ -1133,6 +1160,8 @@ impl FramaCMcpServer {
             isystem_paths: params.isystem_paths.unwrap_or_default(),
             nostdinc: params.nostdinc.unwrap_or(false),
             unsigned_rte_skipped: false,
+            pointer_rte_requested: false,
+            builtin_models: None,
         };
         validate_project_options(&options)?;
         let args = project_cli_args(&options);
@@ -1214,20 +1243,48 @@ impl FramaCMcpServer {
     }
 }
 
-fn compile_database_files(path: &str) -> Result<Vec<String>, McpError> {
-    let db_path = std::path::PathBuf::from(path);
-    let text = std::fs::read_to_string(&db_path).map_err(|e| {
-        McpError::invalid_params(format!("failed to read compilation database: {e}"), None)
-    })?;
-    let entries: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        McpError::invalid_params(format!("failed to parse compilation database JSON: {e}"), None)
-    })?;
-    let Some(entries) = entries.as_array() else {
-        return Err(McpError::invalid_params(
-            "compilation database must be a JSON array",
-            None,
-        ));
-    };
+/// A compilation database read once per load: its path, and its entries or
+/// the reason they could not be read. The reason is kept rather than raised
+/// because only the file-list reader needs the entries to exist; the
+/// dropped-flag report says the database was unreadable, and Frama-C's own
+/// import then says what is wrong with it.
+pub struct CompileDatabase {
+    path: String,
+    entries: Result<Vec<serde_json::Value>, String>,
+}
+
+impl CompileDatabase {
+    pub fn read(path: &str) -> Self {
+        let entries = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read compilation database: {e}"))
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|e| format!("failed to parse compilation database JSON: {e}"))
+            })
+            .and_then(|value| match value {
+                serde_json::Value::Array(entries) => Ok(entries),
+                _ => Err("compilation database must be a JSON array".to_string()),
+            });
+        CompileDatabase { path: path.to_string(), entries }
+    }
+
+    /// The dropped-flag report, or {"unreadable": reason} when the entries
+    /// could not be read, so "nothing dropped" and "nothing checked" do not
+    /// look alike. compile_flags_dropped_gap reads only the first.
+    pub fn dropped_flags(&self) -> serde_json::Value {
+        match &self.entries {
+            Ok(entries) => compile_database_dropped_flags(entries),
+            Err(reason) => json!({"unreadable": reason}),
+        }
+    }
+}
+
+fn compile_database_files(database: &CompileDatabase) -> Result<Vec<String>, McpError> {
+    let db_path = std::path::PathBuf::from(&database.path);
+    let entries = database
+        .entries
+        .as_ref()
+        .map_err(|e| McpError::invalid_params(e.clone(), None))?;
 
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1266,6 +1323,118 @@ fn compile_database_files(path: &str) -> Result<Vec<String>, McpError> {
     Ok(files)
 }
 
+/// Compiler flags that change what the program means and that Frama-C drops
+/// when it imports a compilation database, with what each one changes.
+///
+/// Frama-C keeps only -I, -idirafter, -include, -imacros, -isystem, -D and -U
+/// from an entry and drops the rest with a debug-level message, so the build
+/// and the analysis can disagree about the program with nothing said. Matched
+/// as a whole token or as "flag=value". -std is not here: it is on nearly every
+/// entry, and no measurement
+/// has shown it changing what Frama-C parses.
+pub const DROPPED_SEMANTIC_FLAGS: &[(&str, &str)] = &[
+    ("-funsigned-char", "char is unsigned in the build; the machdep decides it here"),
+    ("-fsigned-char", "char is signed in the build; the machdep decides it here"),
+    ("-fwrapv", "signed overflow wraps in the build; RTE still reports it as undefined"),
+    ("-fno-strict-overflow", "signed overflow wraps in the build; RTE still reports it as undefined"),
+    ("-m32", "the build targets a 32-bit data model; the machdep decides it here"),
+    ("-mx32", "the build targets the x32 data model; the machdep decides it here"),
+    ("-m16", "the build targets a 16-bit data model; the machdep decides it here"),
+    ("--target", "the build names a target; the machdep decides sizes and alignment here"),
+    ("-target", "the build names a target; the machdep decides sizes and alignment here"),
+    ("-mabi", "the build selects an ABI; the machdep decides sizes and alignment here"),
+    ("-fshort-wchar", "wchar_t is 16 bits in the build; the machdep decides it here"),
+    ("-fshort-enums", "enums are packed in the build; the machdep decides it here"),
+    ("-fpack-struct", "structs are packed in the build; the machdep decides layout here"),
+    ("-funsigned-bitfields", "plain bit-fields are unsigned in the build"),
+];
+
+/// The semantic flags a compilation database carries that Frama-C will drop,
+/// as an object from flag to how many entries carry it and what it changes.
+/// Empty when there are none. A database that cannot be read never reaches
+/// this: CompileDatabase::dropped_flags reports it as {"unreadable": reason}.
+pub fn compile_database_dropped_flags(entries: &[serde_json::Value]) -> serde_json::Value {
+    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for entry in entries {
+        // Once per entry, however often an entry repeats a flag.
+        let flags: std::collections::BTreeSet<&str> = compile_entry_tokens(entry)
+            .iter()
+            .filter_map(|token| dropped_semantic_flag(token))
+            .collect();
+        for flag in flags {
+            *counts.entry(flag).or_default() += 1;
+        }
+    }
+    let mut object = serde_json::Map::new();
+    for (flag, entries) in counts {
+        let effect = DROPPED_SEMANTIC_FLAGS
+            .iter()
+            .find(|(f, _)| *f == flag)
+            .map(|(_, effect)| *effect)
+            .unwrap_or_default();
+        object.insert(flag.to_string(), json!({"entries": entries, "effect": effect}));
+    }
+    serde_json::Value::Object(object)
+}
+
+/// An entry's argv, from "arguments" when present and otherwise "command"
+/// split the way a POSIX shell splits words: single quotes literal, double
+/// quotes and backslash escaping one character. A plain whitespace split left
+/// "'-fwrapv'" quoted, so the flag went unmatched and its gap unreported.
+/// Expansion, substitution and globbing are not shell behaviour this needs.
+fn compile_entry_tokens(entry: &serde_json::Value) -> Vec<String> {
+    match entry.get("arguments").and_then(|a| a.as_array()) {
+        Some(arguments) => arguments.iter().filter_map(|a| a.as_str()).map(str::to_string).collect(),
+        None => entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(shell_words)
+            .unwrap_or_default(),
+    }
+}
+
+/// The rest of a double-quoted span, up to its closing quote, with a
+/// backslash escaping the character after it.
+fn push_double_quoted(chars: &mut std::str::Chars<'_>, word: &mut String) {
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return,
+            '\\' => word.extend(chars.next()),
+            c => word.push(c),
+        }
+    }
+}
+
+/// POSIX shell word splitting without expansion. See compile_entry_tokens.
+pub fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => words.extend(word.take()),
+            '\'' => {
+                let current = word.get_or_insert_with(String::new);
+                current.extend(chars.by_ref().take_while(|c| *c != '\''));
+            }
+            '"' => push_double_quoted(&mut chars, word.get_or_insert_with(String::new)),
+            '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
+/// The DROPPED_SEMANTIC_FLAGS entry a token is, written alone or as
+/// "flag=value".
+fn dropped_semantic_flag(token: &str) -> Option<&'static str> {
+    DROPPED_SEMANTIC_FLAGS
+        .iter()
+        .map(|(flag, _)| *flag)
+        .find(|flag| token == *flag || token.strip_prefix(flag).is_some_and(|rest| rest.starts_with('=')))
+}
+
 /// The characters a preprocessor entry may contain.
 ///
 /// This is the security boundary, not a formatting nicety. All three lists land
@@ -1283,7 +1452,7 @@ fn compile_database_files(path: &str) -> Result<Vec<String>, McpError> {
 /// lists. A define value that needs a shell-active character, a parenthesized
 /// expression like "(1<<10)" or a quoted string, is refused rather than
 /// escaped; force_include a header that spells it instead.
-fn is_cpp_arg_char(c: char) -> bool {
+pub(crate) fn is_cpp_arg_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '=' | '.' | '/' | '+' | '-')
 }
 
@@ -1628,6 +1797,8 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
         rte: _,
         nostdinc: _,
         unsigned_rte_skipped: _,
+        pointer_rte_requested: _,
+        builtin_models: _,
     } = options;
 
     validate_cpp_entries(

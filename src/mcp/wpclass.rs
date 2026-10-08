@@ -11,6 +11,16 @@ pub fn classify_wp_goal(goal: &serde_json::Value) -> (String, Option<String>) {
         regex::Regex::new(r"\b((?:re|en|as|li|la|lv|at|an)_[0-9a-f]{8})(?:\b|_)").unwrap()
     });
 
+    // Read off the goal id, not the label, and first: a terminates goal's label
+    // names no keyword below, so it used to fall through to "spec" while its
+    // failure classification said "terminates", and one payload carried two
+    // kinds for one goal. The function's own name is cut off first, so a
+    // function named "x_terminates_parts" does not make every goal of its own a
+    // terminates goal.
+    if goal_id_after_owner(goal).is_some_and(is_terminates_goal) {
+        return ("terminates".into(), None);
+    }
+
     let name = goal
         .get("name")
         .and_then(|v| v.as_str())
@@ -79,7 +89,31 @@ fn classify_failure_reason(
     from_cache: bool,
     push_evidence: &mut impl FnMut(&str, serde_json::Value),
 ) -> (&'static str, &'static str, &'static str) {
-    let classification = if crate::mcp::status::status_is_timeout(normalized_status)
+    // A terminates goal that timed out, and only that: it is the measured shape
+    // of a missing measure. A FAILED or setup-shaped one is a backend or
+    // configuration fault like any other goal's and falls through to those
+    // branches, which send the caller to self_check rather than to a variant.
+    let terminates_timed_out = goal_kind == "terminates"
+        && (crate::mcp::status::status_is_timeout(normalized_status)
+            || crate::mcp::status::status_is_timeout(raw_status));
+    let classification = if terminates_timed_out {
+        // Ahead of the timeout branch, because that is how these arrive.
+        // Measured on Frama-C 33: a loop with no variant and a recursion with
+        // no decreases both leave their terminates goal as Timeout, and no
+        // budget closes it, since the fact the prover would need was never
+        // written. The default "terminates \true" is proved as if written.
+        push_evidence("goal_kind", json!(goal_kind));
+        (
+            "termination_unproved",
+            "high",
+            "This is the function's terminates obligation, which Frama-C 33 generates for the \
+             default \"terminates \\true\" as if it were written, and a longer timeout will not \
+             close it. One of three things is missing: a loop variant on a loop in the body, a \
+             decreases clause on a recursive function (WP warns \"Missing decreases clause\"), \
+             or a terminates clause on a callee that may not return. Add the measure, or state \
+             the condition under which the function terminates as its own terminates clause.",
+        )
+    } else if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
         push_evidence("normalized_status", json!(normalized_status));
@@ -317,6 +351,30 @@ fn classify_failure_reason(
     } else {
         classification
     }
+}
+
+/// A goal's WP id with the "<model>_<function>" prefix cut off, keeping the
+/// underscore that follows it, so a reader of the goal's kind reads only the
+/// part WP derives from the property. Read whole, a function named
+/// "parse_rte_header" put
+/// every one of its goals under memory safety, and a failing postcondition
+/// there left "functional" holding. The whole id when the goal names no
+/// function or the id does not contain it.
+pub fn goal_id_after_owner(goal: &serde_json::Value) -> Option<&str> {
+    let id = super::wp_goal_identity(goal)?;
+    let tail = goal_owner_name(goal)
+        .and_then(|owner| {
+            let at = id.find(&format!("_{owner}_"))?;
+            Some(&id[at + owner.len() + 1..])
+        })
+        .unwrap_or(id);
+    Some(tail)
+}
+
+/// Whether a WP goal name is a function's terminates obligation, written
+/// "<model>_<function>_terminates" or split as "..._terminates_part<n>".
+pub fn is_terminates_goal(name: &str) -> bool {
+    name.ends_with("_terminates") || name.contains("_terminates_part")
 }
 
 pub fn classify_wp_failure_from_goal(
@@ -919,6 +977,7 @@ fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
         "incomplete_behavior_partition" => "WP reported an open behavior partition obligation.",
         "weak_loop_assigns" => "The loop frame does not cover the writes WP must reason about.",
         "weak_loop_variant" => "The loop termination variant is still unproved.",
+        "termination_unproved" => "The function's termination obligation is still unproved.",
         "weak_loop_invariant" => {
             "The loop invariant does not establish or preserve the needed property."
         }

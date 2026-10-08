@@ -1283,6 +1283,9 @@ pub struct WpRunResponse<'a> {
     /// Whether that RTE includes the unsigned checks; false for a load with
     /// rte_unsigned: false.
     pub unsigned_rte: bool,
+    /// Whether that RTE includes pointer formation; true only for a load with
+    /// rte_pointer: true.
+    pub pointer_rte: bool,
     pub frama_c_protocol: Vec<serde_json::Value>,
     pub proofread_report: Option<serde_json::Value>,
 
@@ -1304,6 +1307,7 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
         scope,
         rte_enabled,
         unsigned_rte,
+        pointer_rte,
         frama_c_protocol,
         proofread_report,
         goals,
@@ -1335,6 +1339,9 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
         if unsigned_rte {
             frama_c_options.extend(UNSIGNED_RTE_OPTIONS.iter().map(|option| option.to_string()));
         }
+        if pointer_rte {
+            frama_c_options.push(POINTER_RTE_OPTION.to_string());
+        }
     }
     if let Some(timeout) = timeout {
         frama_c_options.push("-wp-timeout".to_string());
@@ -1344,11 +1351,15 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
         frama_c_options.push("-wp-par".to_string());
         frama_c_options.push(par.to_string());
     }
+    if let Some(steps) = params.steps {
+        frama_c_options.push("-wp-steps".to_string());
+        frama_c_options.push(steps.to_string());
+    }
     if let Some(prop) = &params.prop {
         frama_c_options.push("-wp-prop".to_string());
         frama_c_options.push(prop.clone());
     }
-    let config = json!({
+    let mut config = json!({
         "scope": scope,
         "functions": functions,
         "model": model,
@@ -1392,6 +1403,11 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
         "split_strategy": serde_json::Value::Null,
         "raw_task_ids": collect_json_string_fields(&tasks, &["id", "task_id", "taskId"]),
     });
+    // Only when set, so every receipt made without a step budget keeps the
+    // digest it had: the receipt hashes this object.
+    if let Some(steps) = params.steps {
+        config["steps"] = json!(steps);
+    }
     let measurement = goals.map(crate::mcp::server::wpclass::run_measurement);
     let timeout_triage = wp_timeout_triage_from_tasks_and_report(
         &tasks,
@@ -1632,8 +1648,22 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         // for its larger set.
         rte: _,
         unsigned_rte_skipped: _,
+        pointer_rte_requested: _,
+
+        // Last, after the caller's own force-includes, so a project header
+        // that declares a builtin first is the declaration the model attaches
+        // to rather than the other way round.
+        builtin_models,
     } = options;
 
+    // A header that could not be created is still asked for, under a name no
+    // file has, so the load fails on a missing include instead of quietly
+    // proving without the models the caller named.
+    let builtin_header = builtin_models.as_ref().map(|_| {
+        let header = builtin_models_header()
+            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent/frama-c-mcp-builtins.h"));
+        format!("-include {}", header.display())
+    });
     let flags = nostdinc
         .then(|| "-nostdinc".to_string())
         .into_iter()
@@ -1641,6 +1671,7 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         .chain(isystem_paths.iter().map(|path| format!("-isystem {path}")))
         .chain(defines.iter().map(|define| format!("-D{define}")))
         .chain(force_includes.iter().map(|header| format!("-include {header}")))
+        .chain(builtin_header)
         .collect::<Vec<_>>();
     if flags.is_empty() {
         return None;
@@ -1702,6 +1733,90 @@ impl FramaCMcpServer {
 /// proved stops being so.
 pub const UNSIGNED_RTE_OPTIONS: &[&str] = &["-warn-unsigned-overflow", "-warn-unsigned-downcast"];
 
+/// ACSL contracts for GCC builtins Frama-C models too weakly, force-included
+/// under builtin_models: true.
+///
+/// Frama-C declares __builtin_unreachable as an ordinary returning function, so
+/// "if (x < 0) __builtin_unreachable();" gives WP nothing, and does not declare
+/// __builtin_trap at all; both reached GENERATED_CALLEE_SPEC, whose advice to
+/// write the contract in a header callers include has no header to point at
+/// for a builtin. Measured on 33.0: three postconditions resting on these
+/// builtins time out without the header and prove with it. __builtin_trap
+/// does not terminate, like the libc abort, so a caller's terminates goal
+/// stays open behind it, which is the truth. The type-generic
+/// __builtin_*_overflow family is left out: no prototype can state it.
+pub const BUILTIN_MODELS_HEADER: &str = "\
+/* frama-c-mcp builtin models: every contract below is an assumption. */
+/*@ terminates \\true; exits \\false; assigns \\nothing; ensures \\false; */
+void __builtin_unreachable(void);
+/*@ terminates \\false; exits \\false; assigns \\nothing; ensures \\false; */
+void __builtin_trap(void);
+/*@ requires x != 0; assigns \\nothing;
+    ensures 0 <= \\result < 8 * sizeof(unsigned int); */
+int __builtin_clz(unsigned int x);
+/*@ requires x != 0; assigns \\nothing;
+    ensures 0 <= \\result < 8 * sizeof(unsigned int); */
+int __builtin_ctz(unsigned int x);
+/*@ assigns \\nothing; ensures 0 <= \\result <= 8 * sizeof(unsigned int); */
+int __builtin_popcount(unsigned int x);
+";
+
+/// The builtin-models header on disk, written once per process.
+///
+/// Its own file, created exclusively under a random name with mode 0600, and
+/// never a fixed name in a shared directory. Every contract in it is an axiom,
+/// so a file another local user could plant first, or point at something else
+/// through a symlink, would be a way to make any goal "proved". The random part
+/// is alphanumeric, so the path stays inside the preprocessor allowlist, which
+/// matters because it lands in -cpp-extra-args and Frama-C hands that to a
+/// shell. A temporary directory outside that allowlist falls back to /tmp,
+/// where exclusive creation still holds. The file lives as long as the process;
+/// one removed from under a running server shows as a missing include.
+///
+/// None only when no file could be created at all, which the caller reports.
+pub fn builtin_models_header() -> Option<std::path::PathBuf> {
+    static HEADER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HEADER
+        .get_or_init(|| {
+            let dir = std::env::temp_dir();
+            let safe = dir.to_str().is_some_and(|d| d.chars().all(project::is_cpp_arg_char));
+            let dir = if safe { dir } else { std::path::PathBuf::from("/tmp") };
+            let mut file = tempfile::Builder::new()
+                .prefix("frama-c-mcp-builtins-")
+                .suffix(".h")
+                .tempfile_in(dir)
+                .ok()?;
+            std::io::Write::write_all(&mut file, BUILTIN_MODELS_HEADER.as_bytes()).ok()?;
+            file.into_temp_path().keep().ok()
+        })
+        .clone()
+}
+
+/// The load identity value for builtin_models: true.
+pub fn builtin_models_digest() -> String {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIGEST
+        .get_or_init(|| crate::state::sha256_hex(BUILTIN_MODELS_HEADER.as_bytes()))
+        .clone()
+}
+
+/// The kernel option behind rte_pointer: true. See pointer_rte_requested.
+pub const POINTER_RTE_OPTION: &str = "-warn-invalid-pointer";
+
+/// Keeps RTE generation independent of what EVA concluded.
+///
+/// Frama-C 33 defaults -rte-use-eva-results to on, and its help says what that
+/// means: no annotation is emitted on a function EVA has analyzed. WP's own
+/// generator goes through the same path, so a "check" that runs EVA before WP
+/// drops every runtime-error goal EVA found safe for the one context it
+/// analyzed. Measured: "g(int *a, int i) { a[i] = 1; }" under
+/// "requires 0 <= i", called once as "g(b, 3)", proves 5/5 after EVA because
+/// the out-of-bounds goal is never generated, and 5/6 with this option, where
+/// that goal stays open. An EVA verdict holds for the calls main makes; a WP
+/// goal holds for every caller meeting the contract, and only the second is
+/// what "rte" claims.
+pub const RTE_INDEPENDENT_OF_EVA: &str = "-rte-no-use-eva-results";
+
 /// The argv for the long-lived main Frama-C process.
 ///
 /// A free function so a test can assert it. It is the only place kernel "-rte"
@@ -1734,6 +1849,7 @@ pub fn main_frama_c_args(
         "ast_utils_plugin".to_string(),
         "-server-socket".to_string(),
         socket_path.display().to_string(),
+        RTE_INDEPENDENT_OF_EVA.to_string(),
         "-wp-prover".to_string(),
         default_wp_provers().to_string(),
         "-wp-model".to_string(),
@@ -1762,9 +1878,14 @@ pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
         // parse_surface runs no proof at all. The main spawn reaches this
         // through main_frama_c_args, whose doc carries the measurement for why
         // the kernel's generator is the wrong one. The unsigned options travel
-        // with -wp-rte, from unsigned_rte_args, for the same reason.
+        // with -wp-rte, from unsigned_rte_args, for the same reason, and so
+        // does the pointer option.
         rte: _,
         unsigned_rte_skipped: _,
+        pointer_rte_requested: _,
+
+        // A force-include, so it travels in cpp_extra_args with the others.
+        builtin_models: _,
     } = options;
 
     let mut args = Vec::new();
@@ -2431,6 +2552,28 @@ pub struct ProjectLoadOptions {
     /// receipt made without it keeps the digest it had.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unsigned_rte_skipped: bool,
+
+    /// Whether rte also checks that every pointer formed points into an object
+    /// or one past it (-warn-invalid-pointer).
+    ///
+    /// Off by default in Frama-C 33 and here. Without it, "base + off" formed
+    /// before the NULL test proves, and fragma's ARM32 module-loader bug was
+    /// first flagged by exactly this alarm. Opt-in rather than a default
+    /// because container_of and other kernel idioms form such pointers by
+    /// design, and turning it on moves goal counts no fixture has been measured
+    /// against. Part of the load identity, serialized only when set, like the
+    /// unsigned switch above.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pointer_rte_requested: bool,
+
+    /// The sha256 of the builtin-models header this load force-includes, or
+    /// None when it includes none.
+    ///
+    /// The digest rather than a flag, because every contract in the header is
+    /// an axiom this server ships, and a receipt has to change when one of them
+    /// does. Serialized only when set, like the two RTE switches above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_models: Option<String>,
 }
 
 impl ProjectLoadOptions {
@@ -2444,11 +2587,23 @@ impl ProjectLoadOptions {
     /// session it was probing did not have. Same predicate as reload_project
     /// sets the switches by.
     pub fn unsigned_rte_args(&self) -> Vec<String> {
-        if self.unsigned_rte() {
+        let mut args: Vec<String> = if self.unsigned_rte() {
             UNSIGNED_RTE_OPTIONS.iter().map(|option| option.to_string()).collect()
         } else {
             Vec::new()
+        };
+        // Travels with the unsigned pair, for the same reason: a command-line
+        // run beside -wp-rte has to generate the obligations the session did.
+        if self.pointer_rte() {
+            args.push(POINTER_RTE_OPTION.to_string());
         }
+        args
+    }
+
+    /// Whether this load generates pointer-formation obligations. Same shape
+    /// as unsigned_rte: only under rte, and only when asked.
+    pub fn pointer_rte(&self) -> bool {
+        self.rte && self.pointer_rte_requested
     }
 
     /// Whether this load generates unsigned wraparound and narrowing
@@ -2493,6 +2648,10 @@ impl ProjectLoadOptions {
             nostdinc: _,
             rte: _,
             unsigned_rte_skipped: _,
+            pointer_rte_requested: _,
+
+            // Bytes this server ships, named by their digest in the identity.
+            builtin_models: _,
         } = self;
         !force_includes.is_empty() || compilation_database.is_some()
     }
@@ -2621,15 +2780,17 @@ impl SandboxRegistry {
 ///   and it is therefore the site that fixes the order.
 /// - ensure_main_spawned (this file) is reached only from reload_project. It
 ///   takes main_spawn_lock, then main_frama_c_state, then client.
-/// - check's EVA half (analysis.rs) takes main_eva_lock alone; run_wp,
-///   proof_coverage and verify_program_step take main_wp_lock alone. Nothing
-///   takes eva before wp.
+/// - check's EVA half (analysis.rs) takes main_eva_lock alone; proof_coverage
+///   and verify_program_step take main_wp_lock alone. run_wp takes
+///   main_wp_lock, then main_eva_lock briefly around resetting the entry point
+///   and -lib-entry, which are EVA's parameters as much as WP's. Nothing takes
+///   eva before wp.
 ///
 /// Not machine-checked. A lock-order test needs either instrumented guards or
 /// a run that actually contends, and neither is worth its weight against seven
 /// locks whose every acquisition site is in the list above. What keeps this
 /// honest is that the sites are few and named: grep for the transaction locks
-/// and the answer should be the eight acquisitions this paragraph accounts for.
+/// and the answer should be the nine acquisitions this paragraph accounts for.
 #[derive(Clone)]
 pub struct FramaCMcpServer {
     /// Main Frama-C client. Lazy mode starts with None.
@@ -3261,6 +3422,10 @@ impl FramaCMcpServer {
         if let Some(par) = effective_wp_par(params)? {
             wp_config["par"] = json!(par);
         }
+        // Every run, both ways, for the reason the cache mode is: a budget one
+        // call set would otherwise govern every later call that named none.
+        // Zero is WP's "no step limit".
+        wp_config["steps"] = json!(params.steps.unwrap_or(0));
         client
             .exec(
                 "plugins.ast-utils.execSetWpConfig",
@@ -3272,13 +3437,25 @@ impl FramaCMcpServer {
         Ok(())
     }
 
-    fn sandbox_frama_c_command_line(&self, sandbox_file: &Path, socket: &Path) -> Vec<String> {
-        vec![
+    fn sandbox_frama_c_command_line(
+        &self,
+        sandbox_file: &Path,
+        socket: &Path,
+        rte: crate::state::SandboxRte,
+    ) -> Vec<String> {
+        let mut line = vec![
             self.frama_c_path.clone(),
             sandbox_file.display().to_string(),
             "-rte".to_string(),
-            UNSIGNED_RTE_OPTIONS[0].to_string(),
-            UNSIGNED_RTE_OPTIONS[1].to_string(),
+            RTE_INDEPENDENT_OF_EVA.to_string(),
+        ];
+        if rte.unsigned {
+            line.extend(UNSIGNED_RTE_OPTIONS.iter().map(|option| option.to_string()));
+        }
+        if rte.pointer {
+            line.push(POINTER_RTE_OPTION.to_string());
+        }
+        line.extend([
             "-keep-unused-functions".to_string(),
             "all".to_string(),
             "-keep-unused-types".to_string(),
@@ -3290,7 +3467,8 @@ impl FramaCMcpServer {
             default_wp_model().to_string(),
             "-kernel-warn-key".to_string(),
             "annot-error=feedback".to_string(),
-        ]
+        ]);
+        line
     }
 
     /// The argv for a new main instance.
@@ -3611,12 +3789,15 @@ impl FramaCMcpServer {
         let report_function = (names.len() == 1).then(|| target_names[0].as_str());
         let wp_goals = crate::mcp::server::analysis::fetch_wp_goals(&client).await?;
         let proofread_report = proofread_report_from_wp_goals(&wp_goals, report_function);
-        let source_files = {
+        let (source_files, sandbox_rte) = {
             let sandboxes = self.sandboxes.read().await;
-            sandboxes
-                .metadata(exp_id)
-                .map(|metadata| vec![metadata.sandbox_dir.join("sandbox.c").display().to_string()])
-                .unwrap_or_default()
+            let metadata = sandboxes.metadata(exp_id);
+            (
+                metadata
+                    .map(|metadata| vec![metadata.sandbox_dir.join("sandbox.c").display().to_string()])
+                    .unwrap_or_default(),
+                metadata.map(|metadata| metadata.rte).unwrap_or_default(),
+            )
         };
 
         let mut response = wp_run_response(WpRunResponse {
@@ -3625,7 +3806,8 @@ impl FramaCMcpServer {
             functions: names.clone(),
             scope: "sandbox",
             rte_enabled: true,
-            unsigned_rte: true,
+            unsigned_rte: sandbox_rte.unsigned,
+            pointer_rte: sandbox_rte.pointer,
             frama_c_protocol: protocol_diagnostics,
             proofread_report: Some(proofread_report),
             goals: Some(wp_goals.as_slice()),
@@ -3661,8 +3843,9 @@ impl FramaCMcpServer {
         //
         // Matching what sandbox_frama_c_command_line passes the sandbox's own
         // process: defaults, except that the sandbox always runs with RTE and
-        // its unsigned checks, and a default load has rte false, which made the
-        // probe drop the unsigned options its process had. The narrowing to
+        // with the main project's unsigned and pointer switches, recorded on
+        // its metadata. A default load has rte false, which made the probe drop
+        // the unsigned options its process had. The narrowing to
         // what a printed AST can use happens inside the probe rather than here,
         // so if that command line ever gains the project's machine model this
         // call inherits the same treatment instead of needing to be remembered.
@@ -3671,6 +3854,8 @@ impl FramaCMcpServer {
             response: &mut response,
             project_options: &ProjectLoadOptions {
                 rte: true,
+                unsigned_rte_skipped: !sandbox_rte.unsigned,
+                pointer_rte_requested: sandbox_rte.pointer,
                 ..ProjectLoadOptions::default()
             },
             rte: true,
@@ -3787,6 +3972,7 @@ impl FramaCMcpServer {
         &self,
         sandbox_file: &Path,
         socket: &Path,
+        rte: crate::state::SandboxRte,
         state: Arc<RwLock<SessionState>>,
     ) -> Result<(tokio::process::Child, FramaCClient), McpError> {
         use std::process::Stdio;
@@ -3806,7 +3992,7 @@ impl FramaCMcpServer {
             McpError::internal_error(format!("failed to create sandbox stderr log: {}", e), None)
         })?;
 
-        let command_line = self.sandbox_frama_c_command_line(sandbox_file, socket);
+        let command_line = self.sandbox_frama_c_command_line(sandbox_file, socket, rte);
 
         // Inside the sandbox's own directory, so it goes when the sandbox does
         // and adds no second thing to clean up. That directory already lives
@@ -4365,7 +4551,7 @@ pub fn semantic_suggestions_for_vc(
     if statuses.iter().any(|status| status == "stepout") {
         suggestions.push(json!({
             "kind": "stepout_goal_too_large",
-            "message": "A prover ran out of steps, which is a timeout by another budget: the goal is too large or nonlinear for it. Split it with a guiding assert or a smaller function, try another prover, or raise the step limit.",
+            "message": "A prover ran out of steps. That is how a false goal ends too: Alt-Ergo under WP reports a plainly false postcondition as Stepout or Timeout, never as Invalid, so first rule falsity out with run_e_acsl or a counterexample. If the goal holds, it is too large or nonlinear: split it with a guiding assert or a smaller function, try another prover, or raise the budget with run_wp {steps}.",
             "next_tool": "run_wp",
         }));
     }

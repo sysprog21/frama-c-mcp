@@ -17,8 +17,8 @@ int abs_val(int x)
     return x;
 }
 
-/*@ requires n >= 0;
-    ensures \result >= 0;
+/*@ requires n >= 0 && n <= 46340;
+    ensures \result >= 0 && \result == n * n;
 */
 int square(int n)
 {

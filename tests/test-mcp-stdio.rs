@@ -5373,7 +5373,9 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
     assert_eq!(result["requested_options"]["ilevel"], 16);
     assert_eq!(
         result["frama_c_options"],
-        json!(["-main", "eva_main", "-eva-slevel", "8", "-eva-ilevel", "16"])
+        // -lib-entry because eva_main is not the program's entry: a scoped run
+        // starts from an unknown global state rather than the initializers.
+        json!(["-main", "eva_main", "-lib-entry", "-eva-slevel", "8", "-eva-ilevel", "16"])
     );
     assert!(
         !result["computation_state"].is_null(),
@@ -5411,6 +5413,7 @@ async fn check_running_eva_alone_accepts_ilevel_and_echoes_options() {
             "2",
             "-main",
             "eva_main",
+            "-lib-entry",
             "-eva-slevel",
             "8",
             "-eva-ilevel",
@@ -5637,8 +5640,9 @@ async fn check_receipts_distinguish_eva_entry_points() {
     assert_eq!(main["proof_receipt"]["eva"]["main_function"], "main");
     assert_eq!(abs_val["proof_receipt"]["eva"]["main_function"], "abs_val");
 
-    // The entry point is the only thing that moved, so it must be the only key
-    // that differs. A sha256 comparison would say nothing here: analysing
+    // The entry point is the only thing the caller moved, and lib_entry moves
+    // with it by design: only the program's own entry starts from the
+    // initializers. So those two are the only keys that may differ. A sha256 comparison would say nothing here: analysing
     // abs_val with an unknown int argument raises an overflow alarm that main
     // does not, so the two receipts differ in "reported" whether or not the EVA
     // configuration is in them at all.
@@ -5650,6 +5654,11 @@ async fn check_receipts_distinguish_eva_entry_points() {
             .expect("EVA config object")
             .remove("main_function")
             .expect("main_function key");
+    }
+    assert_eq!(main_config["lib_entry"], false, "{main_config}");
+    assert_eq!(abs_config["lib_entry"], true, "{abs_config}");
+    for config in [&mut main_config, &mut abs_config] {
+        config.as_object_mut().unwrap().remove("lib_entry");
     }
     assert_eq!(main_config, abs_config);
 
@@ -8878,7 +8887,10 @@ async fn check_want_selects_the_analyses_and_says_which_it_skipped() {
 #[tokio::test]
 async fn check_returns_one_field_set_on_both_paths() {
     let expected = [
+        "assumed_definitions",
+        "contract_mutant_probe",
         "detail",
+        "established",
         "eva",
         "eva_alarms",
         "incomplete",
@@ -10832,12 +10844,19 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
             .entry(c["category"].as_str().unwrap_or("?"))
             .or_default() += 1;
     }
+    //
+    // Two categories since termination_unproved was split out of timeout:
+    // bubble_sort's loops carry no variant, so their terminates goals time out
+    // for want of a measure rather than of time, and are classified as such.
+    // Those are fixed by the fixture's text, so their count is pinned exactly.
+    let terminates = by_category.get("termination_unproved").copied().unwrap_or(0);
     assert_eq!(
-        by_category.get("timeout").copied().unwrap_or(0),
-        classified.len(),
-        "the ceiling below is calibrated on an all-timeout mix and this run is \
-         {by_category:?}. The prover or the budget moved, so re-measure the \
-         per-goal figure before reading a ceiling failure as added text."
+        (by_category.get("timeout").copied().unwrap_or(0) + terminates, terminates),
+        (classified.len(), 2),
+        "the ceiling below is calibrated on a mix of timeouts plus bubble_sort's two \
+         terminates goals, and this run is {by_category:?}. The prover or the budget \
+         moved, so re-measure the per-goal figure before reading a ceiling failure \
+         as added text."
     );
 
     // Two-sided on purpose, and the lower bound is the part that matters.
@@ -10855,7 +10874,10 @@ async fn advice_is_carried_once_per_category_over_the_wire() {
     // the upper bound bite. A legitimate shrink trips the lower bound, and the
     // fix is to update BASELINE, which drags the ceiling down with it. That is
     // the step that did not happen last time.
-    const BASELINE: usize = 1654;
+    // 2050 since 2026-10-08: the mix gained two termination_unproved goals,
+    // whose reason names the three missing measures and runs longer than the
+    // generic timeout text. Nothing was added to an existing category.
+    const BASELINE: usize = 2050;
     const TOLERANCE: usize = 400;
     let per_goal = actual / classified.len();
     assert!(
@@ -12530,5 +12552,568 @@ async fn analyze_concurrency_screens_a_concurrent_program() {
     }
     assert_eq!(report["refinement"]["tool"], Value::Null, "{report:?}");
 
+    let _ = client.cancel().await;
+}
+
+fn incomplete_codes(payload: &Value) -> Vec<String> {
+    payload["incomplete"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RTE generation skips a function EVA analyzed unless the process runs with
+/// -rte-no-use-eva-results, and check runs EVA first. The out-of-bounds write
+/// in g is safe for main's one call and not for g's contract, and it used to
+/// prove because its goal was never generated.
+#[tokio::test]
+async fn eva_running_first_does_not_remove_runtime_error_goals() {
+    let fixture = workspace_path("tests/fixtures/rte-after-eva.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 2,
+        "detail": "full",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(result["verdict"], "incomplete", "{result:?}");
+    let goals = result["wp_goals"].as_array().expect("full goal list");
+    assert!(
+        goals.iter().any(|goal| {
+            goal.to_string().contains("mem_access") && goal["status"] != "valid"
+        }),
+        "the out-of-bounds goal on g must exist and stay open: {goals:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A scoped EVA run starts from an unknown global state. From the
+/// initializers, f indexed with g == 0 and raised nothing.
+#[tokio::test]
+async fn a_scoped_eva_run_does_not_assume_the_globals_initializers() {
+    let fixture = workspace_path("tests/fixtures/lib-entry-scope.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "function": "f",
+        "want": ["eva"],
+    }))
+    .await
+    .unwrap();
+    assert!(
+        incomplete_codes(&result).iter().any(|code| code == "ALARM_NOT_VALID"),
+        "{result:?}"
+    );
+    assert_eq!(result["eva"]["effective_options"]["lib_entry"], true, "{result:?}");
+
+    // And the program's own entry still starts from the initializers.
+    let whole = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["eva"],
+    }))
+    .await
+    .unwrap();
+    assert_eq!(whole["eva"]["effective_options"]["lib_entry"], false, "{whole:?}");
+    let _ = client.cancel().await;
+}
+
+/// EVA catches its own abort on an initializer it cannot compute, so the run
+/// answers successfully with no alarms. The state is what says it never ran.
+#[tokio::test]
+async fn an_eva_run_that_aborted_is_not_a_clean_run() {
+    let fixture = workspace_path("tests/fixtures/eva-init-abort.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["eva"],
+    }))
+    .await
+    .unwrap();
+    assert_ne!(result["verdict"], "proved", "{result:?}");
+    assert!(
+        incomplete_codes(&result).iter().any(|code| code == "EVA_NOT_RUN"),
+        "{result:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A raw SV-COMP file states its property as an unreachable call, which no
+/// goal covers. Its assert is false here, so anything but a gap is a lie.
+#[tokio::test]
+async fn an_unencoded_svcomp_property_is_reported() {
+    let fixture = workspace_path("tests/fixtures/svcomp-raw.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    assert_ne!(result["verdict"], "proved", "{result:?}");
+    let gap = result["incomplete"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["code"] == "REACHABILITY_PROPERTY_UNENCODED"))
+        .unwrap_or_else(|| panic!("{result:?}"));
+    let names: Vec<&str> = gap["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["function"].as_str())
+        .collect();
+    assert_eq!(names, ["reach_error", "__VERIFIER_assert"], "{gap}");
+    let _ = client.cancel().await;
+}
+
+/// WP never checks that a recursive logic definition terminates, so check
+/// names every one it will assume.
+#[tokio::test]
+async fn check_lists_the_recursive_logic_it_assumes() {
+    let fixture = workspace_path("tests/fixtures/recursive-logic-unsound.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["wp"],
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    let assumed = &result["assumed_definitions"];
+    assert_eq!(assumed["ran"], true, "{result:?}");
+    assert_eq!(assumed["recursive_logic"][0]["name"], "bad", "{assumed}");
+    assert_eq!(assumed["recursive_logic"][0]["cycle"], json!(["bad"]), "{assumed}");
+    let _ = client.cancel().await;
+}
+
+/// rte_pointer turns on the pointer-formation checks Frama-C leaves off, in the
+/// session's own WP and in the receipt that names the load.
+#[tokio::test]
+async fn rte_pointer_checks_pointers_formed_before_their_bound_test() {
+    let fixture = workspace_path("tests/fixtures/pointer-formation.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let open_pointer_goal = |payload: &Value| {
+        payload["wp_goals"]
+            .as_array()
+            .expect("full goal list")
+            .iter()
+            .any(|g| g.to_string().contains("pointer_value") && g["status"] != "valid")
+    };
+    let default = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["wp"],
+        "timeout": 2,
+        "detail": "full",
+    }))
+    .await
+    .unwrap();
+    assert!(!open_pointer_goal(&default), "off by default: {default:?}");
+
+    let asked = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["wp"],
+        "timeout": 2,
+        "rte_pointer": true,
+        "detail": "full",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(asked["verdict"], "incomplete", "{asked:?}");
+    assert!(open_pointer_goal(&asked), "{asked:?}");
+    assert_ne!(
+        default["proof_receipt"]["subject"]["project_load"],
+        asked["proof_receipt"]["subject"]["project_load"],
+        "the receipt must name the setting"
+    );
+    let _ = client.cancel().await;
+}
+
+/// EVA analyzes one function of two here and reports counter in {1}; a verdict
+/// without a gap would be about a program that never runs its thread.
+#[tokio::test]
+async fn a_threaded_program_is_reported_as_analyzed_sequentially() {
+    let fixture = workspace_path("tests/fixtures/threads-sequential.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    assert!(
+        incomplete_codes(&result).iter().any(|code| code == "CONCURRENT_PROGRAM"),
+        "{result:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A database entry built with -funsigned-char describes a different program
+/// from the one Frama-C parses under its default machdep, and Frama-C drops
+/// the flag with a debug-level message only.
+#[tokio::test]
+async fn a_compilation_database_flag_frama_c_drops_is_a_gap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("u.c");
+    std::fs::write(&source, "int f(char c) { return c; }\n").expect("write source");
+    let database = tmp.path().join("compile_commands.json");
+    std::fs::write(
+        &database,
+        serde_json::to_string(&json!([{
+            "directory": tmp.path().to_str().unwrap(),
+            "file": "u.c",
+            "arguments": ["cc", "-funsigned-char", "-c", "u.c"],
+        }]))
+        .unwrap(),
+    )
+    .expect("write database");
+
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "compilation_database": database.to_str().unwrap(),
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    let gap = result["incomplete"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["code"] == "COMPILE_FLAGS_DROPPED"))
+        .unwrap_or_else(|| panic!("{result:?}"));
+    assert_eq!(gap["flags"]["-funsigned-char"]["entries"], 1, "{gap}");
+    let _ = client.cancel().await;
+}
+
+/// A step budget reaches the provers, and the next run that names none is not
+/// still governed by it: the budget is process state in a long-lived session.
+#[tokio::test]
+async fn a_step_budget_applies_to_its_own_run_only() {
+    let fixture = workspace_path("tests/fixtures/tutorial/bsearch.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    let statuses = |goals: &Value| -> Vec<String> {
+        goals
+            .as_array()
+            .expect("goal array")
+            .iter()
+            .filter_map(|g| g["status"].as_str().map(str::to_ascii_lowercase))
+            .collect()
+    };
+
+    let starved = call_tool_json(&client, "run_wp", json!({"steps": 1, "timeout": 10, "cache": "None"}))
+        .await
+        .unwrap();
+    assert_eq!(starved["effective_wp_config"]["steps"], 1, "{starved:?}");
+    let goals = call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap();
+    assert!(
+        statuses(&goals).iter().any(|s| s != "valid"),
+        "one step cannot prove bsearch: {goals:?}"
+    );
+
+    let free = call_tool_json(&client, "run_wp", json!({"timeout": 10, "cache": "None"}))
+        .await
+        .unwrap();
+    assert!(free["effective_wp_config"].get("steps").is_none(), "{free:?}");
+    let goals = call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap();
+    assert!(
+        statuses(&goals).iter().all(|s| s == "valid"),
+        "the budget leaked into the next run: {goals:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A contract no state satisfies and a statement no execution reaches are
+/// both smoke failures, and only the first makes the theorem vacuous.
+#[tokio::test]
+async fn smoke_failures_say_which_kind_they_are() {
+    let fixture = workspace_path("tests/fixtures/smoke-kinds.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "want": ["wp"],
+        "smoke": true,
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    let gap = result["incomplete"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["code"] == "SMOKE_TEST_FAILED"))
+        .unwrap_or_else(|| panic!("{result:?}"));
+    assert_eq!(gap["by_kind"]["contract_vacuous"], 1, "{gap}");
+    assert_eq!(gap["by_kind"]["unreachable_code"], 1, "{gap}");
+    let _ = client.cancel().await;
+}
+
+/// Pins are checked against the property table Frama-C prints, so a pin
+/// written in ASCII matches a predicate the printer spells in Unicode.
+#[tokio::test]
+async fn a_pinned_property_must_survive_and_be_proved() {
+    let fixture = workspace_path("tests/fixtures/test_abs.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 5,
+        "detail": "full",
+        "pinned": [
+            {"predicate": "\\result >= 0 && \\result == n * n", "function": "square", "kind": "ensures"},
+            {"predicate": "\\result == 42", "function": "square"},
+        ],
+    }))
+    .await
+    .unwrap();
+    let pins: Vec<&Value> = result["incomplete"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["code"].as_str().is_some_and(|c| c.starts_with("PINNED_")))
+        .collect();
+    let ensures: Vec<&Value> = result["eva_alarms"]
+        .as_array()
+        .map(|rows| rows.iter().filter(|r| r["kind"] == "ensures").collect())
+        .unwrap_or_default();
+    assert_eq!(pins.len(), 1, "only the absent pin is a gap: {pins:?}\nensures rows: {ensures:?}");
+    assert_eq!(pins[0]["code"], "PINNED_PROPERTY_MISSING");
+    assert_eq!(pins[0]["pinned"]["predicate"], "\\result == 42");
+    let _ = client.cancel().await;
+}
+
+/// The postconditions behind __builtin_unreachable, __builtin_trap and clz
+/// time out on Frama-C's own declarations and prove with the models loaded.
+#[tokio::test]
+async fn builtin_models_let_a_proof_use_what_the_builtin_means() {
+    let fixture = workspace_path("tests/fixtures/builtin-models.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let open_ensures = |payload: &Value| -> Vec<String> {
+        payload["wp_goals"]
+            .as_array()
+            .expect("full goal list")
+            .iter()
+            .filter(|g| g["wpo"].as_str().is_some_and(|w| w.ends_with("_ensures")))
+            .filter(|g| !g["status"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("valid")))
+            .filter_map(|g| g["wpo"].as_str().map(str::to_string))
+            .collect()
+    };
+    let check = |models: bool| {
+        call_tool_json(&client, "check", json!({
+            "files": [fixture.to_str().unwrap()],
+            "want": ["wp"],
+            "timeout": 3,
+            "detail": "full",
+            "builtin_models": models,
+        }))
+    };
+    let without = check(false).await.unwrap();
+    assert_eq!(open_ensures(&without).len(), 3, "{without:?}");
+    let with = check(true).await.unwrap();
+    assert!(open_ensures(&with).is_empty(), "{with:?}");
+    assert!(
+        with["proof_receipt"]["subject"]["project_load"]["builtin_models"].as_str().is_some(),
+        "the receipt names the models: {:?}",
+        with["proof_receipt"]["subject"]["project_load"]
+    );
+    let _ = client.cancel().await;
+}
+
+/// A contract a stub body also proves is decorative; one that ties the result
+/// to the input kills every stub.
+#[tokio::test]
+async fn a_contract_a_stub_satisfies_is_reported_as_decorative() {
+    let fixture = workspace_path("tests/fixtures/decorative-contract.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let run = |function: &str| {
+        call_tool_json(&client, "check", json!({
+            "files": [fixture.to_str().unwrap()],
+            "function": function,
+            "want": ["wp"],
+            "mutants": true,
+            "timeout": 3,
+        }))
+    };
+    let weak = run("weak").await.unwrap();
+    let gap = weak["incomplete"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["code"] == "CONTRACT_DECORATIVE"))
+        .unwrap_or_else(|| panic!("{:?}", weak["contract_mutant_probe"]));
+    assert_eq!(gap["mutants"][0]["mutant"], "empty", "{gap}");
+
+    let strong = run("strong").await.unwrap();
+    assert!(
+        !incomplete_codes(&strong).iter().any(|c| c.starts_with("CONTRACT_")),
+        "{:?}",
+        strong["contract_mutant_probe"]
+    );
+    let verdicts: Vec<&str> = strong["contract_mutant_probe"]["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["verdict"].as_str())
+        .collect();
+    assert_eq!(verdicts, ["killed", "killed"]);
+    let _ = client.cancel().await;
+}
+
+/// Encoding the harness clears the gap, and the false assert then shows up as
+/// what it is: EVA, which runs first, disproves the precondition at the call,
+/// so the property is checked and found false.
+#[tokio::test]
+async fn an_encoded_svcomp_property_is_checked_rather_than_reported() {
+    let fixture = workspace_path("tests/fixtures/svcomp-encoded.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    let codes = incomplete_codes(&result);
+    assert!(!codes.iter().any(|c| c == "REACHABILITY_PROPERTY_UNENCODED"), "{codes:?}");
+    let disproved_at_the_call = result["incomplete"].as_array().unwrap().iter().any(|i| {
+        i["code"] == "PROPERTY_DISPROVED"
+            && i["descr"].as_str().is_some_and(|d| d.contains("of __VERIFIER_assert at stmt"))
+    });
+    assert!(disproved_at_the_call, "the false assert must be reported: {codes:?}");
+    assert_ne!(result["verdict"], "proved");
+    let _ = client.cancel().await;
+}
+
+/// Codex's two counterexamples to the earlier rule. An encoded assert does not
+/// cover a direct call to an unencoded reach_error, and a precondition that
+/// admits the failing value encodes nothing.
+#[tokio::test]
+async fn a_weak_or_partial_harness_encoding_keeps_the_gap() {
+    let client = spawn_mcp_client_in_dir("", None).await;
+    let unencoded = |source: &'static str| {
+        let client = &client;
+        async move {
+            let result = call_tool_json(client, "check", json!({"source": source, "timeout": 2}))
+                .await
+                .unwrap();
+            incomplete_codes(&result).iter().any(|c| c == "REACHABILITY_PROPERTY_UNENCODED")
+        }
+    };
+    let direct_call = r#"
+extern void abort(void);
+void reach_error(void) { abort(); }
+/*@ requires cond != 0; assigns \nothing; */
+void __VERIFIER_assert(int cond) { if (!cond) { reach_error(); } }
+int main(void) { __VERIFIER_assert(1); reach_error(); return 0; }
+"#;
+    assert!(unencoded(direct_call).await, "a direct reach_error call is unchecked");
+    let weak = r#"
+extern void abort(void);
+/*@ requires \false; assigns \nothing; */
+void reach_error(void) { abort(); }
+/*@ requires cond >= 0; assigns \nothing; */
+void __VERIFIER_assert(int cond) { if (!cond) { reach_error(); } }
+int main(void) { return 0; }
+"#;
+    assert!(!unencoded(weak).await, "reach_error is encoded, so the error route is checked");
+    let weak_alone = r#"
+/*@ requires cond >= 0; assigns \nothing; */
+void __VERIFIER_assert(int cond) { if (!cond) { for (;;) {} } }
+int main(void) { __VERIFIER_assert(0); return 0; }
+"#;
+    assert!(unencoded(weak_alone).await, "cond >= 0 admits __VERIFIER_assert(0)");
+    let _ = client.cancel().await;
+}
+
+/// A scoped EVA check leaves -main and -lib-entry set in the kernel, and a
+/// standalone run_wp used to prove under them: WP refused the scoped function
+/// as a recursive entry point and dropped its postcondition goal.
+#[tokio::test]
+async fn a_standalone_run_wp_after_a_scoped_check_proves_the_same_goals() {
+    let fixture = workspace_path("tests/fixtures/test_abs.c");
+    let goal_ids = |goals: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = goals
+            .as_array()
+            .expect("goal array")
+            .iter()
+            .filter_map(|g| g["wpo"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let fresh = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    call_tool_json(&fresh, "run_wp", json!({"timeout": 5})).await.unwrap();
+    let expected = goal_ids(&call_tool_json(&fresh, "get_wp_goals", json!({})).await.unwrap());
+    let _ = fresh.cancel().await;
+
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "function": "square",
+        "want": ["eva"],
+    }))
+    .await
+    .unwrap();
+    call_tool_json(&client, "run_wp", json!({"timeout": 5})).await.unwrap();
+    let after = goal_ids(&call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap());
+    assert!(expected.iter().any(|id| id.contains("square_ensures")), "{expected:?}");
+    assert_eq!(after, expected, "the scoped check's entry state leaked into run_wp");
+    let _ = client.cancel().await;
+}
+
+/// run_wp's entry reset discards a scoped EVA run's results, so the session
+/// must stop saying EVA completed. Measured: Frama-C answers "not_computed"
+/// after the reset where it answered "computed" before.
+#[tokio::test]
+async fn the_entry_reset_withdraws_a_scoped_eva_completion() {
+    let fixture = workspace_path("tests/fixtures/test_abs.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "function": "square",
+        "want": ["eva"],
+    }))
+    .await
+    .unwrap();
+    let before = call_tool_json(&client, "get_wp_goals", json!({"want": ["counts"]})).await.unwrap();
+    assert_eq!(before["session"]["eva_completed"], true, "{before:?}");
+    assert_eq!(before["eva"], "computed", "{before:?}");
+
+    call_tool_json(&client, "run_wp", json!({"timeout": 2})).await.unwrap();
+    let after = call_tool_json(&client, "get_wp_goals", json!({"want": ["counts"]})).await.unwrap();
+    assert_eq!(after["session"]["eva_completed"], false, "{after:?}");
+    let _ = client.cancel().await;
+}
+
+/// A sandbox runs under the main project's RTE switches, so an annotation it
+/// verifies has faced the obligations the merge back will. It used to fix its
+/// own: pointer formation off whatever the project asked for.
+#[tokio::test]
+async fn a_sandbox_inherits_the_projects_pointer_checks() {
+    let fixture = workspace_path("tests/fixtures/pointer-formation.c");
+    let client = spawn_mcp_client_in_dir("", None).await;
+    call_tool_json(&client, "reload_project", json!({
+        "files": [fixture.to_str().unwrap()],
+        "rte": true,
+        "rte_pointer": true,
+    }))
+    .await
+    .unwrap();
+    let created = call_tool_json(&client, "create_sandbox", json!({"function": "f", "experiment_id": "ptrrte"}))
+        .await
+        .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox name").to_string();
+    let run = call_tool_json(&client, "run_wp", json!({"functions": [&sandbox], "timeout": 2}))
+        .await
+        .unwrap();
+    assert!(
+        run["frama_c_options"].to_string().contains("-warn-invalid-pointer"),
+        "{:?}",
+        run["frama_c_options"]
+    );
+    let goals = call_tool_json(&client, "get_wp_goals", json!({"function": &sandbox})).await.unwrap();
+    assert!(
+        goals.as_array().expect("goal array").iter().any(|g| {
+            g["wpo"].as_str().is_some_and(|w| w.contains("pointer_value"))
+                && !g["status"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("valid"))
+        }),
+        "the pointer formed past the object must be an open goal in the sandbox: {goals:?}"
+    );
+    call_tool_json(&client, "delete_sandbox", json!({"sandbox_name": &sandbox})).await.unwrap();
     let _ = client.cancel().await;
 }

@@ -229,7 +229,7 @@ async fn self_check_shape_with_missing_frama_c() {
     let ast_requests = payload["ast_utils_registered_requests"]
         .as_array()
         .expect("ast-utils registered requests");
-    assert_eq!(ast_requests.len(), 30);
+    assert_eq!(ast_requests.len(), 31);
     assert!(ast_requests.iter().any(|r| r["request"] == "plugins.ast-utils.dumpProject"));
     assert!(ast_requests
         .iter()
@@ -366,7 +366,7 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
         .is_some_and(|warning| warning.contains("executed paths")
             && warning.contains("assigns clauses")));
     // Also pinned in test-process-lifecycle.rs; see the note there.
-    assert_eq!(payload["ast_utils"]["registered_request_count"], 30);
+    assert_eq!(payload["ast_utils"]["registered_request_count"], 31);
     assert!(payload["ast_utils"]["registered_requests"]
         .as_array()
         .expect("ast-utils requests")
@@ -2350,6 +2350,7 @@ fn concurrent_sandbox_writers_do_not_drop_each_others_entries() {
                     stdout_log_path: None,
                     stderr_log_path: None,
                     startup_stderr_tail: None,
+                    rte: Default::default(),
                 };
                 store::remember_sandbox_metadata_at(&base, &entry).expect("remember");
             });
@@ -2440,4 +2441,73 @@ fn two_indirect_calls_in_one_function_get_distinct_ids() {
     assert_ne!(findings[0]["id"], findings[1]["id"], "{findings:?}");
     assert_eq!(findings[0]["stmt_id"], json!(5));
     assert_eq!(findings[1]["stmt_id"], json!(9));
+}
+
+/// A one-shot run that hits its budget takes its whole process group with it.
+/// kill_on_drop alone signals the direct child, which is how a timed-out WP
+/// run left why3server and its provers running with nobody waiting on them.
+#[tokio::test]
+async fn a_timed_out_one_shot_run_leaves_no_descendant_behind() {
+    use frama_c_mcp::mcp::proc::output_in_own_group;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pid_file = dir.path().join("grandchild.pid");
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()));
+    let outcome = output_in_own_group("test", cmd, std::time::Duration::from_millis(500)).await;
+    assert!(outcome.is_err(), "the budget should have elapsed");
+
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("grandchild pid")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+
+    // Killed is the claim, not reaped: once the shell dies the grandchild is
+    // reparented, and whoever inherits it may reap it late or never, so a
+    // zombie counts as gone. "kill(pid, 0)" succeeds for a zombie, which made
+    // this fail after a correct cleanup on a host whose subreaper was slow.
+    let running = |pid: i32| -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat.rsplit(')').next().and_then(|rest| rest.split_whitespace().next()) != Some("Z"),
+
+            // No /proc entry: gone on Linux. Any other read error is not proof
+            // of anything, so it counts as running and the test fails loudly
+            // instead of passing on a process it could not see. Elsewhere, as
+            // on macOS, ask kill.
+            Err(error) if cfg!(target_os = "linux") => error.kind() != std::io::ErrorKind::NotFound,
+            Err(_) => (unsafe { libc::kill(pid, 0) }) == 0,
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while running(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!running(pid), "grandchild {pid} survived the run");
+}
+
+/// A finished run returns when Frama-C exits, not when the last descendant
+/// lets go of its stdout: a why3server inheriting the pipe kept the read open
+/// until the whole budget ran out. And the child's stdin is null, never this
+/// server's stdin, which is the MCP protocol stream.
+#[tokio::test]
+async fn a_one_shot_run_returns_at_exit_and_reads_no_stdin() {
+    use frama_c_mcp::mcp::proc::output_in_own_group;
+    let started = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg("sleep 30 & echo done");
+    let output = output_in_own_group("test", cmd, std::time::Duration::from_secs(20))
+        .await
+        .expect("within budget")
+        .expect("ran");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg("if read line; then echo read; else echo eof; fi");
+    let output = output_in_own_group("test", cmd, std::time::Duration::from_secs(5))
+        .await
+        .expect("stdin at EOF, not waiting")
+        .expect("ran");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "eof");
 }

@@ -270,7 +270,7 @@ The server exposes the following tool groups:
 | Domain | Tools | Purpose |
 |--------|-------|---------|
 | Project | `reload_project`, `list`, `context`, `self_check`, `parse_surface` | Load source, inspect declarations, navigate call relationships, report server capabilities, and measure how much of a file set Frama-C can parse at all |
-| Concurrency | `analyze_concurrency` | Screen source text for concurrent events, lock order, and race candidates. Level-0 syntax: candidates are never verdicts, and an absent candidate is not one either |
+| Concurrency | `analyze_concurrency` | Screen source text for concurrent events, lock order, and race and deadlock candidates. Level-0 syntax: candidates are never verdicts, and an absent candidate is not one either |
 | EVA/WP | `check`, `run_wp`, `get_wp_goals`, `proof_coverage`, `run_e_acsl` | Run verification, read its conclusions, report stored proof coverage, and execute runtime counterexamples |
 | Annotations | `inject_all_annotations`, `propose_annotations` | Dry-run validate and inject ACSL annotations, and propose the frame conditions the code determines |
 | Sandbox | `create_sandbox`, `delete_sandbox` | Isolate annotation experiments |
@@ -406,6 +406,24 @@ unsigned wraparound and narrowing as well, which Frama-C leaves off by default.
 Set it to `false`, on the profile or on `reload_project` and `check`, only for
 code whose idioms wrap by design; a run under it reports `RTE_REDUCED`, and a
 receipt made under it names the setting in its load identity.
+
+`rte_pointer` is optional, and false when unset: set it to `true`, on the
+profile or on `reload_project` and `check`, and a load that also has `rte`
+checks that every pointer formed points into an object or one past it
+(`-warn-invalid-pointer`). Under `rte: false` there are no runtime-error
+obligations for it to add to, so it does nothing.
+Without it, `base + off` computed before a NULL test proves. It is off by
+default because idioms such as `container_of` form such pointers on purpose. A
+receipt made under it names the setting in its load identity.
+
+`builtin_models` is optional, and false when unset: set it to `true`, on the
+profile or on `reload_project` and `check`, to force-include this server's
+contracts for `__builtin_unreachable`, `__builtin_trap`, `__builtin_clz`,
+`__builtin_ctz` and `__builtin_popcount`. Frama-C declares the first as an
+ordinary returning function and the second not at all, so without them a
+proof cannot use the fact that the code after `if (x < 0)
+__builtin_unreachable();` has `x >= 0`. Every contract in the header is an
+assumption, and the receipt's load identity carries the header's sha256.
 
 Two further fields are optional, and say what this server cannot otherwise
 know. `min_goals` is the floor on obligations the target requires WP to
@@ -676,6 +694,13 @@ payload contract and the change rule. The full set:
 | `WP_WEAKENED_MODEL` | The run's memory model used a selector that departs from C semantics: `+cast` (unsafe pointer casts), `+nat` (unbounded integers) or `+real` (exact reals) |
 | `SMOKE_TEST_FAILED` | Smoke tests were requested and WP proved a smoke goal, so something in scope is unreachable or contradictory and the goals around it prove for the wrong reason |
 | `SMOKE_TEST_UNCHECKED` | Smoke tests were requested and did not run, so whether the specification is vacuous is unknown |
+| `REACHABILITY_PROPERTY_UNENCODED` | The program states its property SV-COMP style, as a `reach_error` or `__VERIFIER_assert` call, and the harness preconditions do not make it a proof obligation: every error function needs `requires \false`, and `__VERIFIER_assert` its parameter `!= 0` when no error function is defined |
+| `CONCURRENT_PROGRAM` | The program creates threads, and EVA and WP analyze it sequentially: thread bodies are not analyzed from `main` and no interleaving is considered, so run `analyze_concurrency` |
+| `COMPILE_FLAGS_DROPPED` | The compilation database builds with flags Frama-C drops on import, such as `-funsigned-char`, `-fwrapv` or `-m32`, so the analyzed program differs from the compiled one |
+| `PINNED_PROPERTY_MISSING` | A property passed in `pinned` is no longer in the program in the form it was pinned, so what was proved is not what was asked for |
+| `PINNED_PROPERTY_NOT_PROVED` | A property passed in `pinned` is present and not proved |
+| `CONTRACT_DECORATIVE` | With `mutants: true`, a stub body (`return 0`, `return <param>`) proves every postcondition of the function's contract, so the proof does not tell the function from the stub |
+| `CONTRACT_MUTANTS_UNCHECKED` | `mutants: true` was asked for and no stub could be judged: no `function`, an extraction failure, or no postcondition to test |
 | `AST_PARSE_DIAGNOSTICS_UNAVAILABLE` | This server has no record of what the front end dropped, so nothing says the analyzed program is the compiled one |
 
 Treat the set as additive: codes are added as gaps are found, and three were

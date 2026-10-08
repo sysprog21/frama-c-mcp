@@ -99,6 +99,9 @@ pub fn profile_evidence_error(
             isystem_paths: profile.isystem_paths.clone(),
             nostdinc,
             unsigned_rte_skipped: profile.rte_unsigned == Some(false),
+            pointer_rte_requested: profile.rte_pointer == Some(true),
+            builtin_models: (profile.builtin_models == Some(true))
+                .then(crate::mcp::server::builtin_models_digest),
         });
         if receipt.pointer("/subject/project_load") != Some(&expected_load) {
             return Some(format!(

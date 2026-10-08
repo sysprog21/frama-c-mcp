@@ -131,6 +131,8 @@ fn compile_args(
         nostdinc: _,
         rte: _,
         unsigned_rte_skipped: _,
+        pointer_rte_requested: _,
+        builtin_models: _,
     } = project_options;
 
     let mut args = vec![

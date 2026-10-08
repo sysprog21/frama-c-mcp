@@ -29,6 +29,7 @@ fn wp_response(run: WpRun<'_>) -> serde_json::Value {
         scope: "main",
         rte_enabled: false,
         unsigned_rte: true,
+        pointer_rte: false,
         frama_c_protocol: vec![],
         proofread_report: run.report,
         goals: run.goals,
@@ -2846,6 +2847,24 @@ fn a_load_that_proves_runtime_errors_does_not_ask_the_kernel_for_them() {
     assert!(args.windows(2).any(|w| w == ["-machdep", "gcc_x86_64"]), "{args:?}");
 }
 
+// Frama-C 33 drops runtime-error annotations on any function EVA analyzed
+// unless -rte-no-use-eva-results is set, and "check" runs EVA before WP in this
+// same process. Without the option an out-of-bounds write that EVA found safe
+// for main's one call proved 5/5 with its goal never generated.
+#[test]
+fn the_main_process_generates_runtime_error_goals_regardless_of_eva() {
+    let args = frama_c_mcp::mcp::server::main_frama_c_args(
+        "frama-c",
+        &["a.c".to_string()],
+        &ProjectLoadOptions { rte: true, ..Default::default() },
+        std::path::Path::new("/tmp/s.sock"),
+    );
+    assert!(
+        args.iter().any(|a| a == frama_c_mcp::mcp::server::RTE_INDEPENDENT_OF_EVA),
+        "{args:?}"
+    );
+}
+
 // The advertised model list is what Frama-C documents; this server validates
 // against what it accepts. Caveat is the known gap: -wp-h names it nowhere and
 // the parser takes it, so a project proved under it was told its own model was
@@ -3728,4 +3747,193 @@ fn cli_output_becomes_messages_the_gates_can_read() {
         messages.iter().all(|m| m["message"] != "Parsing f.c (with preprocessing)"),
         "a plain progress line was read as a message: {messages:?}"
     );
+}
+
+// Pointer formation is checked only when the load asks, and then on every
+// command-line path that also carries the unsigned pair, because those paths
+// must generate the obligations the session did.
+#[test]
+fn pointer_formation_checks_travel_with_the_load() {
+    use frama_c_mcp::mcp::server::POINTER_RTE_OPTION;
+    let plain = ProjectLoadOptions { rte: true, ..Default::default() };
+    assert!(!plain.unsigned_rte_args().iter().any(|a| a == POINTER_RTE_OPTION));
+
+    let asked = ProjectLoadOptions { rte: true, pointer_rte_requested: true, ..Default::default() };
+    assert!(asked.pointer_rte());
+    assert!(asked.unsigned_rte_args().iter().any(|a| a == POINTER_RTE_OPTION));
+
+    // Under no rte at all there are no obligations to add it to.
+    let no_rte = ProjectLoadOptions { rte: false, pointer_rte_requested: true, ..Default::default() };
+    assert!(!no_rte.pointer_rte());
+
+    // And it moves the load identity only when set, so older receipts keep
+    // their digests.
+    let identity = |o: &ProjectLoadOptions| frama_c_mcp::mcp::server::receipt::project_load_identity(o);
+    assert_eq!(identity(&plain), identity(&ProjectLoadOptions { rte: true, ..Default::default() }));
+    assert_ne!(identity(&plain), identity(&asked));
+}
+
+// A step budget reaches the reproducing command line and the effective config
+// only when set, so every receipt made before it existed keeps its digest.
+#[test]
+fn a_step_budget_is_recorded_only_when_given() {
+    let respond = |params: &RunWpParams| {
+        wp_run_response(WpRunResponse {
+            tasks: json!({}),
+            params,
+            functions: vec![],
+            scope: "main",
+            rte_enabled: false,
+            unsigned_rte: false,
+            pointer_rte: false,
+            frama_c_protocol: vec![],
+            proofread_report: None,
+            goals: None,
+            host_load: HostLoad::Load(0.1),
+        })
+    };
+    let plain = respond(&RunWpParams::default());
+    assert!(plain["effective_wp_config"].get("steps").is_none(), "{plain}");
+    assert!(!plain["frama_c_options"].to_string().contains("-wp-steps"), "{plain}");
+
+    let budgeted = respond(&RunWpParams { steps: Some(5000), ..Default::default() });
+    assert_eq!(budgeted["effective_wp_config"]["steps"], 5000, "{budgeted}");
+    let options: Vec<&str> = budgeted["frama_c_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o.as_str())
+        .collect();
+    assert!(options.windows(2).any(|w| w == ["-wp-steps", "5000"]), "{options:?}");
+}
+
+// A missing loop variant or decreases leaves the terminates goal as Timeout on
+// Frama-C 33, and no budget closes it. It is classified by what is missing,
+// ahead of the generic timeout advice.
+#[test]
+fn an_unproved_terminates_goal_is_a_missing_measure_not_a_slow_prover() {
+    use frama_c_mcp::mcp::server::wpclass::{classify_wp_failure_from_goal, is_terminates_goal};
+    assert!(is_terminates_goal("typed_spin_terminates"));
+    assert!(is_terminates_goal("typed_rec_terminates_part2"));
+    assert!(!is_terminates_goal("typed_spin_assigns"));
+
+    let goal = json!({
+        "wpo": "typed_spin_terminates",
+        "name": "Termination-condition",
+        "status": "TIMEOUT",
+        "normalized_status": "timeout",
+    });
+    let finding = classify_wp_failure_from_goal(&goal, Some("spin"));
+    assert_eq!(finding["category"], "termination_unproved", "{finding}");
+
+    // A terminates goal whose backend failed is a backend fault, not a missing
+    // measure.
+    let failed = json!({"wpo": "typed_spin_terminates", "name": "Termination-condition", "status": "FAILED", "normalized_status": "failed"});
+    assert_eq!(classify_wp_failure_from_goal(&failed, Some("spin"))["category"], "internal_error");
+
+    // An ordinary timeout still reads as one.
+    let goal = json!({"wpo": "typed_spin_assigns", "name": "Assigns", "status": "TIMEOUT", "normalized_status": "timeout"});
+    assert_eq!(classify_wp_failure_from_goal(&goal, Some("spin"))["category"], "timeout");
+}
+
+// "(No Model)" is the common answer even for a false goal, so the payload says
+// which goals got a model and never lets "status: ok" stand in for one.
+#[test]
+fn counterexample_output_says_which_goals_came_back_with_a_model() {
+    use frama_c_mcp::mcp::server::wpcli::parse_counter_example_models;
+    let text = "[wp] 2 goals scheduled\n\
+                [wp] [Timeout] typed_f_ensures (Qed 0.52ms) (Alt-Ergo) (No Model)\n\
+                [wp] [Unknown] typed_g_ensures (Alt-Ergo) (Model)\n\
+                [wp] [Unknown] typed_g_ensures (Alt-Ergo) (Model)\n\
+                [wp] Proved goals:    3 / 4\n";
+    let models = parse_counter_example_models(text);
+    assert_eq!(models["model_found"], true);
+    assert_eq!(models["goals_with_model"], json!(["typed_g_ensures"]));
+    assert_eq!(models["goals_without_model"], json!(["typed_f_ensures"]));
+
+    let none = parse_counter_example_models("[wp] [Timeout] typed_f_ensures (Alt-Ergo) (No Model)\n");
+    assert_eq!(none["model_found"], false);
+}
+
+// The builtin models reach the preprocessor as a force-include named by its
+// digest, after the caller's own, and move the load identity only when asked.
+#[test]
+fn builtin_models_are_a_private_force_include() {
+    use frama_c_mcp::mcp::server::{builtin_models_digest, builtin_models_header, cpp_extra_args, BUILTIN_MODELS_HEADER};
+    let plain = ProjectLoadOptions::default();
+    assert_eq!(cpp_extra_args(&plain), None);
+
+    let asked = ProjectLoadOptions {
+        force_includes: vec!["own.h".to_string()],
+        builtin_models: Some(builtin_models_digest()),
+        ..Default::default()
+    };
+    let args = cpp_extra_args(&asked).expect("flags");
+    let header = builtin_models_header().expect("header created");
+    assert!(args.ends_with(&format!("-include {}", header.display())), "{args}");
+    assert!(args.starts_with("-include own.h"), "the caller's header comes first: {args}");
+    assert_eq!(std::fs::read_to_string(&header).unwrap(), BUILTIN_MODELS_HEADER);
+
+    // Private to this process: no fixed name another user could plant first.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&header).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+    assert!(!header.file_name().unwrap().to_str().unwrap().contains(&builtin_models_digest()[..16]));
+
+    let identity = |o: &ProjectLoadOptions| frama_c_mcp::mcp::server::receipt::project_load_identity(o);
+    assert_eq!(identity(&plain), identity(&ProjectLoadOptions::default()));
+    let with = ProjectLoadOptions { builtin_models: Some(builtin_models_digest()), ..Default::default() };
+    assert_ne!(identity(&plain), identity(&with));
+}
+
+// Stub bodies come from the printed signature, the splice refuses any shape the
+// printer does not produce, and only ensures goals decide a verdict.
+#[test]
+fn contract_mutants_are_built_spliced_and_judged() {
+    use frama_c_mcp::mcp::server::checkgaps::contract_mutant_gaps;
+    use frama_c_mcp::mcp::server::wpcli::{contract_mutants, mutant_verdict, splice_body};
+    let names = |sig: &str, f: &str| -> Vec<String> {
+        contract_mutants(sig, f).into_iter().map(|(n, _)| n).collect()
+    };
+    assert_eq!(names("int square(int n);", "square"), ["empty", "return_n"]);
+    assert_eq!(names("int *pick(int *a, int *b, int k);", "pick"), ["empty", "return_a", "return_b"]);
+    assert_eq!(names("void reset(int *p);", "reset"), ["empty"]);
+    assert_eq!(contract_mutants("void reset(int *p);", "reset")[0].1, "{}");
+
+    let source = "/*@ ensures \\result == n * n; */\nint square(int n)\n{\n  int r;\n  r = n * n;\n  return r;\n}\n\nint main(void)\n{\n  return 0;\n}\n";
+    let spliced = splice_body(source, "int square(int n);", "{ return 0; }").expect("printed shape");
+    assert!(spliced.contains("int square(int n)\n{ return 0; }\n\nint main(void)"), "{spliced}");
+    assert!(splice_body("int square(int n) {\n}\n", "int square(int n);", "{}").is_none(), "unprinted shape");
+
+    let report = |passed: bool| json!([
+        {"function": "square", "smoke": false, "property": "square_ensures", "passed": passed},
+        {"function": "square", "smoke": false, "property": "square_assigns", "passed": true},
+    ]);
+    assert_eq!(mutant_verdict(&report(true), "square"), "decorative");
+    assert_eq!(mutant_verdict(&report(false), "square"), "killed");
+    assert_eq!(mutant_verdict(&json!([{"function": "square", "property": "square_assigns", "passed": true}]), "square"), "not_applicable");
+
+    assert!(contract_mutant_gaps(&serde_json::Value::Null).is_empty());
+    assert_eq!(contract_mutant_gaps(&json!({"ran": false, "reason": "x"}))[0]["code"], "CONTRACT_MUTANTS_UNCHECKED");
+    let probe = json!({"ran": true, "mutants": [{"mutant": "empty", "verdict": "decorative"}, {"mutant": "return_n", "verdict": "killed"}]});
+    let gaps = contract_mutant_gaps(&probe);
+    assert_eq!(gaps[0]["code"], "CONTRACT_DECORATIVE");
+    assert_eq!(gaps[0]["mutants"].as_array().unwrap().len(), 1);
+    assert!(contract_mutant_gaps(&json!({"ran": true, "mutants": [{"verdict": "killed"}]})).is_empty());
+}
+
+// Parameters split at top-level commas, so a function-pointer parameter does
+// not invent formals, and an array parameter keeps its name.
+#[test]
+fn signature_parameters_survive_function_pointers_and_arrays() {
+    use frama_c_mcp::mcp::server::wpcli::{contract_mutants, signature_parts};
+    let names = |sig: &str, f: &str| -> Vec<String> {
+        signature_parts(sig, f).unwrap().1.into_iter().map(|(_, n)| n.to_string()).collect()
+    };
+    assert_eq!(names("int f(int (*cb)(int g, int h), int x);", "f"), ["cb", "x"]);
+    assert_eq!(names("int f(int p[10], int n);", "f"), ["p", "n"]);
+    assert_eq!(names("int f(void);", "f"), Vec::<String>::new());
+    assert_eq!(names("int *f(int *p, int const *q);", "f"), ["p", "q"]);
+    let mutants: Vec<String> = contract_mutants("int f(int p[10], int n);", "f").into_iter().map(|(m, _)| m).collect();
+    assert_eq!(mutants, ["empty", "return_n"], "an array is not a return candidate");
 }

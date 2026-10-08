@@ -99,7 +99,7 @@ impl FramaCMcpServer {
         // Frama-C spells the CLI values in lower case.
         let cache_mode = effective_wp_cache(params)?.to_ascii_lowercase();
         for prover in &provers {
-            let mut cmd = isolated_attempt_command(IsolatedAttempt {
+            let cmd = isolated_attempt_command(IsolatedAttempt {
                 frama_c_path: &self.frama_c_path,
                 files: &files,
                 project_options: &project_options,
@@ -112,7 +112,7 @@ impl FramaCMcpServer {
                 functions: &functions,
             });
             let command_timeout = Duration::from_secs(u64::from(timeout.unwrap_or(600)) + 30);
-            let output = match tokio::time::timeout(command_timeout, cmd.output()).await {
+            let output = match crate::mcp::proc::output_in_own_group("isolated WP attempt", cmd, command_timeout).await {
                 Ok(output) => output.map_err(|e| {
                     McpError::internal_error(format!("failed to run isolated WP retry: {e}"), None)
                 })?,
@@ -258,6 +258,12 @@ impl FramaCMcpServer {
                 }),
             },
         });
+
+        // Only when set, as on the socket route, so receipts made without a
+        // step budget keep their digests.
+        if let Some(steps) = params.steps {
+            response["effective_wp_config"]["steps"] = json!(steps);
+        }
         if smoke {
             // -wp-prop suppresses WP's synthetic smoke goals. Keep the filter
             // on the proof attempts, but measure vacuity separately.
@@ -336,11 +342,9 @@ pub async fn run_wp_print(
     }
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await;
+    // Pipes, the process group and the kill all belong to output_in_own_group.
+    cmd.args(&args);
+    let output = crate::mcp::proc::output_in_own_group("wp-print", cmd, EXTERNAL_COMMAND_BUDGET).await;
     match output {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -482,6 +486,9 @@ fn isolated_attempt_command(attempt: IsolatedAttempt<'_>) -> tokio::process::Com
     if let Some(par) = par {
         cmd.arg("-wp-par").arg(par.to_string());
     }
+    if let Some(steps) = params.steps {
+        cmd.arg("-wp-steps").arg(steps.to_string());
+    }
     if let Some(prop) = &params.prop {
         cmd.arg("-wp-prop").arg(prop);
     }
@@ -493,7 +500,6 @@ fn isolated_attempt_command(attempt: IsolatedAttempt<'_>) -> tokio::process::Com
     if !functions.is_empty() {
         cmd.arg("-wp-fct").arg(functions.join(","));
     }
-    cmd.kill_on_drop(true);
     cmd
 }
 
@@ -615,6 +621,319 @@ pub fn parse_smoke_output(text: &str) -> serde_json::Value {
     })
 }
 
+/// The stub bodies a contract is tried against, from the function's printed
+/// signature: "{}" or "{ return 0; }", then "{ return p; }" for each
+/// parameter whose declared type text is the return type's. Each is
+/// (name, body). Empty for a signature this cannot read.
+pub fn contract_mutants(signature: &str, function: &str) -> Vec<(String, String)> {
+    let Some((return_type, params)) = signature_parts(signature, function) else {
+        return Vec::new();
+    };
+    let mut mutants = vec![(
+        "empty".to_string(),
+        if return_type == "void" { "{}".to_string() } else { "{ return 0; }".to_string() },
+    )];
+    if return_type == "void" {
+        return mutants;
+    }
+    for (ty, name) in params {
+        if ty == return_type {
+            mutants.push((format!("return_{name}"), format!("{{ return {name}; }}")));
+        }
+    }
+    mutants
+}
+
+/// A printed signature's return type and its (type, name) parameters, or
+/// None when the text does not name the function.
+///
+/// Parameters split on commas at nesting depth zero only, so a
+/// function-pointer parameter "int (*cb)(int g, int h)" stays one parameter
+/// instead of inventing formals g and h, which pin matching would then unwrap
+/// "\\old" around. A name is the last identifier outside any brackets, so
+/// "int p[10]" names p and "int (*cb)(int)" names cb. A parameter written
+/// without a name, and the lone "void", are left out.
+pub fn signature_parts<'a>(
+    signature: &'a str,
+    function: &str,
+) -> Option<(&'a str, Vec<(&'a str, &'a str)>)> {
+    let signature = signature.trim().trim_end_matches(';');
+    let (head, rest) = signature.split_once(&format!("{function}("))?;
+    let rest = rest.strip_suffix(')').unwrap_or(rest);
+    let params = top_level_commas(rest)
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "void")
+        .filter_map(|param| Some((param_type_text(param)?, param_name(param)?)))
+        .collect();
+    Some((head.trim(), params))
+}
+
+/// Split at the commas that sit outside every parenthesis and bracket.
+fn top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// The parameter's name: the last identifier outside brackets, and inside
+/// the "(*name)" of a function pointer.
+fn param_name(param: &str) -> Option<&str> {
+    if let Some(at) = param.find("(*") {
+        let end = param[at..].find(')').map_or(param.len(), |end| at + end);
+        let name = param[at + 2..end].trim();
+        let is_identifier = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        return is_identifier.then_some(name);
+    }
+    let declarator = param.split('[').next().unwrap_or(param).trim_end();
+    let start = declarator
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |at| at + 1);
+    let name = &declarator[start..];
+    (!name.is_empty() && start > 0).then_some(name)
+}
+
+/// The parameter's type as written for a plain declarator, "int" for "int n"
+/// and "int *" for "int *p". An array or function-pointer parameter has no
+/// type text a stub body could return, so it answers the empty type, which no
+/// return type equals: that keeps it out of contract_mutants's
+/// "return <param>" candidates while pin matching still gets its name.
+fn param_type_text(param: &str) -> Option<&str> {
+    if param.contains('[') || param.contains("(*") {
+        return Some("");
+    }
+    let name = param_name(param)?;
+    Some(param[..param.len() - name.len()].trim())
+}
+
+/// The printed source with one function's body replaced, or None when the
+/// definition is not in the shape Frama-C's printer gives it: the signature
+/// alone on a line, "{" alone on the next, and the body closed by the next "}"
+/// alone at column 0. Refusing an unexpected shape is the point, since a wrong
+/// splice would prove something about a program nobody wrote.
+pub fn splice_body(source: &str, signature: &str, body: &str) -> Option<String> {
+    let header = signature.trim().trim_end_matches(';');
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.windows(2).position(|w| w[0] == header && w[1] == "{")?;
+    let end = start + 1 + lines[start + 1..].iter().position(|line| *line == "}")?;
+    let mut out: Vec<&str> = lines[..=start].to_vec();
+    out.push(body);
+    out.extend_from_slice(&lines[end + 1..]);
+    Some(out.join("\n") + "\n")
+}
+
+/// What one mutant's report says: "decorative" when the function has an
+/// ensures goal and every one passed, "killed" when one did not, and
+/// "not_applicable" when there was no ensures goal to read.
+pub fn mutant_verdict(report: &serde_json::Value, function: &str) -> &'static str {
+    let ensures: Vec<&serde_json::Value> = report
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry["function"] == function && entry["smoke"] != true)
+        .filter(|entry| entry["property"].as_str().is_some_and(|p| p.contains("ensures")))
+        .collect();
+    if ensures.is_empty() {
+        "not_applicable"
+    } else if ensures.iter().all(|entry| entry["passed"] == true) {
+        "decorative"
+    } else {
+        "killed"
+    }
+}
+
+/// A JSON file a one-shot run wrote, or None when it is missing or unreadable.
+pub fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// A contract-mutant probe that judged nothing, and why.
+pub fn mutants_not_run(reason: impl Into<String>) -> serde_json::Value {
+    json!({"ran": false, "reason": reason.into(), "mutants": []})
+}
+
+/// Prove one function's contract against one stub body in a fresh Frama-C.
+///
+/// The session's model and provers, so the stub is judged under the
+/// configuration of the proof it is compared with, and only the ensures goals,
+/// which are the ones mutant_verdict reads: a stub has no runtime error worth
+/// reading, and assigns, terminates and exits hold for it by construction.
+async fn run_one_mutant(
+    frama_c_path: String,
+    args: Vec<String>,
+    report: std::path::PathBuf,
+    function: String,
+) -> &'static str {
+    let mut cmd = tokio::process::Command::new(frama_c_path);
+    cmd.args(&args);
+    match crate::mcp::proc::output_in_own_group("contract mutant", cmd, EXTERNAL_COMMAND_BUDGET).await {
+        Ok(Ok(output)) if output.status.success() => {
+            read_json_file(&report).map_or("not_applicable", |report| mutant_verdict(&report, &function))
+        }
+        _ => "not_applicable",
+    }
+}
+
+/// What a contract-mutant probe is asked to run, as one value, for the reason
+/// SmokeProbeRequest is one.
+pub struct ContractMutants<'a> {
+    pub frama_c_path: &'a str,
+    /// The printed, self-contained source the stubs are spliced into.
+    pub source: &'a str,
+    pub function: &'a str,
+    pub signature: &'a str,
+    /// The printed-source options: the source is Frama-C's own output, so only
+    /// the machine survives.
+    pub project_options: &'a ProjectLoadOptions,
+    /// The proof run's effective_wp_config, whose model and provers the
+    /// mutants are proved under. The defaults apply only where it has none.
+    pub run: &'a serde_json::Value,
+}
+
+/// How many mutant proofs run at once. A stub is generated per parameter of
+/// the return type, so the count follows the signature, and every one is a
+/// Frama-C with its provers: unbounded, a wide signature started dozens.
+const MUTANT_PARALLELISM: usize = 4;
+
+/// Prove one function's contract against each stub body, every mutant in its
+/// own process and up to MUTANT_PARALLELISM at once, since they share nothing.
+/// Cache off for the reason the smoke probe gives.
+pub async fn run_contract_mutants(request: ContractMutants<'_>) -> serde_json::Value {
+    let ContractMutants {
+        frama_c_path,
+        source,
+        function,
+        signature,
+        project_options,
+        run,
+    } = request;
+    let model = run["model"].as_str().unwrap_or(default_wp_model()).to_string();
+    let provers = run
+        .pointer("/provers/effective")
+        .and_then(serde_json::Value::as_array)
+        .map(|provers| provers.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join(","))
+        .filter(|provers| !provers.is_empty())
+        .unwrap_or_else(|| default_wp_provers().to_string());
+    let Ok(dir) = tempfile::tempdir() else {
+        return mutants_not_run("could not create a scratch directory");
+    };
+    let mut runs = tokio::task::JoinSet::new();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MUTANT_PARALLELISM));
+    let mut results = Vec::new();
+    for (index, (name, body)) in contract_mutants(signature, function).into_iter().enumerate() {
+        let file = dir.path().join(format!("{name}.c"));
+        let written = splice_body(source, signature, &body)
+            .is_some_and(|mutated| std::fs::write(&file, mutated).is_ok());
+        if !written {
+            results.push((index, json!({"mutant": name, "body": body, "verdict": "not_applicable",
+                "reason": "the definition is not in the printed shape this splices"})));
+            continue;
+        }
+        let report = dir.path().join(format!("{name}.json"));
+        let mut args = project_cli_args(project_options);
+        args.push(file.display().to_string());
+        args.extend(
+            [
+                "-wp", "-wp-fct", function, "-wp-prop", "@ensures", "-wp-cache", "none",
+                "-wp-timeout", "5", "-wp-model", &model, "-wp-prover", &provers,
+                "-wp-report-json",
+            ]
+            .map(str::to_string),
+        );
+        args.push(report.display().to_string());
+        let run = run_one_mutant(frama_c_path.to_string(), args, report, function.to_string());
+        let permits = permits.clone();
+        runs.spawn(async move {
+            // The semaphore is never closed, so acquiring cannot fail.
+            let _permit = permits.acquire_owned().await;
+            (index, json!({"mutant": name, "body": body, "verdict": run.await}))
+        });
+    }
+
+    // A mutant whose task failed is left out rather than ending the loop:
+    // stopping at the first error dropped the set and aborted every mutant
+    // still running.
+    while let Some(joined) = runs.join_next().await {
+        if let Ok(result) = joined {
+            results.push(result);
+        }
+    }
+    results.sort_by_key(|(index, _)| *index);
+    let results: Vec<serde_json::Value> = results.into_iter().map(|(_, result)| result).collect();
+    if !results.iter().any(|r| r["verdict"] != "not_applicable") {
+        return json!({
+            "ran": false,
+            "reason": "no mutant produced an ensures goal to judge: the contract has no postcondition, or no stub body parsed",
+            "mutants": results,
+        });
+    }
+    json!({"ran": true, "reason": null, "mutants": results})
+}
+
+/// What a doomed smoke goal says is wrong, from its property name.
+///
+/// WP names a smoke goal after what it probes, "<fn>_wp_smoke_<kind>", and the
+/// kinds split two ways. "default_requires" doomed means the precondition can
+/// never hold, so every theorem about the function is vacuous. "dead_code",
+/// "dead_loop" and "dead_call" doomed mean a statement cannot be reached, and
+/// the function's theorem may still be meaningful. Anything else is reported
+/// as unclassified, which the gap treats like vacuity rather than guess.
+pub fn smoke_failure_kind(property: &str) -> &'static str {
+    let Some((_, kind)) = property.split_once("wp_smoke_") else {
+        return "unclassified";
+    };
+    if kind.contains("requires") {
+        "contract_vacuous"
+    } else if kind.starts_with("dead_") {
+        "unreachable_code"
+    } else {
+        "unclassified"
+    }
+}
+
+/// The doomed smoke goals in a -wp-report-json report, each with its kind.
+///
+/// The report rather than the console, because WP shortens a long goal name
+/// on the console to the function and a bare statement number, which loses
+/// the kind, and prints a "[Failed] (Doomed)" line for some doomed goals and
+/// not for others. Measured on 33.0: an entry has "smoke", "passed", "goal",
+/// "property", "function", "file" and "line", and a doomed smoke goal is
+/// "smoke": true with "passed": false.
+pub fn parse_smoke_report(report: &serde_json::Value) -> Vec<serde_json::Value> {
+    report
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry["smoke"] == true && entry["passed"] == false)
+        .map(|entry| {
+            let property = entry["property"].as_str().unwrap_or_default();
+            json!({
+                "goal": entry["goal"],
+                "kind": smoke_failure_kind(property),
+                "function": entry["function"],
+                "file": entry["file"],
+                "line": entry["line"],
+            })
+        })
+        .collect()
+}
+
 /// What a smoke probe is asked to run, as one value.
 ///
 /// A struct for the reason PrintedAstProbe is one: the fields all describe a
@@ -678,8 +997,17 @@ pub async fn run_wp_smoke_probe(
     let par = run
         .pointer("/parallel/effective")
         .and_then(serde_json::Value::as_u64);
+
+    // A scratch directory per probe for the JSON report, removed on return. A
+    // probe that cannot make one still runs and reads the console, so the
+    // classification is lost rather than the probe.
+    let report_dir = tempfile::tempdir().ok();
+    let report_path = report_dir.as_ref().map(|dir| dir.path().join("smoke.json"));
     let mut args = project_cli_args(project_options);
     args.extend(files.iter().cloned());
+    if let Some(path) = &report_path {
+        args.extend(["-wp-report-json".to_string(), path.display().to_string()]);
+    }
     args.extend([
         "-wp".to_string(),
         "-wp-smoke-tests".to_string(),
@@ -715,14 +1043,12 @@ pub async fn run_wp_smoke_probe(
     // list is the scoping that does work and is passed above.
     let started = std::time::Instant::now();
     let mut cmd = tokio::process::Command::new(frama_c_path);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    // Pipes, the process group and the kill all belong to output_in_own_group.
+    cmd.args(&args);
     let command: Vec<String> = std::iter::once(frama_c_path.to_string())
         .chain(args)
         .collect();
-    match tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await {
+    match crate::mcp::proc::output_in_own_group("smoke probe", cmd, EXTERNAL_COMMAND_BUDGET).await {
         Ok(Ok(output)) => {
             let text = format!(
                 "{}\n{}",
@@ -730,6 +1056,11 @@ pub async fn run_wp_smoke_probe(
                 String::from_utf8_lossy(&output.stderr)
             );
             let mut probe = parse_smoke_output(&text);
+            probe["failed_detail"] = report_path
+                .as_deref()
+                .and_then(read_json_file)
+                .map(|report| json!(parse_smoke_report(&report)))
+                .unwrap_or(serde_json::Value::Null);
             probe["ran"] = json!(output.status.success());
             probe["command"] = json!(command);
             probe["provers"] = json!(provers);
@@ -808,11 +1139,9 @@ pub async fn run_wp_memory_model_probe(
     }
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    match tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await {
+    // Pipes, the process group and the kill all belong to output_in_own_group.
+    cmd.args(&args);
+    match crate::mcp::proc::output_in_own_group("memory-model probe", cmd, EXTERNAL_COMMAND_BUDGET).await {
         Ok(Ok(output)) => {
             // Both streams. Frama-C writes diagnostics to stdout and this
             // warning has been seen on each, so reading one of them is how a
@@ -957,11 +1286,9 @@ pub async fn run_why3_dump(
     }
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await;
+    // Pipes, the process group and the kill all belong to output_in_own_group.
+    cmd.args(&args);
+    let output = crate::mcp::proc::output_in_own_group("why3 dump", cmd, EXTERNAL_COMMAND_BUDGET).await;
     match output {
         Ok(Ok(output)) => {
             let (dumps, files_omitted) =
@@ -1008,6 +1335,41 @@ pub async fn run_why3_dump(
     }
 }
 
+/// Which goals came back with a prover model in a -wp-counter-examples run.
+///
+/// WP marks each reported goal " (Model)" when the prover returned one and
+/// " (No Model)" when it was asked and did not (register.ml in 33.0). Measured
+/// here: Alt-Ergo 2.6.3 and Z3 both answer "(No Model)" for
+/// "ensures \result == x + 1" over "return x;", which is plainly false, so an
+/// absent model says nothing about whether the goal holds.
+pub fn parse_counter_example_models(text: &str) -> serde_json::Value {
+    let goal_of = |line: &str| -> Option<String> {
+        // "[wp] [Status] goal ...": the goal follows the second tag.
+        let rest = line.split("] ").nth(2)?;
+        rest.split_whitespace().next().map(str::to_string)
+    };
+    let mut with_model: Vec<String> = Vec::new();
+    let mut without_model: Vec<String> = Vec::new();
+    for line in text.lines().filter(|line| line.starts_with("[wp] [")) {
+        let bucket = if line.contains(" (No Model)") {
+            &mut without_model
+        } else if line.contains(" (Model)") {
+            &mut with_model
+        } else {
+            continue;
+        };
+        if let Some(goal) = goal_of(line).filter(|goal| !bucket.contains(goal)) {
+            bucket.push(goal);
+        }
+    }
+    json!({
+        "model_found": !with_model.is_empty(),
+        "goals_with_model": with_model,
+        "goals_without_model": without_model,
+        "note": "A goal without a model is not evidence either way: the provers here often return none even for a false goal. Use run_e_acsl to look for a concrete violation.",
+    })
+}
+
 pub async fn run_wp_counter_examples(
     frama_c_path: &str,
     files: &[String],
@@ -1036,6 +1398,13 @@ pub async fn run_wp_counter_examples(
         default_wp_provers().to_string(),
         "-wp-fct".to_string(),
         function.to_string(),
+
+        // A replayed verdict comes with no model, because no prover ran, so a
+        // warm cache would answer "no model" for every goal it holds.
+        "-wp-cache".to_string(),
+        "none".to_string(),
+        "-wp-timeout".to_string(),
+        "10".to_string(),
     ]);
     if rte {
         args.push("-wp-rte".to_string());
@@ -1046,11 +1415,9 @@ pub async fn run_wp_counter_examples(
         .collect::<Vec<_>>();
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    match tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await {
+    // Pipes, the process group and the kill all belong to output_in_own_group.
+    cmd.args(&args);
+    match crate::mcp::proc::output_in_own_group("counterexample run", cmd, EXTERNAL_COMMAND_BUDGET).await {
         Ok(Ok(output)) => {
             let (stdout, stdout_truncated) =
                 capped_lossy_string(&output.stdout, MAX_COUNTER_EXAMPLE_OUTPUT_BYTES);
@@ -1060,6 +1427,7 @@ pub async fn run_wp_counter_examples(
                 "status": if output.status.success() { "ok" } else { "error" },
                 "code": output.status.code(),
                 "command": command,
+                "models": parse_counter_example_models(&stdout),
                 "raw_stdout": stdout,
                 "raw_stderr": stderr,
                 "truncated": stdout_truncated || stderr_truncated,
