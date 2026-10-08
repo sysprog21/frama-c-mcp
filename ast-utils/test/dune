@@ -1,29 +1,60 @@
-(rule
- (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run.sh)))
+; Every regression runs through with-built-plugin.sh, which points findlib at
+; this tree's freshly built plug-in rather than the copy installed in the opam
+; switch, and turns on the AST integrity check. (package ast_utils) is the
+; dependency that makes dune populate the install lib it points at.
 
 (rule
  (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run_exec_add_funspec.sh)))
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run.sh)))
 
 (rule
  (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run_funspec_scope.sh)))
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run_exec_add_funspec.sh)))
 
 (rule
  (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run-payload-shapes.sh)))
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run_funspec_scope.sh)))
 
 (rule
  (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run-contract-frontier.sh)))
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run-payload-shapes.sh)))
 
 (rule
  (alias runtest)
- (deps (source_tree regressions))
- (action (run ./regressions/run-cache-provenance.sh)))
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run-contract-frontier.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run-cache-provenance.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run-ghost-integrity.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions) (package ast_utils))
+ (action
+  (run ./regressions/with-built-plugin.sh
+   %{workspace_root}/../install/default/lib ./regressions/run-recursive-logic.sh)))

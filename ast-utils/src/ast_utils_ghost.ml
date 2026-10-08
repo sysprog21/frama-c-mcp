@@ -1,31 +1,28 @@
-(** ast_utils_ghost.ml — Ghost statement insertion/removal via direct CIL construction.
+(** ast_utils_ghost.ml: ghost code insertion via direct CIL construction.
 
     Provides:
-    - Type name resolution (string → CIL typ)
-    - Simple C expression parser (recursive descent)
-    - Ghost variable declaration insertion
-    - Ghost assignment insertion
-    - Ghost global variable insertion/removal
-    - Ghost statement/variable removal with registry tracking
+    - Type name resolution (string to CIL typ)
+    - Simple C expression parser (recursive descent), resolving names through
+      the blocks that enclose the insertion point, then formals, then globals
+    - Insertion of ghost globals, formals, lemma functions, local declarations,
+      assignments, empty-else assignments, labels and counting loops
+
+    There is no removal: an inserted ghost goes away only by reloading the
+    project. Nothing records what was inserted either; the three registries
+    that once did were written and never read, and were removed.
+
+    Every insertion that rewrites a function body rebuilds its CFG and calls
+    Ast.mark_as_changed, so states computed from the old body, WP's
+    per-function CFG cache among them, are recomputed. A ghost local is listed
+    both in the function's slocals and in the blocals of the block holding its
+    declaration, with vdefined set, which is what Filecheck expects of a
+    Local_init.
 
     All inserted statements have stmt.ghost = true and target variables
     have vghost = true, ensuring soundness (no effect on program semantics). *)
 
 open Frama_c_kernel
 open Cil_types
-
-(* ====== Ghost Registry ====== *)
-
-(* key: (function_name, var_name), value: sids of statements we inserted *)
-let ghost_registry : (string * string, int list) Hashtbl.t =
-  Hashtbl.create 16
-
-(* key: function_name, value: statement-only ghost insert sids *)
-let ghost_stmt_registry : (string, int list) Hashtbl.t =
-  Hashtbl.create 16
-
-let ghost_global_registry : (string, varinfo) Hashtbl.t =
-  Hashtbl.create 16
 
 let is_valid_c_identifier name =
   let len = String.length name in
@@ -166,74 +163,141 @@ let peek ls =
   ls.pos <- saved;
   tok
 
-let find_var_in_fundec fundec name =
-  try List.find (fun vi -> vi.vname = name) fundec.slocals
-  with Not_found ->
-  try List.find (fun vi -> vi.vname = name) fundec.sformals
-  with Not_found ->
-  try Globals.Vars.find_from_astinfo name Global
-  with Not_found ->
-    failwith (Printf.sprintf "unknown variable '%s'" name)
+(* The blocks enclosing the statement with this sid, innermost first, each
+   paired with its statements that precede the one leading to the target. None
+   when the body does not contain it. A walk over the body rather than
+   Kernel_function.find_all_enclosing_blocks, because the kernel's statement
+   tables do not know a statement inserted since the last Ast.mark_as_changed. *)
+let enclosing_blocks fundec target_sid =
+  let rec in_block acc b =
+    let rec scan before = function
+      | [] -> None
+      | s :: rest ->
+        if s.sid = target_sid then Some ((b, List.rev before) :: acc)
+        else
+          match in_stmt ((b, List.rev before) :: acc) s with
+          | Some _ as found -> found
+          | None -> scan (s :: before) rest
+    in
+    scan [] b.bstmts
+  and in_stmt acc s =
+    match s.skind with
+    | If (_, tb, fb, _) ->
+      (match in_block acc tb with
+       | Some _ as found -> found
+       | None -> in_block acc fb)
+    | Loop (_, b, _, _, _) | Block b | Switch (_, b, _, _) -> in_block acc b
+    | UnspecifiedSequence seq ->
+      List.find_map (fun (s, _, _, _, _) ->
+        if s.sid = target_sid then Some acc else in_stmt acc s) seq
+    | _ -> None
+  in
+  in_block [] fundec.sbody
 
-let rec parse_expr_impl ls fundec loc =
-  parse_additive ls fundec loc
+(* Whether stmt is the Local_init of vi, the statement C scope starts at. *)
+let rec initializes vi stmt =
+  match stmt.skind with
+  | Instr (Local_init (v, _, _)) -> v.vid = vi.vid
+  | UnspecifiedSequence seq ->
+    List.exists (fun (s, _, _, _, _) -> initializes vi s) seq
+  | _ -> false
 
-and parse_additive ls fundec loc =
-  let left = ref (parse_multiplicative ls fundec loc) in
+(* Resolve a C name as it reads at the statement with this sid: the locals of
+   the enclosing blocks, innermost first, then the formals, then the globals.
+   A block local with an initializer is visible only once that initializer has
+   run, since CIL lists every local at the top of its block whatever its C
+   scope. Within a block the CIL name wins over the source name, so "t_0" and
+   "t" both reach a second "t" CIL renamed, and neither reaches a sibling
+   block. *)
+let find_var_in_scope fundec target_sid name =
+  let blocks =
+    match enclosing_blocks fundec target_sid with
+    | Some blocks -> blocks
+    | None ->
+      failwith (Printf.sprintf "statement %d not found in function body"
+                  target_sid)
+  in
+  let in_block (b, before) =
+    let visible vi =
+      (not vi.vdefined) || List.exists (initializes vi) before in
+    let named f = List.find_opt (fun vi -> f vi && visible vi) b.blocals in
+    match named (fun vi -> vi.vname = name) with
+    | Some _ as found -> found
+    | None -> named (fun vi -> vi.vorig_name = name)
+  in
+  match List.find_map in_block blocks with
+  | Some vi -> vi
+  | None ->
+    match List.find_opt (fun vi -> vi.vname = name) fundec.sformals with
+    | Some vi -> vi
+    | None ->
+      try Globals.Vars.find_from_astinfo name Global
+      with Not_found ->
+        if List.exists (fun vi -> vi.vname = name) fundec.slocals then
+          failwith (Printf.sprintf
+            "variable '%s' is not in scope at statement %d" name target_sid)
+        else
+          failwith (Printf.sprintf "unknown variable '%s'" name)
+
+let rec parse_expr_impl ls lookup loc =
+  parse_additive ls lookup loc
+
+and parse_additive ls lookup loc =
+  let left = ref (parse_multiplicative ls lookup loc) in
   let cont = ref true in
   while !cont do
     match peek ls with
     | TkPlus ->
       ignore (next_token ls);
       left := Ast_utils_compat.mk_binop ~loc PlusA !left
-                (parse_multiplicative ls fundec loc)
+                (parse_multiplicative ls lookup loc)
     | TkMinus ->
       ignore (next_token ls);
       left := Ast_utils_compat.mk_binop ~loc MinusA !left
-                (parse_multiplicative ls fundec loc)
+                (parse_multiplicative ls lookup loc)
     | _ -> cont := false
   done;
   !left
 
-and parse_multiplicative ls fundec loc =
-  let left = ref (parse_unary ls fundec loc) in
+and parse_multiplicative ls lookup loc =
+  let left = ref (parse_unary ls lookup loc) in
   let cont = ref true in
   while !cont do
     match peek ls with
     | TkStar ->
       ignore (next_token ls);
       left := Ast_utils_compat.mk_binop ~loc Mult !left
-                (parse_unary ls fundec loc)
+                (parse_unary ls lookup loc)
     | TkSlash ->
       ignore (next_token ls);
       left := Ast_utils_compat.mk_binop ~loc Div !left
-                (parse_unary ls fundec loc)
+                (parse_unary ls lookup loc)
     | TkPercent ->
       ignore (next_token ls);
       left := Ast_utils_compat.mk_binop ~loc Mod !left
-                (parse_unary ls fundec loc)
+                (parse_unary ls lookup loc)
     | _ -> cont := false
   done;
   !left
 
-and parse_unary ls fundec loc =
+and parse_unary ls lookup loc =
   match peek ls with
   | TkMinus ->
     ignore (next_token ls);
-    let e = parse_unary ls fundec loc in
+    let e = parse_unary ls lookup loc in
     Cil.new_exp ~loc (UnOp (Neg, e, Cil.typeOf e))
-  | _ -> parse_primary ls fundec loc
+  | _ -> parse_primary ls lookup loc
 
-and parse_primary ls fundec loc =
+and parse_primary ls lookup loc =
   match next_token ls with
   | TkInt n ->
     Cil.integer ~loc n
   | TkIdent name ->
-    let vi = find_var_in_fundec fundec name in
+    let vi = lookup name in
     (match peek ls with
      | TkLBracket ->
        ignore (next_token ls);
-       let idx = parse_expr_impl ls fundec loc in
+       let idx = parse_expr_impl ls lookup loc in
        (match next_token ls with
         | TkRBracket -> ()
         | _ -> failwith (Printf.sprintf
@@ -250,7 +314,7 @@ and parse_primary ls fundec loc =
      | _ ->
        Cil.evar ~loc vi)
   | TkLParen ->
-    let e = parse_expr_impl ls fundec loc in
+    let e = parse_expr_impl ls lookup loc in
     (match next_token ls with
      | TkRParen -> ()
      | _ -> failwith (Printf.sprintf
@@ -262,13 +326,17 @@ and parse_primary ls fundec loc =
     failwith (Printf.sprintf
       "parse error: unexpected token at position %d" ls.pos)
 
-let parse_c_expr fundec loc expr_string =
+(* Parse an expression as it reads just before stmt, which is where every
+   caller inserts the code that uses it. *)
+let parse_c_expr fundec stmt expr_string =
   if String.length (String.trim expr_string) = 0 then
     Error "empty expression"
   else
     try
+      let loc = Cil_datatype.Stmt.loc stmt in
+      let lookup = find_var_in_scope fundec stmt.sid in
       let ls = mk_lexer expr_string in
-      let e = parse_expr_impl ls fundec loc in
+      let e = parse_expr_impl ls lookup loc in
       (match peek ls with
        | TkEof -> Ok e
        | _ -> Error (Printf.sprintf
@@ -296,30 +364,37 @@ let rebuild_cfg fundec =
   Cfg.clearCFGinfo ~clear_id:false fundec;
   Cfg.cfgFun fundec
 
-(* Insert new_stmt before target_sid in the function body (recursive) *)
-let rec insert_in_block target_sid new_stmt b =
-  let found = ref false in
-  let new_bstmts = List.fold_right (fun s acc ->
-    if s.sid = target_sid then begin
-      found := true;
-      new_stmt :: s :: acc
-    end else begin
-      insert_in_skind target_sid new_stmt s.skind;
-      s :: acc
-    end
-  ) b.bstmts [] in
-  if !found then b.bstmts <- new_bstmts;
-  !found
+(* The end of every finished body edit: rebuild the CFG and invalidate what was
+   computed from the old body. WP keeps a per-function cache that depends on
+   Ast.self, so an edit that rebuilt without marking left the next proof
+   running against the body as it was. One name for the pair, so a new
+   insertion cannot do half of it. rebuild_cfg alone is for the two paths that
+   mark later on purpose, after typing an annotation or registering a
+   function. *)
+let commit_body_edit fundec =
+  rebuild_cfg fundec;
+  Ast.mark_as_changed ()
 
-and insert_in_skind target_sid new_stmt = function
+(* Insert new_stmt before the statement with target_sid, searching nested
+   blocks. Returns the block that now holds both, or None when the body has no
+   such statement, in which case nothing was changed. *)
+let rec insert_in_block target_sid new_stmt b =
+  if List.exists (fun s -> s.sid = target_sid) b.bstmts then begin
+    b.bstmts <- List.concat_map
+        (fun s -> if s.sid = target_sid then [new_stmt; s] else [s]) b.bstmts;
+    Some b
+  end else
+    List.find_map (insert_in_stmt target_sid new_stmt) b.bstmts
+
+and insert_in_stmt target_sid new_stmt s =
+  match s.skind with
   | If (_, tb, fb, _) ->
-    ignore (insert_in_block target_sid new_stmt tb);
-    ignore (insert_in_block target_sid new_stmt fb)
-  | Loop (_, b, _, _, _) | Block b ->
-    ignore (insert_in_block target_sid new_stmt b)
-  | Switch (_, b, _, _) ->
-    ignore (insert_in_block target_sid new_stmt b)
-  | _ -> ()
+    (match insert_in_block target_sid new_stmt tb with
+     | Some _ as found -> found
+     | None -> insert_in_block target_sid new_stmt fb)
+  | Loop (_, b, _, _, _) | Block b | Switch (_, b, _, _) ->
+    insert_in_block target_sid new_stmt b
+  | _ -> None
 
 (* Remove statements by sid list from the function body (recursive) *)
 let rec remove_from_block sids b =
@@ -384,7 +459,6 @@ let insert_ghost_global name typ init =
       let file = Ast.get () in
       file.globals <- file.globals @ [global];
       Globals.Vars.add vi initinfo;
-      Hashtbl.replace ghost_global_registry name vi;
       Ast.mark_as_changed ();
       Ok vi
     end
@@ -500,7 +574,6 @@ let insert_ghost_formal kf name typ where =
 let insert_ghost_decl kf stmt var_name typ init_exp =
   try
     let fundec = Kernel_function.get_definition kf in
-    let kf_name = Kernel_function.get_name kf in
     (* Check for duplicate variable name *)
     let exists_in_locals =
       List.exists (fun vi -> vi.vname = var_name) fundec.slocals in
@@ -519,26 +592,25 @@ let insert_ghost_decl kf stmt var_name typ init_exp =
       (* Create ghost local variable (insert:false = don't auto-add) *)
       let vi = Cil.makeLocalVar ~insert:false ~ghost:true ~loc
                  fundec var_name typ in
-      (* Manually add to slocals *)
-      fundec.slocals <- fundec.slocals @ [vi];
       (* Build Local_init instruction *)
       let init_instr =
         Local_init (vi, AssignInit (SingleInit cast_exp), loc) in
       let new_stmt =
         Cil.mkStmtOneInstr ~ghost:true ~valid_sid:true init_instr in
       (* Insert before target stmt *)
-      let inserted = insert_in_block stmt.sid new_stmt fundec.sbody in
-      if not inserted then
+      match insert_in_block stmt.sid new_stmt fundec.sbody with
+      | None ->
         Error (Printf.sprintf "statement %d not found in function body"
                  stmt.sid)
-      else begin
+      | Some holder ->
+        (* Declared where it is initialized: the holding block's locals, with
+           vdefined set because a Local_init initializes it. *)
+        vi.vdefined <- true;
+        holder.blocals <- holder.blocals @ [vi];
+        fundec.slocals <- fundec.slocals @ [vi];
         fundec.sallstmts <- new_stmt :: fundec.sallstmts;
-        rebuild_cfg fundec;
-        (* Update registry *)
-        Hashtbl.replace ghost_registry
-          (kf_name, var_name) [new_stmt.sid];
+        commit_body_edit fundec;
         Ok new_stmt
-      end
     end
   with
   | Kernel_function.No_Definition ->
@@ -550,13 +622,8 @@ let insert_ghost_decl kf stmt var_name typ init_exp =
 let insert_ghost_assign kf stmt target_name expr =
   try
     let fundec = Kernel_function.get_definition kf in
-    let kf_name = Kernel_function.get_name kf in
-    (* Find the target ghost variable *)
-    let vi =
-      try List.find (fun vi -> vi.vname = target_name) fundec.slocals
-      with Not_found ->
-        failwith (Printf.sprintf "variable '%s' not found" target_name)
-    in
+    (* Find the target ghost variable as it reads at the insertion point *)
+    let vi = find_var_in_scope fundec stmt.sid target_name in
     if not vi.vghost then
       failwith (Printf.sprintf
         "variable '%s' is not a ghost variable" target_name);
@@ -572,21 +639,14 @@ let insert_ghost_assign kf stmt target_name expr =
     let new_stmt =
       Cil.mkStmtOneInstr ~ghost:true ~valid_sid:true set_instr in
     (* Insert before target stmt *)
-    let inserted = insert_in_block stmt.sid new_stmt fundec.sbody in
-    if not inserted then
+    match insert_in_block stmt.sid new_stmt fundec.sbody with
+    | None ->
       Error (Printf.sprintf "statement %d not found in function body"
                stmt.sid)
-    else begin
+    | Some _ ->
       fundec.sallstmts <- new_stmt :: fundec.sallstmts;
-      rebuild_cfg fundec;
-      (* Update registry *)
-      let key = (kf_name, target_name) in
-      let existing =
-        try Hashtbl.find ghost_registry key
-        with Not_found -> [] in
-      Hashtbl.replace ghost_registry key (new_stmt.sid :: existing);
+      commit_body_edit fundec;
       Ok new_stmt
-    end
   with
   | Kernel_function.No_Definition ->
     Error (Printf.sprintf "function '%s' has no definition"
@@ -597,17 +657,16 @@ let insert_ghost_assign kf stmt target_name expr =
 let insert_ghost_else_assign kf if_stmt target_name expr =
   try
     let fundec = Kernel_function.get_definition kf in
-    let kf_name = Kernel_function.get_name kf in
-    let vi =
-      try List.find (fun vi -> vi.vname = target_name) fundec.slocals
-      with Not_found ->
-        failwith (Printf.sprintf "variable '%s' not found" target_name)
-    in
-    if not vi.vghost then
-      failwith (Printf.sprintf
-        "variable '%s' is not a ghost variable" target_name);
+    (* The statement kind is checked before the name is resolved: a target
+       that is not an if is the more basic error, and resolving first answered
+       "not in scope" for a ghost declared by the target statement itself. *)
     match if_stmt.skind with
     | If (_, _, false_block, loc) ->
+      (* The else branch sees what the if statement sees *)
+      let vi = find_var_in_scope fundec if_stmt.sid target_name in
+      if not vi.vghost then
+        failwith (Printf.sprintf
+          "variable '%s' is not a ghost variable" target_name);
       if false_block.bstmts <> [] then
         Error "else_set requires an if statement with an empty else branch"
       else begin
@@ -621,12 +680,7 @@ let insert_ghost_else_assign kf if_stmt target_name expr =
           Cil.mkStmtOneInstr ~ghost:true ~valid_sid:true set_instr in
         false_block.bstmts <- [new_stmt];
         fundec.sallstmts <- new_stmt :: fundec.sallstmts;
-        rebuild_cfg fundec;
-        let key = (kf_name, target_name) in
-        let existing =
-          try Hashtbl.find ghost_registry key
-          with Not_found -> [] in
-        Hashtbl.replace ghost_registry key (new_stmt.sid :: existing);
+        commit_body_edit fundec;
         Ok new_stmt
       end
     | _ ->
@@ -642,7 +696,6 @@ let insert_ghost_loop
     kf stmt var_name typ init_exp stop_exp step_exp invariant assigns variant assert_pred =
   try
     let fundec = Kernel_function.get_definition kf in
-    let kf_name = Kernel_function.get_name kf in
     let exists =
       List.exists (fun vi -> vi.vname = var_name) fundec.slocals ||
       List.exists (fun vi -> vi.vname = var_name) fundec.sformals
@@ -655,7 +708,7 @@ let insert_ghost_loop
       let loc = Cil_datatype.Stmt.loc stmt in
       let vi =
         Cil.makeLocalVar ~insert:false ~ghost:true ~loc fundec var_name typ in
-      fundec.slocals <- fundec.slocals @ [vi];
+      vi.vdefined <- true;
       let cast_to_counter exp =
         if Cil_datatype.Typ.equal (Cil.typeOf exp) typ then exp
         else Cil.mkCast ~newt:typ exp
@@ -696,14 +749,15 @@ let insert_ghost_loop
          post_assert := Some (stmt, pred);
          stmts := !stmts @ [stmt]);
       let block = Cil.mkBlock !stmts in
+      (* The counter is scoped to the ghost block that initializes it *)
+      block.blocals <- [vi];
       let block_stmt = Cil.mkStmt ~ghost:true ~valid_sid:true (Block block) in
       force_stmt_ghost block_stmt;
-      let inserted = insert_in_block stmt.sid block_stmt fundec.sbody in
-      if not inserted then begin
-        fundec.slocals <- List.filter (fun v -> v.vid <> vi.vid) fundec.slocals;
+      match insert_in_block stmt.sid block_stmt fundec.sbody with
+      | None ->
         Error (Printf.sprintf "statement %d not found in function body" stmt.sid)
-      end
-      else begin
+      | Some _ ->
+        fundec.slocals <- fundec.slocals @ [vi];
         let inserted_sids =
           collect_stmt_tree [] block_stmt |> List.map (fun s -> s.sid) in
         fundec.sallstmts <- collect_stmt_tree [] block_stmt @ fundec.sallstmts;
@@ -715,7 +769,7 @@ let insert_ghost_loop
               fundec.sallstmts;
           fundec.slocals <-
             List.filter (fun v -> v.vid <> vi.vid) fundec.slocals;
-          rebuild_cfg fundec;
+          commit_body_edit fundec;
           Error msg
         in
         let loop_acsl =
@@ -739,10 +793,8 @@ let insert_ghost_loop
              | None -> ()
              | Some (stmt, _) ->
                Ast_utils_core.insert_annots kf stmt assert_annots);
-            Hashtbl.replace ghost_registry (kf_name, var_name) inserted_sids;
             Ast.mark_as_changed ();
             Ok (block_stmt, loop_stmt, vi, inserted_sids)
-      end
     end
   with
   | Kernel_function.No_Definition ->
@@ -754,7 +806,6 @@ let insert_ghost_loop
 let insert_ghost_label kf stmt label_name =
   try
     let fundec = Kernel_function.get_definition kf in
-    let kf_name = Kernel_function.get_name kf in
     if not (is_valid_c_identifier label_name) then
       Error (Printf.sprintf "invalid label name '%s'" label_name)
     else if is_reserved_logic_label label_name then
@@ -766,19 +817,14 @@ let insert_ghost_label kf stmt label_name =
       let loc = Cil_datatype.Stmt.loc stmt in
       let new_stmt = Cil.mkEmptyStmt ~ghost:true ~valid_sid:true ~loc () in
       new_stmt.labels <- [Label (label_name, loc, true)];
-      let inserted = insert_in_block stmt.sid new_stmt fundec.sbody in
-      if not inserted then
+      match insert_in_block stmt.sid new_stmt fundec.sbody with
+      | None ->
         Error (Printf.sprintf "statement %d not found in function body"
                  stmt.sid)
-      else begin
+      | Some _ ->
         fundec.sallstmts <- new_stmt :: fundec.sallstmts;
-        rebuild_cfg fundec;
-        let existing =
-          try Hashtbl.find ghost_stmt_registry kf_name
-          with Not_found -> [] in
-        Hashtbl.replace ghost_stmt_registry kf_name (new_stmt.sid :: existing);
+        commit_body_edit fundec;
         Ok new_stmt
-      end
     end
   with
   | Kernel_function.No_Definition ->

@@ -1257,3 +1257,116 @@ let get_contract_context (kf : kernel_function) : Yojson.Basic.t =
     ("unresolved_callees", `List unresolved_callees);
     ("callee_resolution_complete", `Bool (unresolved_callees = []));
   ]
+
+(* ====== Recursive logic definitions ====== *)
+
+class logic_uses_visitor (uses : (int, unit) Hashtbl.t) = object
+  inherit Cil.nopCilVisitor
+
+  method! vlogic_info_use li =
+    Hashtbl.replace uses li.l_var_info.lv_id ();
+    DoChildren
+end
+
+(** Every ACSL logic function or predicate defined with a body that is
+    recursive, directly or through others.
+
+    WP turns such a definition into an axiom and never asks whether the
+    recursion terminates, so a definition like "bad(n) = bad(n) + 1" is an
+    inconsistent axiom from which any goal follows. This lists them; it does not
+    try to decide termination.
+
+    Nodes are the definitions whose body is a term or a predicate, found at top
+    level and inside axiomatic blocks and modules. Inductive predicates are not
+    nodes: they denote least fixpoints, which are consistent by construction. An
+    edge goes from a definition to every node its body mentions, and a node is
+    reported when its strongly connected component has more than one member or
+    it mentions itself. "cycle" is that component in source order. *)
+let get_recursive_logic () : Yojson.Basic.t =
+  let seen = Hashtbl.create 16 in
+  let defs = ref [] in
+  let rec collect = function
+    | Dfun_or_pred (li, loc) ->
+      (match li.l_body with
+       | LBterm _ | LBpred _ when not (Hashtbl.mem seen li.l_var_info.lv_id) ->
+         Hashtbl.replace seen li.l_var_info.lv_id ();
+         defs := (li, loc) :: !defs
+       | _ -> ())
+    | Daxiomatic (_, inner, _, _) -> List.iter collect inner
+    | Dmodule (_, inner, _, _, _) -> List.iter collect inner
+    | _ -> ()
+  in
+  Annotations.iter_global (fun _ ga -> collect ga);
+  let by_position (a, la) (b, lb) =
+    compare
+      (Ast_utils_compat.loc_file la, Ast_utils_compat.loc_line la,
+       a.l_var_info.lv_name)
+      (Ast_utils_compat.loc_file lb, Ast_utils_compat.loc_line lb,
+       b.l_var_info.lv_name)
+  in
+  let defs = Array.of_list (List.sort by_position !defs) in
+  let n = Array.length defs in
+  let index_of = Hashtbl.create n in
+  Array.iteri (fun i (li, _) -> Hashtbl.replace index_of li.l_var_info.lv_id i)
+    defs;
+  let succs = Array.map (fun (li, _) ->
+    let uses = Hashtbl.create 8 in
+    let vis = new logic_uses_visitor uses in
+    (match li.l_body with
+     | LBterm t -> ignore (Cil.visitCilTerm (vis :> Cil.cilVisitor) t)
+     | LBpred p -> ignore (Cil.visitCilPredicate (vis :> Cil.cilVisitor) p)
+     | _ -> ());
+    Hashtbl.fold (fun id () acc ->
+      match Hashtbl.find_opt index_of id with
+      | Some j -> j :: acc
+      | None -> acc) uses []
+    |> List.sort_uniq compare
+  ) defs in
+  (* Tarjan's strongly connected components. *)
+  let index = Array.make n (-1) and low = Array.make n 0 in
+  let on_stack = Array.make n false and stack = ref [] in
+  let counter = ref 0 and comp = Array.make n (-1) and ncomp = ref 0 in
+  let rec visit v =
+    index.(v) <- !counter; low.(v) <- !counter; incr counter;
+    stack := v :: !stack; on_stack.(v) <- true;
+    List.iter (fun w ->
+      if index.(w) < 0 then begin
+        visit w; low.(v) <- min low.(v) low.(w)
+      end else if on_stack.(w) then
+        low.(v) <- min low.(v) index.(w)) succs.(v);
+    if low.(v) = index.(v) then begin
+      let rec pop () =
+        match !stack with
+        | w :: rest ->
+          stack := rest; on_stack.(w) <- false; comp.(w) <- !ncomp;
+          if w <> v then pop ()
+        | [] -> ()
+      in
+      pop (); incr ncomp
+    end
+  in
+  for v = 0 to n - 1 do if index.(v) < 0 then visit v done;
+  (* Members bucketed once after the walk, in source order, rather than
+     rebuilt by scanning every definition for each one, which made even an
+     acyclic program quadratic in its logic definitions. *)
+  let buckets = Array.make (max 1 !ncomp) [] in
+  for i = n - 1 downto 0 do
+    buckets.(comp.(i)) <- i :: buckets.(comp.(i))
+  done;
+  let members c = buckets.(c) in
+  let recursive v =
+    List.mem v succs.(v) || List.compare_length_with (members comp.(v)) 1 > 0 in
+  let name i = (fst defs.(i)).l_var_info.lv_name in
+  let definitions =
+    List.filter recursive (List.init n Fun.id)
+    |> List.map (fun i ->
+      let li, loc = defs.(i) in
+      `Assoc [
+        ("name", `String (name i));
+        ("kind", `String (if li.l_type = None then "predicate" else "function"));
+        ("file", `String (Ast_utils_compat.loc_file loc));
+        ("line", `Int (Ast_utils_compat.loc_line loc));
+        ("cycle", `List (List.map (fun j -> `String (name j)) (members comp.(i))));
+      ])
+  in
+  `Assoc [("definitions", `List definitions)]
