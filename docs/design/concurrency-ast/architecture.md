@@ -77,7 +77,10 @@ Requires:
 Ensures:
   - threads(f) ⊆ entries ∪ {main}, non-empty for every defined f
   - threads(f) = {UNATTRIBUTED} exactly when no entry reaches f
-  - may_repeat(e) ⇔ e has two spawn sites, or one inside a loop
+  - may_repeat(e) ⇔ e has two spawn sites, or one inside a loop, or one in
+    a function that may run more than once (§6.1)
+  - UNATTRIBUTED may repeat whenever a spawn's entry is unresolved or names
+    no defined function
 Invariant: UNATTRIBUTED is never equal to any entry, so a pair involving it is
   never discarded as same-thread. This is a property the pairing depends on and
   it was violated once; §4.4.
@@ -155,6 +158,13 @@ The agreement:
 functions that count as a spawn, a join, an acquire or a release is a property
 of the C library being analysed, and putting it in OCaml keeps one list rather
 than one per consumer.
+
+That list is the lock API table the text screener now carries (§6.3), so the
+plug-in is to classify against the same entries. The table needs four kinds that
+"acquire" and "release" alone cannot express: "try" for every try and timed
+variant, "wait" for a condition wait, a lock mode for rwlocks, and an atomic
+access for the address argument of an atomic builtin (§6.2). Extending the
+`kind` enum to carry them is part of this contract, not a change to it.
 
 ### 3.2 threads → concurrency
 
@@ -263,3 +273,159 @@ of the move is that a condition is reported when it is met.
 4. Rewire `concurrency.rs`, delete the scanner, and carry over the verdict
    tests named in §4.5.
 5. The gap codes and the README table they are pinned to.
+
+## 6. Semantics the text screener carries today
+
+These were added to `src/mcp/concurrency.rs` on 2026-10-07, while it is still
+the text screener. They describe verdict behaviour, not text handling, so §4.5
+applies to them: the AST rewrite inherits them, and their tests move with it.
+The function-level design is in [detailed-design.md](detailed-design.md).
+
+### 6.1 Thread multiplicity from the call graph
+
+Before this change, `may_repeat` only saw a loop around the `pthread_create`
+line itself. Now a spawn also repeats when the function holding it may run more
+than once. That set is computed from call edges as a fixpoint. A function joins
+it when it has more than one call site, a call site in a loop, or a part in
+recursion (a strongly connected component, or a self edge). It also joins when
+a function in the set calls it, or when a repeating thread entry reaches it.
+Two call sites outside a loop count as two runs. Treating them as one, which
+Racer does, is the defect this section exists to avoid.
+
+A creation wrapper that takes its start routine as a parameter resolves its
+entry to the parameter, so the routine's body is UNATTRIBUTED. UNATTRIBUTED
+therefore counts as repeating whenever some spawn is unresolved or names no
+defined function. Both rules only add candidates.
+
+### 6.2 Atomics
+
+An access is atomic in two cases. The first is the address argument of a
+`__atomic_*`, `__sync_*` or C11 `atomic_*` call: loads give `ATOMIC_READ`,
+stores and clears give `ATOMIC_WRITE`, and exchanges and fetch operations give
+`ATOMIC_RMW`. `atomic_init` is the exception: it initialises the object without
+synchronisation, so its address argument is a plain `WRITE`. A compare-exchange
+(`atomic_compare_exchange_*`, `__atomic_compare_exchange`,
+`__atomic_compare_exchange_n`) also writes its second argument, plainly, when it
+fails, so that argument is a `WRITE` too; the `__sync` forms take the expected
+value itself and write nothing back. The second case is any access to a global
+declared `_Atomic`, `_Atomic(T)` or with one of the type names `stdatomic.h`
+defines (`atomic_int`, `atomic_flag`, `atomic_uint_least32_t` and the rest of
+that fixed list). A program's own typedef that starts with `atomic_` is not one.
+A pair is skipped only when both sides are atomic. An atomic write against a
+plain read is still a candidate.
+
+`__VERIFIER_atomic_begin()` and `__VERIFIER_atomic_end()` acquire and release
+the pseudo-lock `"<atomic>"`. A function whose name starts with
+`__VERIFIER_atomic` runs entirely under it. Like any lock, it is evidence and
+never suppresses a candidate.
+
+### 6.3 Lock API table
+
+A table of (name, lock argument, operation, mode) replaces the three mutex
+calls. It covers pthread mutexes, spin locks, rwlocks, POSIX semaphores and
+`pthread_cond_wait` / `pthread_cond_timedwait`, whose mutex is the second
+argument. The operations behave as follows:
+
+- Try and timed acquisitions follow the trylock rule: an event, never a lock
+  held, and no order edge.
+- A condition wait leaves the lockset unchanged. It adds an order edge into its
+  mutex from every other lock held, because the wait takes the mutex again.
+- A lock held in shared mode (a read-held rwlock) is evidence of nothing
+  between two accesses that both hold it that way, a write included.
+
+The arguments of every modelled call are excluded from access events.
+
+### 6.4 Lock order report
+
+Edges are kept once per ordered pair, with up to 16 sites, a site count and the
+union of their threads. Distinct pairs are capped at `max_events`, and every
+pair observation that did not fit is counted: one per lock already held at an
+acquisition, so one acquisition can count more than once. Three reports are read off the edges:
+
+- A self edge is a `double_lock`.
+- A strongly connected component of two or more locks is a
+  `deadlock_candidate`, when two of its edges may be taken by threads running at
+  once. That is the same `threads_concurrent` closed form the race pairing
+  uses. A component taken by readers alone is not one: every acquisition on
+  every edge held both locks in shared mode, and no member is taken in
+  exclusive mode anywhere. A reader can queue behind a writer, so a single
+  exclusive acquisition of a member keeps the component, even one that records
+  no edge.
+- A thread entry whose closing brace is reached with a non-empty lockset is an
+  `unreleased_lock`.
+
+The must-lockset rule at a block's end is refined by how the block's last
+statement leaves it:
+
+- `return`, `exit`, `abort` or `pthread_exit` means the path never reaches the
+  code after the block, so the block is not intersected.
+- `break` moves the path to the end of the nearest enclosing loop or switch,
+  where it is intersected. `continue` passes through any switch and moves the
+  path to the end of the nearest enclosing loop.
+- `goto` moves the path to the next label of the function.
+
+A backward goto is listed as unsupported, along with mutex attributes and
+semaphore counts.
+
+### 6.5 Interprocedural locksets
+
+A lock taken in a wrapper used to be dropped at the wrapper's closing brace, and
+a callee started every walk with nothing held. So the two-wrapper ABBA deadlock,
+`lock_a(); lock_b();` in one thread and `lock_b(); lock_a();` in another, gave
+no order edge, and an access in a helper only ever called under a mutex was
+reported as holding nothing. Three facts now cross a call:
+
+- **Summaries.** Each defined function gets the locks it certainly holds at
+  every return, starting from nothing held (`acquires`, a must-set), and the
+  locks it may release without having taken them (`releases`, a may-set). The
+  first makes it a lock wrapper, the second an unlock wrapper. Summaries are
+  computed by re-walking the program with the previous round's summaries
+  applied at call sites, until a round changes nothing, at most 16 rounds. The
+  step is not monotone, since a callee's releases shrink its caller's
+  acquisitions, and mutual recursion can make it alternate between two answers.
+  So the last 8 rounds are narrowed: an acquisition survives only if the
+  previous round had it, and a release once seen stays. That settles, and it
+  errs on the side of claiming less. If the cap is still reached, every summary
+  becomes "acquires nothing, may release anything", which only removes claims,
+  and `lock_summaries_converged` is false.
+- **Application at a call site.** After the call, the caller's held set loses
+  each released lock and gains each acquired one, and each acquisition records an
+  order edge from every lock the caller holds. A lock in a summary that is the
+  callee's own parameter is mapped to the argument at the call site, when that
+  argument is a plain identifier, with `&` or `*` stripped, that is not a local
+  of the caller: a global, a global pointer, or the caller's own parameter,
+  which is how one wrapper composes into another. Any other argument is counted
+  in `lock_arguments_unresolved`; its acquisition is dropped and its release
+  clears the caller's whole held set. A lock reached through a parameter
+  without being one, such as `m->inner`, cannot be named at any call site, so
+  it is counted and applied the same way. A caller that released a lock this
+  way may release anything; its own callers apply that without counting it
+  again.
+- **Entry locksets.** A function's entry lockset is the intersection of the
+  caller's held set at every call site of it. It is empty for a thread entry,
+  for `main`, for a function with no call site, and for one whose name appears
+  anywhere other than as a call this pass resolved, since that is a caller this
+  pass cannot see. The intersection is computed by iteration from the empty
+  set, which is monotone, so every iterate under-claims and the 16-round cap is
+  safe. The callee's events hold it, and its acquisitions record order edges
+  from it, except into a lock that names one of its own parameters, whose edges
+  the call site already records under the argument's name, and into a lock the
+  function still holds on every return, whose edge the call site records when
+  it applies the summary.
+
+The entry lockset is one set per function, not one per calling context, so a
+helper called once with a lock and once without holds nothing. That is listed
+as unsupported, as are calls through function pointers and lock arguments this
+pass cannot name. None of it changes a status: a lock reaching a callee is
+evidence the same way a lock taken there is.
+
+**Cost, measured.** The fixpoint re-walks the source each round, up to 16
+rounds twice plus the emission pass, so its worst case is about 33 walks. On
+2026-10-08 a generated 39,005-line file with 3,000 lock-taking functions in
+one call chain, two mutexes and one thread scanned in 0.68 s through the
+release binary, converged, and reported every section complete, against the
+120 s CONCURRENCY_SCAN_BUDGET. Tokenizing each line once and re-walking only
+functions whose callees changed would cut that further; at that figure it is
+not worth the complexity, so it was not done. Re-measure before revisiting.
+
+
