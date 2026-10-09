@@ -348,6 +348,118 @@ pub async fn connect_when_listening(
     }
 }
 
+/// Kills a process group when dropped. See output_in_own_group.
+struct GroupKillOnDrop {
+    what: &'static str,
+    pid: Option<u32>,
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_frama_c_group(self.what, pid, Some(pid));
+        }
+    }
+}
+
+/// Runs a one-shot Frama-C to completion inside its own process group, and
+/// kills that group however the call ends: success, error, timeout, or the
+/// future being dropped.
+///
+/// The same result shape as "tokio::time::timeout(budget, cmd.output())", so a
+/// call site swaps one for the other. It exists because kill_on_drop signals
+/// Frama-C alone. A WP run that hits the budget leaves why3server and every
+/// prover it started running with nobody waiting on them, and dawnr measured
+/// orphaned z3 processes surviving a day on a shared machine. The group is
+/// signalled after a clean exit too, since a why3server can outlive the
+/// Frama-C that started it.
+///
+/// Waits for Frama-C to exit, not for its pipes to close. A descendant that
+/// inherited stdout keeps the pipe open after Frama-C exits, so reading to the
+/// end first could hold a finished run until its budget ran out. The group is
+/// killed once Frama-C exits, which closes any pipe a descendant still holds,
+/// and the output is then collected under a short bound of its own. stdin is
+/// null, as "cmd.output()" made it: this server's stdin is the MCP protocol
+/// stream, and a child inheriting it could consume or wait on protocol input.
+pub async fn output_in_own_group(
+    what: &'static str,
+    mut cmd: tokio::process::Command,
+    budget: Duration,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    cmd.process_group(0)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return Ok(Err(error)),
+    };
+    let group = GroupKillOnDrop { what, pid: child.id() };
+    let stdout = PipeReader(drain_pipe(child.stdout.take()));
+    let stderr = PipeReader(drain_pipe(child.stderr.take()));
+    let status = tokio::time::timeout(budget, child.wait()).await;
+    drop(group);
+    let status = match status {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return Ok(Err(error)),
+        Err(elapsed) => return Err(elapsed),
+    };
+    let stdout = match stdout.collect().await {
+        Ok(bytes) => bytes,
+        Err(error) => return Ok(Err(error)),
+    };
+    let stderr = match stderr.collect().await {
+        Ok(bytes) => bytes,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok(std::process::Output { status, stdout, stderr }))
+}
+
+/// Read a child's pipe to its end on a task of its own, so the pipe never
+/// fills and stalls the child while output_in_own_group waits on its exit.
+fn drain_pipe<R>(pipe: Option<R>) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buffer).await?;
+        }
+        Ok(buffer)
+    })
+}
+
+/// A pipe reader that is aborted when dropped, so no path out of
+/// output_in_own_group, a timeout, an early error or the collection bound,
+/// leaves a task holding the pipe and its buffer behind it.
+struct PipeReader(tokio::task::JoinHandle<std::io::Result<Vec<u8>>>);
+
+impl Drop for PipeReader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl PipeReader {
+    /// What the pipe held. Bounded, because a descendant that left the
+    /// process group could hold the pipe open past the group kill. A read that
+    /// failed is an error rather than a short buffer, since callers parse
+    /// these bytes as WP and smoke-test evidence; a reader still waiting at the
+    /// bound is one too, for the same reason.
+    async fn collect(mut self) -> std::io::Result<Vec<u8>> {
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.0).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(join)) => Err(std::io::Error::other(join)),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "a process outside the group held the output pipe open",
+            )),
+        }
+    }
+}
+
 pub async fn run_command_json(program: &str, args: &[&str], timeout: Duration) -> serde_json::Value {
     let mut child = match tokio::process::Command::new(program)
         .args(args)

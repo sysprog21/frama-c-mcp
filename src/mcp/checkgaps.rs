@@ -71,6 +71,10 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
         .or_else(|| first_unproved_lemma_next_call(eva_alarms, wp_goals))
         .or_else(|| first_alarm_next_call(eva_alarms))
         .or_else(|| first_wp_goal_next_call(wp_goals, function))
+
+        // Only once both sequential analyses ran: with one left out, asking for
+        // it is the next call, and the fallback below says so.
+        .or_else(|| concurrent_program_next_call(incomplete).filter(|_| wanted.eva && wanted.wp))
         .unwrap_or_else(|| {
             // An analysis the caller left out is answered by asking for it, not
             // by reading the table it never filled. Pointing at get_wp_goals
@@ -108,6 +112,33 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
                 "tool": tool,
                 "args": args,
                 "reason": reason,
+            })
+        })
+}
+
+/// After every open alarm and goal: a concurrent program whose sequential
+/// analysis is otherwise clean is exactly the case where the next useful call
+/// is the one that looks at interleavings. It reads the loaded project's files.
+///
+/// Only for pthread_create, the one creation call analyze_concurrency reads: on
+/// a C11 thrd_create program it would answer "no threads", which reads as
+/// clean.
+fn concurrent_program_next_call(incomplete: &[serde_json::Value]) -> Option<serde_json::Value> {
+    incomplete
+        .iter()
+        .any(|item| {
+            item["code"] == incomplete_code::CONCURRENT_PROGRAM
+                && item["thread_creation"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name == "pthread_create"))
+        })
+        .then(|| {
+            json!({
+                "tool": "analyze_concurrency",
+                "args": {},
+                "reason": "The program creates threads and every sequential obligation that \
+                           remains open is listed above it, so what is left unexamined is the \
+                           interleaving: race and deadlock candidates.",
             })
         })
 }
@@ -188,6 +219,13 @@ pub mod incomplete_code {
     pub const CHECK_NARROWED_BY_PROP: &str = "CHECK_NARROWED_BY_PROP";
     pub const WP_MESSAGES_TRUNCATED: &str = "WP_MESSAGES_TRUNCATED";
     pub const WP_GOALS_CHANGED_UNDER_CHECK: &str = "WP_GOALS_CHANGED_UNDER_CHECK";
+    pub const REACHABILITY_PROPERTY_UNENCODED: &str = "REACHABILITY_PROPERTY_UNENCODED";
+    pub const CONCURRENT_PROGRAM: &str = "CONCURRENT_PROGRAM";
+    pub const COMPILE_FLAGS_DROPPED: &str = "COMPILE_FLAGS_DROPPED";
+    pub const PINNED_PROPERTY_MISSING: &str = "PINNED_PROPERTY_MISSING";
+    pub const PINNED_PROPERTY_NOT_PROVED: &str = "PINNED_PROPERTY_NOT_PROVED";
+    pub const CONTRACT_DECORATIVE: &str = "CONTRACT_DECORATIVE";
+    pub const CONTRACT_MUTANTS_UNCHECKED: &str = "CONTRACT_MUTANTS_UNCHECKED";
 
     // Only the doc comparison reads the list as a list; the emit sites name
     // codes one at a time. It used to be cfg(test) gated, which stopped meaning
@@ -233,6 +271,13 @@ pub mod incomplete_code {
         CHECK_NARROWED_BY_PROP,
         WP_MESSAGES_TRUNCATED,
         WP_GOALS_CHANGED_UNDER_CHECK,
+        REACHABILITY_PROPERTY_UNENCODED,
+        CONCURRENT_PROGRAM,
+        COMPILE_FLAGS_DROPPED,
+        PINNED_PROPERTY_MISSING,
+        PINNED_PROPERTY_NOT_PROVED,
+        CONTRACT_DECORATIVE,
+        CONTRACT_MUTANTS_UNCHECKED,
     ];
 }
 
@@ -329,6 +374,410 @@ fn unrequested_analysis_gaps(
     }
 }
 
+/// What check reports about logic definitions WP takes on trust.
+///
+/// WP turns a logic function or predicate definition into an axiom and never
+/// checks that a recursive one terminates. One that does not, such as
+/// "logic integer bad(integer n) = bad(n) + 1;", is inconsistent, and dawnr
+/// measured a false postcondition reaching VERIFIED behind it, smoke tests
+/// included: no smoke goal mentions the symbol, so the prover never unfolds it.
+///
+/// Reported rather than gated. A recursive definition is also how a correct
+/// specification states a sum or a list length, and nothing this server can
+/// run tells the two apart, so a gate would leave every such specification
+/// incomplete with nothing to write that clears it. The field lets a reader
+/// see the trust being placed; termination is theirs to argue.
+///
+/// "ran: false" with a reason when the plug-in could not be asked, so an empty
+/// list always means none were found.
+pub fn assumed_definitions(recursive_logic: Result<&serde_json::Value, String>) -> serde_json::Value {
+    let reason = "WP assumes each recursive logic definition below as an axiom without \
+                  checking that it terminates; one that does not makes every goal in scope \
+                  provable. Each needs a decreasing argument and a base case it reaches.";
+    match recursive_logic {
+        Ok(answer) => match answer.get("definitions").and_then(serde_json::Value::as_array) {
+            Some(definitions) => json!({
+                "ran": true,
+                "recursive_logic": definitions,
+                "reason": if definitions.is_empty() { serde_json::Value::Null } else { json!(reason) },
+            }),
+            None => json!({
+                "ran": false,
+                "recursive_logic": [],
+                "reason": format!("the plug-in answered without a definitions list: {answer}"),
+            }),
+        },
+        Err(error) => json!({
+            "ran": false,
+            "recursive_logic": [],
+            "reason": error,
+        }),
+    }
+}
+
+/// The SV-COMP harness functions whose call states the property, and the
+/// precondition that turns each call into a proof obligation.
+pub const SVCOMP_PROPERTY_FUNCTIONS: &[(&str, &str)] = &[
+    ("reach_error", "requires \\false;"),
+    ("__VERIFIER_error", "requires \\false;"),
+    ("__VERIFIER_assert", "requires <its parameter> != 0;"),
+];
+
+/// A gap when an SV-COMP property is not encoded as a proof obligation.
+///
+/// An SV-COMP task encodes its property as "reach_error is never called",
+/// usually behind "__VERIFIER_assert(P)". Neither is an annotation, so WP
+/// generates no goal for P. Measured on afnp2014 with the property made false
+/// and loop invariants added: 22 of 23 goals proved, and the one open goal was
+/// a termination fact unrelated to it. Recognized by name only, so ordinary
+/// code never reaches it; harness_encoding decides what counts as encoded.
+///
+/// Takes (name, encoded) for the harness functions the program declares. The
+/// error functions decide when any is present, and every one of them must be
+/// encoded: an encoded __VERIFIER_assert covers the failures that go through
+/// it and says nothing about a direct "reach_error()" elsewhere, which an
+/// earlier rule letting one encoded function clear the gap for all missed.
+/// __VERIFIER_assert decides alone only when the program defines no error
+/// function for it to reach. Every unencoded harness function is listed, so
+/// the suggested preconditions cover the whole harness.
+pub fn reachability_property_gap(functions: &[(String, bool)]) -> Option<serde_json::Value> {
+    let is_error = |name: &str| name != "__VERIFIER_assert";
+    let deciding: Vec<&(String, bool)> = if functions.iter().any(|(f, _)| is_error(f)) {
+        functions.iter().filter(|(f, _)| is_error(f)).collect()
+    } else {
+        functions.iter().collect()
+    };
+    if deciding.iter().all(|(_, encoded)| *encoded) {
+        return None;
+    }
+    let unencoded: Vec<serde_json::Value> = SVCOMP_PROPERTY_FUNCTIONS
+        .iter()
+        .filter(|(name, _)| functions.iter().any(|(f, encoded)| f == name && !encoded))
+        .map(|(name, requires)| json!({"function": name, "suggested_requires": requires}))
+        .collect();
+    if unencoded.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "code": incomplete_code::REACHABILITY_PROPERTY_UNENCODED,
+        "reason": "The program states its property as an error call that must be unreachable, \
+                   and no precondition on that call makes it a proof obligation, so no goal \
+                   checks the property.",
+        "functions": unencoded,
+    }))
+}
+
+/// Thread-creation functions whose presence makes the program concurrent.
+///
+/// Read off the loaded function table, which keeps a library prototype only
+/// when the program uses it, so a header that merely declares pthread_create
+/// does not count.
+pub const THREAD_CREATION_FUNCTIONS: &[&str] = &["pthread_create", "thrd_create"];
+
+/// CONCURRENT_PROGRAM when the program creates threads.
+///
+/// Measured: with "counter++" in both main and a thread body, EVA reports one
+/// function analyzed out of two and counter in {1}, because the libc stub for
+/// pthread_create only assigns its thread handle. A verdict with no gap there
+/// would be about a program that never runs its threads.
+pub fn concurrent_program_gap(present: &[&str]) -> Option<serde_json::Value> {
+    if present.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "code": incomplete_code::CONCURRENT_PROGRAM,
+        "reason": "The program creates threads, and EVA and WP analyze it sequentially: thread \
+                   bodies are not analyzed from main, and no interleaving is considered.",
+        "thread_creation": present,
+    }))
+}
+
+/// COMPILE_FLAGS_DROPPED from the reload's compilation_database_dropped_flags.
+/// Silence for a reload with no database, or with nothing dropped.
+pub fn compile_flags_dropped_gap(reload: &serde_json::Value) -> Option<serde_json::Value> {
+    // An unreadable database reports {"unreadable": reason}, which is not a
+    // flag. Frama-C fails the same load on it, so the reload's own error is the
+    // gap there.
+    let dropped = reload
+        .get("compilation_database_dropped_flags")
+        .and_then(serde_json::Value::as_object)
+        .filter(|flags| !flags.is_empty() && !flags.contains_key("unreadable"))?;
+    Some(json!({
+        "code": incomplete_code::COMPILE_FLAGS_DROPPED,
+        "reason": "The compilation database builds with flags that change what the program \
+                   means, and Frama-C drops them on import, so the analyzed program differs \
+                   from the compiled one.",
+        "flags": dropped,
+    }))
+}
+
+/// The three verification targets check reports separately.
+pub const VERIFICATION_TARGETS: &[&str] = &["memory_safety", "termination", "functional"];
+
+/// Which target a WP goal belongs to, read off its WP id: a runtime-error
+/// guard is memory safety, a terminates, loop variant or decreases goal is
+/// termination, and everything else is functional.
+pub fn goal_target(wpo: &str) -> &'static str {
+    if wpo.contains("_rte_") {
+        "memory_safety"
+    } else if crate::mcp::server::wpclass::is_terminates_goal(wpo)
+        || wpo.contains("_loop_variant")
+        || wpo.contains("_decreases")
+    {
+        "termination"
+    } else {
+        "functional"
+    }
+}
+
+/// The verdict split by target, for check's "established" field.
+///
+/// Informational, and built so it can never say more than the verdict: an
+/// incomplete[] entry blocks every target unless it is a goal-level entry
+/// (GOAL_NOT_VALID or PROVER_TIMEOUT) whose goal is known to belong to another
+/// one. An axiom, a skipped function or a backend abort is about the whole run,
+/// so it blocks all three. A target with no goal never holds, because nothing
+/// was shown about it. So a "proved" verdict implies every target with goals
+/// holds, and the converse is what the field adds: a run whose only open goal
+/// is a termination goal still shows memory safety and functional correctness.
+pub fn established_by_target(
+    wp_goals: &serde_json::Value,
+    incomplete: &[serde_json::Value],
+) -> serde_json::Value {
+    // Each non-smoke goal with its target, placed once.
+    let goals: Vec<(&serde_json::Value, &'static str)> = wp_goals
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|goal| goal["smoke"] != true)
+        .filter_map(|goal| Some((goal, goal_target(crate::mcp::server::wpclass::goal_id_after_owner(goal)?))))
+        .collect();
+    let target_by_id: std::collections::HashMap<&str, &'static str> = goals
+        .iter()
+        .filter_map(|(goal, target)| Some((goal["stable_goal_id"].as_str()?, *target)))
+        .collect();
+
+    // Which targets each gap blocks. An entry whose goal cannot be placed
+    // blocks everything, which is the safe reading.
+    let blocked_by = |item: &serde_json::Value| -> Vec<&'static str> {
+        let goal_level = item["code"] == incomplete_code::GOAL_NOT_VALID
+            || item["code"] == incomplete_code::PROVER_TIMEOUT;
+        let placed = goal_level
+            .then(|| item["stable_goal_id"].as_str())
+            .flatten()
+            .and_then(|id| target_by_id.get(id).copied());
+        match placed {
+            Some(target) => vec![target],
+            None => VERIFICATION_TARGETS.to_vec(),
+        }
+    };
+    let blocked: std::collections::BTreeSet<&str> =
+        incomplete.iter().flat_map(blocked_by).collect();
+
+    let mut object = serde_json::Map::new();
+    for target in VERIFICATION_TARGETS {
+        let mine: Vec<&serde_json::Value> =
+            goals.iter().filter(|(_, t)| t == target).map(|(goal, _)| *goal).collect();
+        let open = mine
+            .iter()
+            .filter(|goal| !crate::mcp::status::own_status_is_proved(goal))
+            .count();
+        object.insert(
+            target.to_string(),
+            json!({
+                "goals": mine.len(),
+                "open": open,
+                "holds": !mine.is_empty() && open == 0 && !blocked.contains(target),
+            }),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+/// A predicate in the form two spellings of it share: no whitespace, the
+/// printer's Unicode operators in their ASCII form, and "\\old(x)" unwrapped
+/// around each of the given formals. Frama-C prints the property table with
+/// "≤", "∀" and the like, and prints a formal inside a postcondition as
+/// "\\old(x)" whether or not it was written so, which for a formal is what
+/// plain "x" means anyway. Only formals: for a global the two differ, and
+/// unwrapping there would let "n == \\old(n)" match the tautology "n == n".
+pub fn normalize_predicate(text: &str, formals: &[&str]) -> String {
+    use std::sync::OnceLock;
+    static OLD_IDENT: OnceLock<regex::Regex> = OnceLock::new();
+    let old_ident =
+        OLD_IDENT.get_or_init(|| regex::Regex::new(r"\\old\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)").unwrap());
+    let text = old_ident.replace_all(text, |caps: &regex::Captures| {
+        if formals.contains(&&caps[1]) { caps[1].to_string() } else { caps[0].to_string() }
+    });
+    crate::mcp::acsl::ascii_acsl_operators(text.trim().trim_end_matches(';'))
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// The property kinds whose predicate is read in the post-state, where the
+/// printer writes a formal as "\\old(x)" whether or not it was written so.
+pub const POST_STATE_KINDS: &[&str] = &["ensures", "exits", "breaks", "continues", "returns"];
+
+/// The gaps a list of pins leaves, against the property table.
+///
+/// scopes maps a pinned function name to its declaration marker, which is how
+/// a property row names its scope, and formals maps a declaration marker to
+/// that function's formals. A pin naming a function that does not resolve
+/// matches nothing, so it reports missing rather than silently widening to
+/// every scope. Each row is compared under its own scope's formals, and the
+/// cheap scope and kind tests run before the text is normalized.
+pub fn pinned_property_gaps(
+    pins: &[crate::mcp::types::PinnedProperty],
+    properties: &[serde_json::Value],
+    scopes: &std::collections::HashMap<String, String>,
+    formals: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<serde_json::Value> {
+    let mut gaps = Vec::new();
+    for pin in pins {
+        let scope = pin.function.as_ref().map(|name| scopes.get(name));
+        let matching: Vec<&serde_json::Value> = properties
+            .iter()
+            .filter(|row| match scope {
+                None => true,
+                Some(None) => false,
+                Some(Some(marker)) => row["scope"].as_str() == Some(marker.as_str()),
+            })
+            .filter(|row| pin.kind.as_deref().is_none_or(|kind| row["kind"] == kind))
+            .filter(|row| {
+                // Only where the printer adds "\\old" around a formal, which is
+                // the postcondition kinds. Elsewhere "\\old" is not implicit,
+                // so unwrapping it there could let a pinned "x == \\old(x)"
+                // match a weakened "x == x".
+                let post_state = POST_STATE_KINDS.contains(&row["kind"].as_str().unwrap_or_default());
+                let own: Vec<&str> = row["scope"]
+                    .as_str()
+                    .filter(|_| post_state)
+                    .and_then(|marker| formals.get(marker))
+                    .map(|names| names.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                row.get("predicate")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| {
+                        normalize_predicate(text, &own) == normalize_predicate(&pin.predicate, &own)
+                    })
+            })
+            .collect();
+        let pinned = json!({
+            "predicate": pin.predicate,
+            "function": pin.function,
+            "kind": pin.kind,
+        });
+        if matching.is_empty() {
+            gaps.push(json!({
+                "code": incomplete_code::PINNED_PROPERTY_MISSING,
+                "reason": "No property in the program matches this pin, so the property that \
+                           was asked for is not what was proved.",
+                "pinned": pinned,
+            }));
+        } else if !matching.iter().any(|row| crate::mcp::status::own_status_is_proved(row)) {
+            let statuses: Vec<&str> = matching
+                .iter()
+                .map(|row| crate::mcp::status::own_status(row).unwrap_or("unknown"))
+                .collect();
+            gaps.push(json!({
+                "code": incomplete_code::PINNED_PROPERTY_NOT_PROVED,
+                "reason": "The pinned property is present and not proved.",
+                "pinned": pinned,
+                "statuses": statuses,
+            }));
+        }
+    }
+    gaps
+}
+
+/// The gaps a contract-mutant probe leaves. None for a null probe, which is
+/// check's answer when mutants were not asked for; CONTRACT_MUTANTS_UNCHECKED
+/// when they were and none could be judged; CONTRACT_DECORATIVE naming each
+/// stub that proved the whole contract.
+pub fn contract_mutant_gaps(probe: &serde_json::Value) -> Vec<serde_json::Value> {
+    if probe.is_null() {
+        return Vec::new();
+    }
+    if probe["ran"] != true {
+        return vec![json!({
+            "code": incomplete_code::CONTRACT_MUTANTS_UNCHECKED,
+            "reason": probe["reason"].as_str().unwrap_or("the mutant probe did not run"),
+        })];
+    }
+    let decorative: Vec<&serde_json::Value> = probe["mutants"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m["verdict"] == "decorative")
+        .collect();
+    if decorative.is_empty() {
+        return Vec::new();
+    }
+    vec![json!({
+        "code": incomplete_code::CONTRACT_DECORATIVE,
+        "reason": "A stub body proves every postcondition of the contract, so the proof does \
+                   not distinguish the function from the stub.",
+        "mutants": decorative,
+    })]
+}
+
+/// Whether each present SV-COMP harness function has its property encoded,
+/// as the (name, encoded) pairs reachability_property_gap reads.
+///
+/// Judged by what the precondition says, not by whether one exists. An error
+/// function is encoded only by "requires \\false": then every call that can
+/// reach it is an obligation no caller meets, and a call that cannot is the
+/// property holding. __VERIFIER_assert is encoded only by a requires that is
+/// its own parameter, or that parameter compared unequal to zero. Anything
+/// weaker was accepted before and cleared the gap: "requires cond >= 0" lets
+/// "__VERIFIER_assert(0)" through, and "requires 1 == 1" constrains nothing,
+/// while a call-site goal for either proves only that the weak clause held.
+/// Several requires are a conjunction, so one matching clause is enough.
+/// present pairs a name with its declaration marker, the scope a property row
+/// carries, and its formals, which the comparison unwraps "\\old" around.
+pub fn harness_encoding(
+    present: &[(String, String, Vec<String>)],
+    properties: &[serde_json::Value],
+) -> Vec<(String, bool)> {
+    present
+        .iter()
+        .map(|(name, declaration, formals)| {
+            let formals: Vec<&str> = formals.iter().map(String::as_str).collect();
+            let encoding: Vec<String> = match (name.as_str(), formals.first()) {
+                ("__VERIFIER_assert", Some(p)) => {
+                    vec![format!("{p}!=0"), format!("0!={p}"), p.to_string(), format!("!({p}==0)")]
+                }
+                ("__VERIFIER_assert", None) => Vec::new(),
+                _ => vec!["\\false".to_string()],
+            };
+            let encoded = properties.iter().any(|prop| {
+                prop["kind"] == "requires"
+                    && prop["scope"].as_str() == Some(declaration.as_str())
+                    && prop["predicate"]
+                        .as_str()
+                        .is_some_and(|p| encoding.contains(&normalize_predicate(p, &formals)))
+            });
+            (name.clone(), encoded)
+        })
+        .collect()
+}
+
+/// The EVA computation state when it is anything but "computed".
+///
+/// EVA catches its own abort: "Eva not started because globals initialization
+/// is not computable" sets the state to "aborted" and the compute request still
+/// answers successfully, so the step looks like a clean run with no alarms.
+/// The state is the one place the abort shows. A missing or non-string state
+/// says nothing either way and is left to check_step_failed.
+pub fn eva_unfinished_state(eva: &serde_json::Value) -> Option<&str> {
+    eva.get("computation_state")
+        .and_then(|state| state.as_str())
+        .filter(|state| *state != "computed")
+}
+
 /// Gaps left by a step that failed, was skipped, or had not finished.
 fn step_failure_gaps(
     incomplete: &mut Vec<serde_json::Value>,
@@ -341,13 +790,24 @@ fn step_failure_gaps(
 ) {
     // Both blocks are guarded, because a skipped analysis leaves its fields
     // null and null is how a failed one looks too.
+    let unfinished = eva_unfinished_state(eva);
     if wanted.eva
-        && (check_step_failed(reload) || check_step_failed(eva) || check_step_failed(eva_alarms))
+        && (check_step_failed(reload)
+            || check_step_failed(eva)
+            || check_step_failed(eva_alarms)
+            || unfinished.is_some())
     {
+        let error = eva
+            .get("error")
+            .or_else(|| eva_alarms.get("error"))
+            .or_else(|| reload.get("error"))
+            .cloned()
+            .or_else(|| unfinished.map(|state| json!(format!("EVA computation state is {state:?}, not \"computed\""))))
+            .unwrap_or_else(|| json!(null));
         incomplete.push(json!({
             "code": incomplete_code::EVA_NOT_RUN,
             "reason": "EVA did not complete, so eva_alarms is not proof of no alarms.",
-            "error": eva.get("error").or_else(|| eva_alarms.get("error")).or_else(|| reload.get("error")).cloned().unwrap_or_else(|| json!(null)),
+            "error": error,
         }));
     }
     if wanted.wp {
@@ -393,9 +853,12 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
             "This property is recorded valid by assumption, not by proof. WP uses it as a \
              hypothesis everywhere without ever checking it, so one false axiom proves every \
              goal in scope. Prefer a recursive logic definition with proved lemmas and remove \
-             the axiom. If the assumption is deliberate, say so where a reader will see it, and \
-             run check with smoke: true: an inconsistent axiom set shows up there as \
-             SMOKE_TEST_FAILED, and nowhere else."
+             the axiom, but WP never checks that a recursion terminates either: give it a \
+             decreasing argument and a base case, because one that does not terminate is the \
+             same inconsistency under another name, and check lists it under \
+             assumed_definitions. If the assumption is deliberate, say so where a reader will \
+             see it, and run check with smoke: true: an inconsistent axiom set can show up \
+             there as SMOKE_TEST_FAILED, though only when a smoke goal mentions its symbols."
         }
         incomplete_code::PROPERTY_DEAD => {
             "EVA proved this code unreachable, so proving anything about it constrains no run. \
@@ -465,7 +928,52 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
             "This callee has neither code nor a specification, so the kernel invented one: it \
              terminates, never exits, and assigns only through its pointer parameters, never a \
              global. Every caller's proof rests on that guess. Write the callee's real contract, \
-             at least assigns, terminates and exits, in the header callers include."
+             at least assigns, terminates and exits, in the header callers include. A \
+             __builtin_ callee has no such header: load with builtin_models: true for \
+             __builtin_unreachable, __builtin_trap, clz, ctz and popcount, or force-include a \
+             header of your own that declares the builtin with a contract."
+        }
+        incomplete_code::REACHABILITY_PROPERTY_UNENCODED => {
+            "This program states its property the SV-COMP way, as a call that must never be \
+             reached, and no annotation turns that call into an obligation. WP proves what is \
+             annotated, so nothing here checks the property: with the assert made false the \
+             same file still proves every goal it has. Give the error function \
+             \"requires \\false;\" and the assert function \"requires cond != 0;\" over its \
+             own parameter, so every reachable call site becomes a goal, then check again."
+        }
+        incomplete_code::CONCURRENT_PROGRAM => {
+            "This program starts threads, and EVA and WP both analyze it as one sequential \
+             execution. Frama-C's thread-creation stub never calls the start routine, so EVA \
+             from main does not analyze the thread bodies at all, and neither analysis sees \
+             another thread write a shared location between two statements. Run \
+             analyze_concurrency for race and deadlock candidates, protect or rule out each \
+             one, and report this result as holding for each thread run alone."
+        }
+        incomplete_code::COMPILE_FLAGS_DROPPED => {
+            "The compilation database builds this code with flags Frama-C does not import, so \
+             the analyzed program is not the compiled one. Map each flag to what this server \
+             can set: char signedness, data model, ABI and layout flags to a machdep that \
+             matches the build (gcc_x86_32 for -m32, or a YAML machdep with char_is_unsigned \
+             for -funsigned-char); for -fwrapv or -fno-strict-overflow, the signed-overflow \
+             goals RTE reports are about behavior the build defines, so judge them as \
+             intended wraparound rather than bugs."
+        }
+        incomplete_code::PINNED_PROPERTY_MISSING => {
+            "A property the caller pinned is no longer in the program in the form it was \
+             pinned. If it was edited, weakened or deleted, put it back as written: the pin \
+             is the statement of what was asked for, and everything else is scaffolding. If \
+             only its spelling changed, pin the new spelling deliberately."
+        }
+        incomplete_code::PINNED_PROPERTY_NOT_PROVED => {
+            "A pinned property is present and not proved. Work on the scaffolding around it, \
+             the requires, the loop invariants and the callee contracts, and leave the \
+             property itself alone."
+        }
+        incomplete_code::CONTRACT_DECORATIVE => {
+            "A stub body proves every postcondition of this contract, so proving the real body \
+             says nothing the stub does not. Strengthen the ensures until the stub named here \
+             fails it: relate \\result to the inputs, and state what changes in every location \
+             the function assigns."
         }
         incomplete_code::WP_WEAKENED_MODEL => {
             "This run used a WP model selector that departs from C semantics, so a goal proved \
@@ -476,10 +984,12 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
         }
         incomplete_code::SMOKE_TEST_FAILED => {
             "WP proved a smoke goal, so something in scope is unreachable or contradictory and the \
-             goals around it prove for the wrong reason. The goal name says which: requires or \
-             assumes means no state satisfies the precondition, dead_code or dead_call a statement \
-             no execution reaches, dead_loop a loop body that never runs. Fix the specification or \
-             the code, never the smoke test."
+             goals around it prove for the wrong reason. by_kind says which, read off WP's report \
+             because the console shortens the goal name: contract_vacuous means no state \
+             satisfies the precondition, so every theorem about the function is vacuous; \
+             unreachable_code means a statement, loop body or call no execution reaches, and \
+             the theorem may still stand. Fix the specification or the code, never the smoke \
+             test."
         }
         incomplete_code::RTE_REDUCED => {
             "This load checked runtime errors without unsigned wraparound and narrowing, because \
@@ -579,7 +1089,7 @@ pub fn smoke_test_gaps(requested: bool, wp: &serde_json::Value) -> Vec<serde_jso
     if failed.is_empty() && summary_failed == 0 {
         return Vec::new();
     }
-    vec![json!({
+    let mut gap = json!({
         "code": incomplete_code::SMOKE_TEST_FAILED,
         "reason": format!(
             "WP proved {} smoke goal(s), so part of what was proved holds over no execution.",
@@ -588,7 +1098,24 @@ pub fn smoke_test_gaps(requested: bool, wp: &serde_json::Value) -> Vec<serde_jso
         "failed": failed,
         "passed": passed,
         "total": total,
-    })]
+    });
+
+    // Split by kind when the probe read the JSON report, because the two halves
+    // need different repairs: a precondition that can never hold makes the
+    // whole contract vacuous, while an unreachable statement leaves the theorem
+    // standing and only that statement unexercised. Absent rather than empty
+    // when the report could not be read, so "no kinds" never reads as "none of
+    // either".
+    if let Some(detail) = probe.get("failed_detail").and_then(serde_json::Value::as_array) {
+        let count = |kind: &str| detail.iter().filter(|d| d["kind"] == kind).count();
+        gap["by_kind"] = json!({
+            "contract_vacuous": count("contract_vacuous"),
+            "unreachable_code": count("unreachable_code"),
+            "unclassified": count("unclassified"),
+        });
+        gap["failed_detail"] = json!(detail);
+    }
+    vec![gap]
 }
 
 /// The selectors in a WP model string that give up C semantics.
@@ -1463,6 +1990,7 @@ pub fn check_incomplete_items(
 ) -> Vec<serde_json::Value> {
     let mut incomplete = Vec::new();
     ast_diagnostic_gaps(&mut incomplete, reload, AST_WARNING_ALLOWLIST);
+    incomplete.extend(compile_flags_dropped_gap(reload));
     unrequested_analysis_gaps(&mut incomplete, rte, wp, wanted);
     step_failure_gaps(
         &mut incomplete,

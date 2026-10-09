@@ -231,17 +231,15 @@ fn acsl_normalize(text: &str) -> String {
     };
     let mut out = String::with_capacity(body.len());
     for ch in body.chars() {
-        match ch {
-            '\u{2264}' => out.push_str(" <= "),
-            '\u{2265}' => out.push_str(" >= "),
-            '\u{2261}' => out.push_str(" == "),
-            '\u{2262}' => out.push_str(" != "),
-            '\u{21D4}' => out.push_str(" <==> "),
-            '\u{21D2}' => out.push_str(" ==> "),
-            '\u{2227}' => out.push_str(" && "),
-            '\u{2228}' => out.push_str(" || "),
-            c if c.is_whitespace() => out.push(' '),
-            c => out.push(c),
+        let operator = ACSL_UNICODE_OPERATORS.iter().find(|(unicode, _)| *unicode == ch);
+        match (operator, ch) {
+            (Some((_, ascii)), _) => {
+                out.push(' ');
+                out.push_str(ascii);
+                out.push(' ');
+            }
+            (None, c) if c.is_whitespace() => out.push(' '),
+            (None, c) => out.push(c),
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")

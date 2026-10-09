@@ -48,6 +48,9 @@ pub const AST_UTILS_REQUESTS: &[AstUtilsSpec] = &[
     ("plugins.ast-utils.getWriteEffects", ProbeKind::Get, true),
     ("plugins.ast-utils.getLoopEffects", ProbeKind::Get, true),
     ("plugins.ast-utils.getLogicDeps", ProbeKind::Get, true),
+
+    // Backs check's assumed_definitions. Whole-program, so null is its input.
+    ("plugins.ast-utils.getRecursiveLogic", ProbeKind::Get, true),
     ("plugins.ast-utils.getRteObligations", ProbeKind::Get, true),
     ("plugins.ast-utils.getAcslValidation", ProbeKind::Get, true),
 
@@ -172,11 +175,13 @@ pub const UNPROBED_REQUESTS: &[(&str, &str)] = &[
 /// check, and nothing would have caught the next name added to one side alone.
 const PARAMETER_REQUESTS: &[RequestSpec] = &[
     ("kernel", "kernel.parameters.setMain", ProbeKind::Set),
+    ("kernel", "kernel.parameters.setLibEntry", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaPrecision", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaSlevel", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaIlevel", ProbeKind::Set),
     ("kernel", "kernel.parameters.setWarnUnsignedOverflow", ProbeKind::Set),
     ("kernel", "kernel.parameters.setWarnUnsignedDowncast", ProbeKind::Set),
+    ("kernel", "kernel.parameters.setWarnInvalidPointer", ProbeKind::Set),
     ("kernel", "kernel.ast.compute", ProbeKind::Exec),
     ("kernel", "kernel.ast.setFiles", ProbeKind::Set),
 ];
@@ -257,12 +262,14 @@ fn probe_payload(request: &str) -> serde_json::Value {
         "kernel.ast.printDeclaration" => json!("main"),
         "kernel.ast.setFiles" => json!([]),
         "kernel.parameters.setMain" => json!("main"),
+        "kernel.parameters.setLibEntry" => json!(false),
         "kernel.parameters.setEvaPrecision" => json!(0),
         "kernel.parameters.setEvaSlevel" => json!(0),
         "plugins.ast-utils.getGoalCacheStats" => json!({"goals": []}),
         "kernel.parameters.setEvaIlevel" => json!(2),
         "kernel.parameters.setWarnUnsignedOverflow"
         | "kernel.parameters.setWarnUnsignedDowncast" => json!(true),
+        "kernel.parameters.setWarnInvalidPointer" => json!(false),
         // Probing it turns monitoring on, which is what we want anyway.
         "kernel.services.setLogs" => json!(true),
         "kernel.ast.compute"

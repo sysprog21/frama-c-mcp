@@ -248,6 +248,7 @@ async fn exec_eva_compute(client: &FramaCClient) -> Result<Vec<serde_json::Value
 /// line and no user argument reaches it.
 pub const EVA_READBACK_REQUESTS: &[(&str, &str)] = &[
     ("main_function", "kernel.parameters.getMain"),
+    ("lib_entry", "kernel.parameters.getLibEntry"),
     ("precision", "kernel.parameters.getEvaPrecision"),
     ("slevel", "kernel.parameters.getEvaSlevel"),
     ("ilevel", "kernel.parameters.getEvaIlevel"),
@@ -282,6 +283,87 @@ pub const EVA_READBACK_REQUESTS: &[(&str, &str)] = &[
         "kernel.parameters.getEvaOctagonThroughCalls",
     ),
 ];
+
+/// The goal and alarm arrays as check reports them: summarized unless the
+/// caller asked for "full". Taken by value, because the full arrays are the
+/// answer on the full path and nothing reads them after this.
+fn reported_arrays(
+    summarize: bool,
+    wp_goals: serde_json::Value,
+    eva_alarms: serde_json::Value,
+) -> (serde_json::Value, serde_json::Value) {
+    if !summarize {
+        return (wp_goals, eva_alarms);
+    }
+    (
+        summarize_unless_skipped(&wp_goals, goal_needs_failure_classification, goal_summary_bucket),
+        summarize_unless_skipped(&eva_alarms, alarm_is_undischarged, alarm_summary_bucket),
+    )
+}
+
+/// Put the kernel's entry point and -lib-entry back to Frama-C's defaults
+/// before WP reads them.
+///
+/// A scoped EVA run sets both, the kernel keeps them, and WP reads both: with
+/// -main left at a function that has a caller, WP refused it as a
+/// "(potentially) recursive" entry point, generated no goal for its
+/// postcondition and turned its own requires into an obligation; measured,
+/// check {function:"g", want:["eva"]} followed by check {want:["wp"]} came back
+/// with 4 goals and WP_VERIFICATION_SKIPPED where a clean run has 6. Under a
+/// leftover -lib-entry, main may not assume the globals' initializers, so the
+/// proof of main changes too. Done here, inside run_wp after its lock, rather
+/// than in check's WP step where it used to be: a standalone run_wp after a
+/// scoped check never passed that step and proved under the stale pair.
+/// Unconditional, because the stale value comes from the previous call, not
+/// this one. Failing closed: a run that cannot reset them must not prove under
+/// whatever they are.
+///
+/// Answers whether EVA's results survived. A change to either parameter
+/// discards them: measured on 33.0, a scoped check {function:"square",
+/// want:["eva"]} leaves EVA "computed" with two invalid statuses, and after
+/// this reset it reads "not_computed" with neither. The comment this replaces,
+/// in check's WP step, said the scoped alarms survive; they do inside that one
+/// check only because it reads them before WP runs. An unreadable state is
+/// treated as discarded, the reading that cannot overclaim.
+async fn reset_wp_entry_state(client: &FramaCClient) -> Result<bool, McpError> {
+    client
+        .set("kernel.parameters.setMain", json!("main"))
+        .await
+        .map_err(McpError::from)?;
+    client
+        .set("kernel.parameters.setLibEntry", json!(false))
+        .await
+        .map_err(McpError::from)?;
+    let state = get_eva_computation_state(client).await.ok();
+    Ok(state.as_ref().and_then(|s| s.as_str()) == Some("computed"))
+}
+
+/// What program_facts reads off one check call, as one value.
+pub struct ProgramFactInputs<'a> {
+    pub pins: Option<&'a [PinnedProperty]>,
+    pub mutants: bool,
+    pub function: Option<&'a str>,
+    /// The proof run's effective_wp_config, so the mutants are proved under
+    /// the model and provers of the proof they are compared with.
+    pub wp_config: &'a serde_json::Value,
+}
+
+/// What program_facts hands back to check.
+pub struct ProgramFacts {
+    pub gaps: Vec<serde_json::Value>,
+    pub mutant_probe: serde_json::Value,
+    pub assumed_definitions: serde_json::Value,
+}
+
+/// Whether EVA starts from an unknown global state (-lib-entry).
+///
+/// Only the program's own entry point starts from the initializers, because
+/// only there is "nothing ran before" true. Without it an entry other than
+/// main is analyzed as if no other function ran first, so an alarm that
+/// depends on a global another function set is never raised.
+pub fn eva_lib_entry(main_function: &str) -> bool {
+    main_function != "main"
+}
 
 /// What EVA actually ran with, read back rather than asserted.
 ///
@@ -978,8 +1060,14 @@ fn printed_source_options(options: &ProjectLoadOptions) -> ProjectLoadOptions {
         rte,
 
         // Carried, because the probe passes the unsigned options beside -wp-rte
-        // and has to pass the same ones the run did.
+        // and has to pass the same ones the run did. The pointer option rides
+        // with them.
         unsigned_rte_skipped,
+        pointer_rte_requested,
+
+        // Printed into the AST the probe re-reads, like the other
+        // force-includes, so nothing to carry.
+        builtin_models: _,
     } = options;
 
     ProjectLoadOptions {
@@ -989,6 +1077,7 @@ fn printed_source_options(options: &ProjectLoadOptions) -> ProjectLoadOptions {
         machdep: machdep.clone(),
         rte: *rte,
         unsigned_rte_skipped: *unsigned_rte_skipped,
+        pointer_rte_requested: *pointer_rte_requested,
         ..ProjectLoadOptions::default()
     }
 }
@@ -1652,6 +1741,8 @@ pub fn profile_matches_loaded_project(
         isystem_paths,
         nostdinc,
         unsigned_rte_skipped,
+        pointer_rte_requested,
+        builtin_models,
     } = options;
 
     compilation_database.is_none()
@@ -1667,6 +1758,8 @@ pub fn profile_matches_loaded_project(
         // does can be proof evidence, which the evidence gate enforces.
         && profile.rte.is_none_or(|want| want == *rte)
         && profile.rte_unsigned.is_none_or(|want| want != *unsigned_rte_skipped)
+        && profile.rte_pointer.unwrap_or(false) == *pointer_rte_requested
+        && profile.builtin_models.unwrap_or(false) == builtin_models.is_some()
 
         // Compared exactly, like the three lists above it and unlike the two
         // Option flags beside it. It was briefly loosened to treat an empty
@@ -1823,6 +1916,21 @@ impl FramaCMcpServer {
             frama_c_options.push("-main".to_string());
             frama_c_options.push(requested.clone());
         }
+
+        // Set both ways on every run, for the reason setMain is: the kernel
+        // keeps it. An entry other than main started from the initializers is
+        // analyzed as if no other function ran first, which is not what a
+        // scoped check means. Measured: "f() { a[g] = 1; }" with main calling
+        // "set(42)" first gives 0 alarms under -main f and 2 out-of-bounds
+        // alarms under -main f -lib-entry.
+        let lib_entry = eva_lib_entry(main_fn);
+        (self.require_client().await?)
+            .set("kernel.parameters.setLibEntry", json!(lib_entry))
+            .await
+            .map_err(McpError::from)?;
+        if lib_entry {
+            frama_c_options.push("-lib-entry".to_string());
+        }
         if let Some(slevel) = params.slevel {
             (self.require_client().await?)
                 .set("kernel.parameters.setEvaSlevel", json!(slevel))
@@ -1850,9 +1958,19 @@ impl FramaCMcpServer {
             .await
             .map_err(McpError::from)?;
 
+        // Only a computed run counts. EVA swallows its own abort and answers
+        // the compute request successfully, so marking completion on return
+        // told every later progress payload that an analysis which never
+        // started had finished. Cleared otherwise: the setMain and
+        // setLibEntry writes above invalidate the previous results, so a
+        // completion recorded by an earlier run no longer describes them.
         {
             let mut state = self.state.write().await;
-            state.set_eva_completed();
+            if comp_state.as_str() == Some("computed") {
+                state.set_eva_completed();
+            } else {
+                state.eva_completed = false;
+            }
         }
 
         Ok(json!({
@@ -2085,25 +2203,8 @@ impl FramaCMcpServer {
         wp_params: RunWpParams,
         function: Option<&str>,
     ) -> (serde_json::Value, serde_json::Value) {
-        // A scoped check sets the entry point to the function for EVA, and WP
-        // reads the same kernel setting: it then refused a function that has a
-        // caller as a "(potentially) recursive" entry point, generating no goal
-        // for its postcondition, and turned the function's own requires into an
-        // obligation. Put back to Frama-C's default before WP. Measured: EVA's
-        // alarms from the scoped run survive, the postcondition becomes a goal
-        // again, and a lemma or axiom in scope is still reported.
-        //
-        // Unconditionally, not only for a scoped check. The value is sticky and
-        // run_eva_payload is what writes it, so a call that asks for WP alone
-        // never passes the place it would be put back: measured, check
-        // {function:"g", want:["eva"]} followed by check {want:["wp"]} left
-        // -main at "g" and the second call came back with 4 goals and
-        // WP_VERIFICATION_SKIPPED where a clean run has 6. Guarding this on
-        // "did this call name a function" asked about the wrong call, since the
-        // stale value comes from the previous one.
-        if let Ok(client) = self.require_client().await {
-            let _ = client.set("kernel.parameters.setMain", json!("main")).await;
-        }
+        // run_wp puts the entry point and -lib-entry back before proving; see
+        // reset_wp_entry_state for why it is there rather than here.
         let wp = match self.run_wp(Parameters(wp_params)).await {
             Ok(result) => tool_result_json(result),
             Err(error) => check_step_error(&error),
@@ -2185,6 +2286,11 @@ impl FramaCMcpServer {
             // reader branching on this key needs "did not run" and "found
             // nothing" to look different.
             "memory_model_probe": probe_absent("the reload failed, so nothing was proved", true),
+            "contract_mutant_probe": serde_json::Value::Null,
+            "assumed_definitions": assumed_definitions(Err(
+                "the reload failed, so there is no program to read".to_string(),
+            )),
+            "established": established_by_target(&serde_json::Value::Null, &incomplete),
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": {
@@ -2771,6 +2877,163 @@ impl FramaCMcpServer {
         }
     }
 
+    /// The contract-mutant probe for check {mutants: true}. Extracts the
+    /// function with its dependencies from the main instance, which is the
+    /// printed, self-contained source the splice expects, and proves the
+    /// contract against each stub in its own process.
+    async fn contract_mutant_probe(&self, function: Option<&str>, wp_config: &serde_json::Value) -> serde_json::Value {
+        let Some(function) = function else {
+            return super::wpcli::mutants_not_run("mutants need check's function: the stubs replace one body");
+        };
+        let signature = {
+            let state = self.state.read().await;
+            state.resolve_function(function).map(|info| info.signature.clone())
+        };
+        let Some(signature) = signature else {
+            return super::wpcli::mutants_not_run(format!("no function named {function:?} is loaded"));
+        };
+        let extracted = match self.require_client().await {
+            Ok(client) => client
+                .get("plugins.ast-utils.extractFunctionWithDeps", json!(function))
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        let Some(source) = extracted.as_ref().and_then(|e| e["source"].as_str()) else {
+            return super::wpcli::mutants_not_run("the function could not be extracted");
+        };
+        let options = self
+            .main_frama_c_state
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| printed_source_options(&state.project_options))
+            .unwrap_or_default();
+        super::wpcli::run_contract_mutants(super::wpcli::ContractMutants {
+            frama_c_path: &self.frama_c_path,
+            source,
+            function,
+            signature: &signature,
+            project_options: &options,
+            run: wp_config,
+        })
+        .await
+    }
+
+    /// What check learns about the program rather than about the proof run:
+    /// SV-COMP harness encoding, thread creation, pinned properties, contract
+    /// mutants and the recursive logic WP will assume.
+    ///
+    /// One step because they share an input and a position. Each reads the
+    /// program as the run left it, after every analysis, and the pins and the
+    /// harness check both need the property table, which is fetched here once
+    /// and only when one of them will read it.
+    async fn program_facts(&self, input: ProgramFactInputs<'_>) -> ProgramFacts {
+        let ProgramFactInputs {
+            pins,
+            mutants,
+            function,
+            wp_config,
+        } = input;
+        let pins = pins.filter(|pins| !pins.is_empty());
+        let (harness, threads) = {
+            let state = self.state.read().await;
+            let harness: Vec<(String, String, Vec<String>)> = SVCOMP_PROPERTY_FUNCTIONS
+                .iter()
+                .filter_map(|(name, _)| state.resolve_function(name))
+                .map(|info| {
+                    let formals = super::wpcli::signature_parts(&info.signature, &info.name)
+                        .map(|(_, params)| params.into_iter().map(|(_, n)| n.to_string()).collect())
+                        .unwrap_or_default();
+                    (info.name.clone(), info.declaration.clone(), formals)
+                })
+                .collect();
+            let threads: Vec<&'static str> = THREAD_CREATION_FUNCTIONS
+                .iter()
+                .copied()
+                .filter(|name| state.resolve_function(name).is_some())
+                .collect();
+            (harness, threads)
+        };
+        let properties = if pins.is_some() || !harness.is_empty() {
+            match self.require_client().await {
+                Ok(client) => fetch_properties(&client).await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let mut gaps = Vec::new();
+        // A harness read against a table that could not be fetched says
+        // nothing: the gap is about a property the program states, and a
+        // program this call could not read states nothing here.
+        if let Some(properties) = properties.as_deref() {
+            gaps.extend(reachability_property_gap(&harness_encoding(&harness, properties)));
+        }
+        gaps.extend(concurrent_program_gap(&threads));
+        if let Some(pins) = pins {
+            gaps.extend(self.pinned_gaps(pins, properties.as_deref().unwrap_or_default()).await);
+        }
+        let mutant_probe = if mutants {
+            self.contract_mutant_probe(function, wp_config).await
+        } else {
+            serde_json::Value::Null
+        };
+        gaps.extend(contract_mutant_gaps(&mutant_probe));
+        ProgramFacts {
+            gaps,
+            mutant_probe,
+            assumed_definitions: self.assumed_definitions_payload().await,
+        }
+    }
+
+    /// PINNED_PROPERTY_* for check's pins, against the property table as it
+    /// stands after the run. A table that could not be read arrives empty and
+    /// reports every pin as missing, because a pin is a claim this call has to
+    /// establish.
+    async fn pinned_gaps(
+        &self,
+        pins: &[PinnedProperty],
+        properties: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        let (scopes, formals) = {
+            let state = self.state.read().await;
+            let scopes: std::collections::HashMap<String, String> = pins
+                .iter()
+                .filter_map(|pin| pin.function.as_ref())
+                .filter_map(|name| {
+                    state.resolve_function(name).map(|info| (name.clone(), info.declaration.clone()))
+                })
+                .collect();
+            let formals: std::collections::HashMap<String, Vec<String>> = state
+                .functions
+                .values()
+                .filter_map(|info| {
+                    let (_, params) = super::wpcli::signature_parts(&info.signature, &info.name)?;
+                    let names = params.into_iter().map(|(_, name)| name.to_string()).collect();
+                    Some((info.declaration.clone(), names))
+                })
+                .collect();
+            (scopes, formals)
+        };
+        pinned_property_gaps(pins, properties, &scopes, &formals)
+    }
+
+    /// The recursive logic definitions WP will assume, for check's
+    /// assumed_definitions. See assumed_definitions for why this is reported
+    /// rather than gated.
+    async fn assumed_definitions_payload(&self) -> serde_json::Value {
+        let answer = match self.require_client().await {
+            Ok(client) => client
+                .get("plugins.ast-utils.getRecursiveLogic", json!(null))
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        assumed_definitions(answer.as_ref().map_err(Clone::clone))
+    }
+
     /// What this run will prove: the target functions, the guards generated for
     /// them, and the markers startProofs is given.
     ///
@@ -2862,6 +3125,8 @@ impl FramaCMcpServer {
                 // off.
                 rte: Some(rte),
                 rte_unsigned: params.rte_unsigned,
+                rte_pointer: params.rte_pointer,
+                builtin_models: params.builtin_models,
 
                 // check's own detail governs goals and alarms; the function
                 // list it embeds is never the point of the call, and at full
@@ -2919,6 +3184,7 @@ impl FramaCMcpServer {
                     provers: params.provers,
                     timeout: params.timeout,
                     par: params.par,
+                    steps: params.steps,
                     model: params.model,
                     prop: params.prop,
                     smoke: None,
@@ -2997,6 +3263,20 @@ impl FramaCMcpServer {
             .await;
         incomplete.extend(gaps);
 
+        let ProgramFacts {
+            gaps,
+            mutant_probe,
+            assumed_definitions: assumed_logic,
+        } = self
+            .program_facts(ProgramFactInputs {
+                pins: params.pinned.as_deref(),
+                mutants: params.mutants == Some(true),
+                function: params.function.as_deref(),
+                wp_config: &wp["effective_wp_config"],
+            })
+            .await;
+        incomplete.extend(gaps);
+
         let recommended_next_call = check_next_call(NextCallInputs {
             backend_diagnosis: &backend_diagnosis,
             anomaly_left_goals_unjudged,
@@ -3021,20 +3301,9 @@ impl FramaCMcpServer {
         // Everything above this line reads the complete arrays, so summarizing
         // cannot change the verdict, incomplete[], or the recommended call.
         let goals = wp_goals.as_array().cloned().unwrap_or_default();
-        let detail = params.detail.unwrap_or_default();
-        let summarize = !detail.is_full();
-        let (reported_goals, reported_alarms) = if summarize {
-            (
-                summarize_unless_skipped(
-                    &wp_goals,
-                    goal_needs_failure_classification,
-                    goal_summary_bucket,
-                ),
-                summarize_unless_skipped(&eva_alarms, alarm_is_undischarged, alarm_summary_bucket),
-            )
-        } else {
-            (wp_goals, eva_alarms)
-        };
+        let established = established_by_target(&wp_goals, &incomplete);
+        let summarize = !params.detail.unwrap_or_default().is_full();
+        let (reported_goals, reported_alarms) = reported_arrays(summarize, wp_goals, eva_alarms);
 
         let mut payload = json!({
             "schema": CHECK_SCHEMA,
@@ -3058,6 +3327,9 @@ impl FramaCMcpServer {
             // code when it ran, and the reason when it did not, so a reader can
             // tell "nothing was assumed" from "nobody could look".
             "memory_model_probe": memory_model,
+            "contract_mutant_probe": mutant_probe,
+            "assumed_definitions": assumed_logic,
+            "established": established,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": recommended_next_call,
@@ -3957,6 +4229,19 @@ impl FramaCMcpServer {
             changed_from,
         } = self.wp_run_subject(&params).await?;
         let client = self.require_client().await?;
+        // The reset can discard EVA's results, so the session's record of them
+        // is read back from Frama-C rather than kept. Under main_eva_lock,
+        // because the two parameters are EVA's as much as WP's: a check's EVA
+        // half holds that lock from configuring to reading its alarms, and a
+        // reset landing inside that window would pair its settings with an
+        // invalidated run. Taken after main_wp_lock, which is the documented
+        // order, and released before WP proves anything.
+        {
+            let _eva_op_guard = self.main_eva_lock.lock().await;
+            if !reset_wp_entry_state(&client).await? {
+                self.state.write().await.eva_completed = false;
+            }
+        }
         self.apply_wp_config(&client, &params, requested_provers.as_ref())
             .await?;
 
@@ -4090,6 +4375,7 @@ impl FramaCMcpServer {
             // run adds carry unsigned obligations exactly when the load asked
             // for them, and frama_c_options says which it was.
             unsigned_rte: project_options.unsigned_rte(),
+            pointer_rte: project_options.pointer_rte(),
             frama_c_protocol: protocol_diagnostics,
             proofread_report: Some(proofread_report),
             goals: Some(wp_goals.as_slice()),

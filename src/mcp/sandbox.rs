@@ -220,8 +220,21 @@ impl FramaCMcpServer {
         // start that never reaches a connectable socket kills and reaps the
         // child in there, so a failure leaves no zombie either.
         let sandbox_socket = sandbox_dir.join("frama-c.sock");
+
+        // The main project's switches, so the sandbox generates the obligations
+        // its annotations will face after the merge.
+        let rte = self
+            .main_frama_c_state
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| crate::state::SandboxRte {
+                unsigned: !state.project_options.unsigned_rte_skipped,
+                pointer: state.project_options.pointer_rte_requested,
+            })
+            .unwrap_or_default();
         let (sandbox_child, sandbox_client) = self
-            .spawn_sandbox_frama_c(&sandbox_file, &sandbox_socket, session)
+            .spawn_sandbox_frama_c(&sandbox_file, &sandbox_socket, rte, session)
             .await?;
         let sandbox_pid = sandbox_child.id().unwrap_or(0);
 
@@ -263,7 +276,8 @@ impl FramaCMcpServer {
             created_at: now.clone(),
             last_activity: now,
             deleted: false,
-            command_line: self.sandbox_frama_c_command_line(&sandbox_file, &sandbox_socket),
+            command_line: self.sandbox_frama_c_command_line(&sandbox_file, &sandbox_socket, rte),
+            rte,
 
             // Both logs: Frama-C writes its diagnostics to stdout, so a
             // stderr-only tail reports an empty string for a sandbox that

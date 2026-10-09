@@ -1920,7 +1920,7 @@ fn self_check_reports_capabilities_over_stdio() {
     // (self_check_shape_with_missing_frama_c and its capabilities twin).
     // Removing a plug-in request means changing all three; missing one costs a
     // full gate run to find, which is how this comment came to exist.
-    assert_eq!(capabilities["ast_utils"]["registered_request_count"], 30);
+    assert_eq!(capabilities["ast_utils"]["registered_request_count"], 31);
     for request in [
         "plugins.ast-utils.getCilContext",
         "plugins.ast-utils.getContractContext",

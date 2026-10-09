@@ -83,3 +83,15 @@ fn value_accepts_stringified_object() {
 fn value_accepts_empty_string_as_none() {
     assert_eq!(parse_value(r#"{"v": ""}"#).unwrap(), None);
 }
+
+/// pinned takes the stringified array some MCP clients send, like variants.
+#[test]
+fn pinned_accepts_a_stringified_array() {
+    let params: frama_c_mcp::mcp::types::CheckParams = serde_json::from_value(serde_json::json!({
+        "pinned": "[{\"predicate\": \"\\\\result >= 0\", \"function\": \"f\"}]",
+    }))
+    .expect("parses");
+    let pins = params.pinned.expect("pins");
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].function.as_deref(), Some("f"));
+}

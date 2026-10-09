@@ -94,7 +94,14 @@ if assumed.get("descr") != "assigns \\nothing;" or where != decls[0]:
 if "wp_goals" not in payload:
     sys.exit(f"no wp_goals in the payload; keys are {list(payload)}")
 counts = payload["wp_goals"].get("counts")
-expected = {"spec/valid": 10, "user_assert/valid": 1}
+# The three overflow goals exist because the main process runs with
+# -rte-no-use-eva-results. Before it, EVA running first made RTE generation
+# skip every function it had analyzed, so check carried no overflow goal here
+# at all, and the comment above about an open overflow arriving as a second
+# entry was true only of the alarms EVA raised. The terminates goal has its
+# own kind since the classifier reads it off the goal id; it was counted as
+# spec before.
+expected = {"rte_overflow/valid": 3, "spec/valid": 9, "terminates/valid": 1, "user_assert/valid": 1}
 if counts != expected:
     sys.exit(f"goal counts are {counts}, expected {expected}")
 '; then

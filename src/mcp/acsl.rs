@@ -403,6 +403,41 @@ pub fn canonical_extracted_annotations(value: &serde_json::Value) -> Vec<String>
     annotations
 }
 
+/// Frama-C's printer writes ACSL operators in Unicode, and callers write them
+/// in ASCII. One table, read by every normalizer that compares the two
+/// spellings: there were three, covering three different subsets, so one
+/// printed predicate normalized three ways depending on who asked.
+pub const ACSL_UNICODE_OPERATORS: &[(char, &str)] = &[
+    ('≤', "<="),
+    ('≥', ">="),
+    ('≡', "=="),
+    ('≢', "!="),
+    ('≠', "!="),
+    ('⇔', "<==>"),
+    ('⇒', "==>"),
+    ('∧', "&&"),
+    ('∨', "||"),
+    ('⊕', "^^"),
+    ('¬', "!"),
+    ('∀', "\\forall"),
+    ('∃', "\\exists"),
+    ('ℤ', "integer"),
+    ('ℝ', "real"),
+];
+
+/// A predicate with every operator in ACSL_UNICODE_OPERATORS spelled in ASCII,
+/// and nothing else changed.
+pub fn ascii_acsl_operators(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ACSL_UNICODE_OPERATORS.iter().find(|(unicode, _)| *unicode == ch) {
+            Some((_, ascii)) => out.push_str(ascii),
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Compiled once: canonical_extracted_annotations calls this from two loops,
 /// one per global and one per annotation.
 pub fn normalize_annotation_equivalence(acsl: &str) -> String {
@@ -410,10 +445,7 @@ pub fn normalize_annotation_equivalence(acsl: &str) -> String {
     let label = LABEL_RE
         .get_or_init(|| regex::Regex::new(r"\b(?:re|en|as|li|la|lv|at|an)_[0-9a-f]{8}_?").unwrap());
     let stripped = label.replace_all(acsl, "");
-    stripped
-        .replace('≥', ">=")
-        .replace('≤', "<=")
-        .replace('≠', "!=")
+    ascii_acsl_operators(&stripped)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

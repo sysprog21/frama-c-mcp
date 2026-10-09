@@ -255,6 +255,15 @@ pub struct ReloadProjectParams {
     /// Default: true.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte_unsigned: Option<bool>,
+    /// With rte, true also checks that every pointer formed points into an
+    /// object or one past it (-warn-invalid-pointer). Default: false.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub rte_pointer: Option<bool>,
+    /// Force-include contracts for GCC builtins Frama-C models too weakly
+    /// (__builtin_unreachable, __builtin_trap, clz, ctz, popcount). Each is an
+    /// assumption, named in the receipt by the header's digest. Default: false.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub builtin_models: Option<bool>,
     /// Register what the project's build system proves each target under, as an
     /// object keyed by target name. Emit it from the build system rather than
     /// writing it here, so it cannot drift from the command that decides:
@@ -360,6 +369,10 @@ pub struct RunWpParams {
     /// Number of parallel WP prover processes. Defaults to FRAMAC_PAR or
     /// Frama-C.
     pub par: Option<u32>,
+    /// Prover step budget (-wp-steps), which unlike timeout does not move with
+    /// machine load, so two runs under one step budget are comparable.
+    /// Recorded in the receipt when set. Default: none.
+    pub steps: Option<u32>,
     /// WP memory model. Defaults to "Typed+nocast"; use self_check to see
     /// selectors and modifiers reported by the installed Frama-C.
     pub model: Option<String>,
@@ -461,6 +474,18 @@ pub struct CheckVariant {
     pub model: Option<String>,
 }
 
+/// One property check must find, unchanged and proved. See CheckParams::pinned.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct PinnedProperty {
+    /// The ACSL predicate, without the clause keyword or the trailing ";".
+    pub predicate: String,
+    /// The function the property belongs to. Omitted: any scope.
+    pub function: Option<String>,
+    /// The property kind as Frama-C reports it, such as "ensures", "requires"
+    /// or "assert". Omitted: any kind.
+    pub kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct CheckParams {
     // The analysis tuning knobs below stay accepted but are hidden from the
@@ -546,9 +571,28 @@ pub struct CheckParams {
     /// With rte, false skips unsigned wrap and narrowing checks (RTE_REDUCED).
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte_unsigned: Option<bool>,
+    /// With rte, true also checks pointer formation (-warn-invalid-pointer).
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub rte_pointer: Option<bool>,
+    /// Force-include this server's contracts for GCC builtins (assumptions).
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub builtin_models: Option<bool>,
     /// Also run WP smoke tests; a smoke goal WP proves is SMOKE_TEST_FAILED.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub smoke: Option<bool>,
+    /// Properties the verdict must contain, unchanged and proved: each names
+    /// the ACSL predicate as written, without the clause keyword or the
+    /// semicolon, and optionally the function and the clause kind. A pin that
+    /// matches no property is PINNED_PROPERTY_MISSING, and one that matches
+    /// only unproved ones is PINNED_PROPERTY_NOT_PROVED. The comparison is
+    /// textual up to whitespace and operator spelling.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub pinned: Option<Vec<PinnedProperty>>,
+    /// With function, also prove that function's contract against stub
+    /// bodies ("return 0", "return <param>"): one that proves every ensures is
+    /// CONTRACT_DECORATIVE. One extra proof run per stub.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub mutants: Option<bool>,
     /// Response size. "summary" (default) returns counts plus the first few
     /// non-valid goals and undischarged alarms; "full" returns every goal and
     /// alarm. The verdict, incomplete[] and recommended_next_call are computed
@@ -582,6 +626,8 @@ pub struct CheckParams {
     #[schemars(skip)]
     pub provers: Option<Vec<String>>,
     pub timeout: Option<u32>,
+    /// Prover step budget (-wp-steps); load-independent, unlike timeout.
+    pub steps: Option<u32>,
     #[schemars(skip)]
     pub par: Option<u32>,
     #[schemars(skip)]

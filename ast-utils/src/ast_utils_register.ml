@@ -19,6 +19,8 @@
     - getLoopEffects: direct writes grouped by loop
     - getLogicDeps: ACSL logic dependencies by function contract and annotation
     - getRteObligations: generated RTE assertions with alarm metadata
+    - getRecursiveLogic: logic definitions that are directly or mutually
+      recursive, which WP assumes without a termination check
     - getWriteEffects: direct writes and direct callee assigns *)
 
 open Frama_c_kernel
@@ -31,6 +33,69 @@ module Self = Plugin.Register (struct
   let shortname = "ast-utils"
   let help = "CIL AST JSON serialization and ACSL annotation manipulation"
 end)
+
+(* ====== AST integrity check ====== *)
+
+module CheckAst = Self.False(struct
+  let option_name = "-ast-utils-check-ast"
+  let help = "Run the kernel's AST integrity check (Filecheck) after every \
+              request that changes the AST, and report a failure as the \
+              request's error. Also enabled by AST_UTILS_CHECK_AST set to \
+              anything but empty or 0."
+end)
+
+let check_ast_enabled () =
+  CheckAst.get ()
+  || (match Sys.getenv_opt "AST_UTILS_CHECK_AST" with
+      | None | Some ("" | "0") -> false
+      | Some _ -> true)
+
+(* Filecheck reports through Kernel.fatal, which prints the reason and raises
+   an exception that carries only the plug-in name. The reason is taken from
+   the message stream instead, recorded only while a check runs. *)
+let check_failure : string option ref = ref None
+let checking = ref false
+
+let () =
+  Log.add_listener ~kind:[Log.Failure] (fun event ->
+    if !checking && !check_failure = None then
+      check_failure := Some (Rich_text.plain event.Log.evt_message))
+
+(* Run Filecheck over the current AST after a mutating request, when enabled,
+   and turn a failure into the request's error. The mutation is not undone: the
+   point is to say that the AST is no longer one the kernel accepts, so the
+   caller reloads rather than proving against it. Fields the request already
+   returned are kept beside success = false and the error. *)
+let checked_ast request (result : Json.t) : Json.t =
+  if not (check_ast_enabled ()) then result
+  else begin
+    check_failure := None;
+    checking := true;
+    let outcome =
+      try Filecheck.check_ast ("ast-utils " ^ request); None
+      with exn ->
+        Some (match !check_failure with
+            | Some reason -> reason
+            | None -> Printexc.to_string exn)
+    in
+    checking := false;
+    match outcome with
+    | None -> result
+    | Some reason ->
+      let msg = Printf.sprintf
+          "AST integrity check failed after %s; the AST is left modified \
+           and the project should be reloaded: %s"
+          request
+          (String.concat " "
+             (List.filter (( <> ) "")
+                (String.split_on_char '\n' (String.trim reason)))) in
+      let kept = match result with
+        | `Assoc fields ->
+          List.filter (fun (k, _) -> k <> "success" && k <> "error") fields
+        | _ -> []
+      in
+      `Assoc (("success", `Bool false) :: ("error", `String msg) :: kept)
+  end
 
 (* ====== Helpers ====== *)
 
@@ -254,6 +319,21 @@ let () =
          with Kernel_function.No_Definition ->
            error_json (Printf.sprintf "function '%s' has no definition" name))
 
+(* getRecursiveLogic *)
+
+let () =
+  Server.Request.register
+    ~package
+    ~kind:`GET
+    ~name:"getRecursiveLogic"
+    ~descr:(Markdown.plain
+              "List ACSL logic functions and predicates whose definition is \
+               recursive, directly or mutually. WP assumes such a definition \
+               as an axiom without checking termination.")
+    ~input:(module Server.Data.Jany)
+    ~output:(module Server.Data.Jany)
+    (fun _ignored -> Ast_utils_ast.get_recursive_logic ())
+
 (* getRteObligations *)
 
 let () =
@@ -379,7 +459,7 @@ let () =
          | Error msg ->
            ok_json [("success", `Bool false); ("error", `String msg)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execAddGlobalAcsl" result))
 
 (* ====== execRemoveGlobalAcsl ====== *)
 
@@ -407,7 +487,7 @@ let () =
          | Error msg ->
            ok_json [("success", `Bool false); ("error", `String msg)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execRemoveGlobalAcsl" result))
 
 (* ====== execInsertGhostGlobal ====== *)
 
@@ -451,7 +531,7 @@ let () =
                ok_json [("success", `Bool true); ("name", `String name);
                         ("vid", `Int vi.vid); ("error", `Null)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execInsertGhostGlobal" result))
 
 (* ====== execInsertGhostFormal ====== *)
 
@@ -498,7 +578,7 @@ let () =
                ok_json [("success", `Bool true); ("name", `String name);
                         ("vid", `Int vi.vid); ("error", `Null)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execInsertGhostFormal" result))
 
 (* ====== execInsertGhostLemmaFunction ====== *)
 
@@ -573,7 +653,7 @@ let () =
                       ("sids", `List sids);
                       ("error", `Null)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execInsertGhostLemmaFunction" result))
 
 (* ====== execAddAnnotation ====== *)
 
@@ -645,7 +725,7 @@ let () =
            | _ ->
              error_json (Printf.sprintf "unknown kind '%s', expected 'spec' or 'annot'" kind)
        in
-       set_result rq result)
+       set_result rq (checked_ast "execAddAnnotation" result))
 
 (* ====== execRemoveAnnotations ====== *)
 
@@ -659,6 +739,7 @@ let () =
     ~input:(module Server.Data.Jstring)
     ~output:(module Server.Data.Jany)
     (fun name ->
+       checked_ast "execRemoveAnnotations" @@
        match find_kf name with
        | Error msg -> error_json msg
        | Ok kf ->
@@ -698,7 +779,7 @@ let () =
              ok_json [("success", `Bool false);
                       ("error", `String "annotation not found")]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execRemoveAnnotationByLabel" result))
 
 (* ====== execInsertGhostLoop ====== *)
 
@@ -769,9 +850,8 @@ let () =
                with Kernel_function.No_Definition ->
                  failwith "function has no definition"
              in
-             let loc = Cil_datatype.Stmt.loc stmt in
              let parse_expr field text =
-               match Ast_utils_ghost.parse_c_expr fundec loc text with
+               match Ast_utils_ghost.parse_c_expr fundec stmt text with
                | Ok exp -> Ok exp
                | Error msg -> Error (Printf.sprintf "%s: %s" field msg)
              in
@@ -809,7 +889,7 @@ let () =
                             ("sids", `List (List.map (fun sid -> `Int sid) sids));
                             ("error", `Null)]
        in
-       set_result rq result)
+       set_result rq (checked_ast "execInsertGhostLoop" result))
 
 (* ====== execInsertGhostStmt ====== *)
 
@@ -861,13 +941,12 @@ let () =
                with Kernel_function.No_Definition ->
                  failwith "function has no definition"
              in
-             let loc = Cil_datatype.Stmt.loc stmt in
              match op with
              | "decl" ->
                (match Ast_utils_ghost.resolve_ghost_type type_name with
                 | Error msg -> error_json msg
                 | Ok typ ->
-                  match Ast_utils_ghost.parse_c_expr fundec loc expr_str with
+                  match Ast_utils_ghost.parse_c_expr fundec stmt expr_str with
                   | Error msg -> error_json msg
                   | Ok init_exp ->
                     match Ast_utils_ghost.insert_ghost_decl
@@ -881,7 +960,7 @@ let () =
                                ("sid", `Int new_stmt.sid);
                                ("error", `Null)])
              | "set" ->
-               (match Ast_utils_ghost.parse_c_expr fundec loc expr_str with
+               (match Ast_utils_ghost.parse_c_expr fundec stmt expr_str with
                 | Error msg -> error_json msg
                 | Ok expr ->
                   match Ast_utils_ghost.insert_ghost_assign
@@ -895,7 +974,7 @@ let () =
                              ("sid", `Int new_stmt.sid);
                              ("error", `Null)])
              | "else_set" ->
-               (match Ast_utils_ghost.parse_c_expr fundec loc expr_str with
+               (match Ast_utils_ghost.parse_c_expr fundec stmt expr_str with
                 | Error msg -> error_json msg
                 | Ok expr ->
                   match Ast_utils_ghost.insert_ghost_else_assign
@@ -923,7 +1002,7 @@ let () =
                error_json (Printf.sprintf
                  "unknown op '%s', expected 'decl', 'set', 'label', or 'else_set'" op)
        in
-       set_result rq result)
+       set_result rq (checked_ast "execInsertGhostStmt" result))
 
 (* ====== getVcDetails ====== *)
 
@@ -1085,6 +1164,10 @@ let () =
     ~name:"par" ~descr:(Markdown.plain
       "Number of parallel WP prover processes")
     (module Server.Data.Jint) in
+  let get_steps = Server.Request.param_opt s
+    ~name:"steps" ~descr:(Markdown.plain
+      "Prover step budget; 0 means no step limit")
+    (module Server.Data.Jint) in
   let set_result = Server.Request.result s
     ~name:"result" ~descr:(Markdown.plain "Configuration result")
     (module Server.Data.Jany) in
@@ -1121,6 +1204,13 @@ let () =
           Wp.Wp_parameters.Procs.set p;
           changed := ("par", `Int p) :: !changed
         | None -> ());
+       (match get_steps rq with
+        | Some n ->
+          if n < 0 then
+            invalid_arg "steps must not be negative";
+          Wp.Wp_parameters.Steps.set n;
+          changed := ("steps", `Int n) :: !changed
+        | None -> ());
        set_result rq
          (ok_json [("success", `Bool true);
                     ("changed", `List (List.map (fun (k, v) ->
@@ -1140,6 +1230,7 @@ let () =
     ~input:(module Server.Data.Jstring)
     ~output:(module Server.Data.Jany)
     (fun name ->
+       checked_ast "execCreateSandbox" @@
        match find_kf name with
        | Error msg -> error_json msg
        | Ok kf ->
@@ -1164,6 +1255,7 @@ let () =
     ~input:(module Server.Data.Jstring)
     ~output:(module Server.Data.Jany)
     (fun sandbox_name ->
+       checked_ast "execDeleteSandbox" @@
        match Ast_utils_sandbox.delete_sandbox sandbox_name with
        | Error msg -> error_json msg
        | Ok () ->

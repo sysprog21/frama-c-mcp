@@ -606,6 +606,41 @@ fn a_drained_wp_run_is_not_a_gap() {
     assert!(items.is_empty(), "{items:?}");
 }
 
+/// EVA swallows its own abort. "Eva not started because globals initialization
+/// is not computable" leaves the compute request successful and the alarm list
+/// empty, which reads as a clean run unless the state is looked at.
+#[test]
+fn an_aborted_eva_run_is_not_a_run() {
+    for state in ["aborted", "not_computed", "computing"] {
+        let items = check_incomplete_items(
+            Some(true),
+            &json!({"ok": true}),
+            &json!({"computation_state": state}),
+            &json!([]),
+            &json!({"ok": true, "drained": true}),
+            &json!([]),
+            WantedAnalyses::BOTH,
+        );
+        let gap = items
+            .iter()
+            .find(|i| i["code"] == "EVA_NOT_RUN")
+            .unwrap_or_else(|| panic!("{state}: {items:?}"));
+        assert!(gap["error"].as_str().is_some_and(|e| e.contains(state)), "{gap}");
+    }
+
+    // And the finished state is not one.
+    let items = check_incomplete_items(
+        Some(true),
+        &json!({"ok": true}),
+        &json!({"computation_state": "computed"}),
+        &json!([]),
+        &json!({"ok": true, "drained": true}),
+        &json!([]),
+        WantedAnalyses::BOTH,
+    );
+    assert!(items.is_empty(), "{items:?}");
+}
+
 /// Not restricted to contract kinds. An allowlist would go silent on whichever
 /// `propKind` nobody enumerated, so a disproved statement contract with no goal
 /// behind it reports like any other.
@@ -2262,4 +2297,306 @@ async fn evidence_that_was_not_read_fails_closed() {
 
     let complete = codes(&server.run_evidence_gates(inputs(false, None, &SEVEN)).await);
     assert!(!complete.contains(&"WP_MESSAGES_TRUNCATED".to_string()), "{complete:?}");
+}
+
+/// Only the program's own entry starts from the initializers. A scoped run
+/// from anything else used to, and "f() { a[g] = 1; }" behind "set(42)" in
+/// main came back with no alarm at all.
+#[test]
+fn eva_starts_a_scoped_entry_from_an_unknown_global_state() {
+    use frama_c_mcp::mcp::server::analysis::eva_lib_entry;
+    assert!(!eva_lib_entry("main"));
+    assert!(eva_lib_entry("f"));
+}
+
+/// SV-COMP states the property as an unreachable call, which WP never sees
+/// unless a precondition makes the call an obligation. Name-based on purpose,
+/// so only harness functions are ever reported.
+#[test]
+fn an_unencoded_svcomp_property_is_a_gap() {
+    use frama_c_mcp::mcp::server::checkgaps::reachability_property_gap;
+    // An encoded assert does not cover the error function it calls.
+    assert!(reachability_property_gap(&[
+        ("reach_error".to_string(), false),
+        ("__VERIFIER_assert".to_string(), true),
+    ])
+    .is_some());
+    let gap = reachability_property_gap(&[
+        ("reach_error".to_string(), false),
+        ("__VERIFIER_assert".to_string(), false),
+        ("main".to_string(), false),
+    ])
+    .expect("no harness function encoded");
+    assert_eq!(gap["code"], incomplete_code::REACHABILITY_PROPERTY_UNENCODED);
+    let names: Vec<&str> = gap["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["function"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["reach_error", "__VERIFIER_assert"], "{gap}");
+    assert!(!gap_guidance(incomplete_code::REACHABILITY_PROPERTY_UNENCODED).is_null());
+
+    // Encoded, or not a harness at all: nothing to say.
+    assert!(reachability_property_gap(&[("reach_error".to_string(), true)]).is_none());
+    assert!(reachability_property_gap(&[("main".to_string(), false)]).is_none());
+}
+
+/// Recursive logic definitions are listed, never gated, and "nobody asked"
+/// never looks like "none found".
+#[test]
+fn assumed_definitions_separates_none_found_from_not_asked() {
+    use frama_c_mcp::mcp::server::checkgaps::assumed_definitions;
+    let found = json!({"definitions": [{"name": "bad", "kind": "function", "file": "a.c", "line": 1, "cycle": ["bad"]}]});
+    let payload = assumed_definitions(Ok(&found));
+    assert_eq!(payload["ran"], true);
+    assert_eq!(payload["recursive_logic"][0]["name"], "bad");
+    assert!(payload["reason"].as_str().is_some(), "{payload}");
+
+    let none = assumed_definitions(Ok(&json!({"definitions": []})));
+    assert_eq!(none["ran"], true);
+    assert!(none["reason"].is_null(), "{none}");
+
+    let failed = assumed_definitions(Err("plug-in too old".to_string()));
+    assert_eq!(failed["ran"], false);
+    assert_eq!(failed["reason"], "plug-in too old");
+    let malformed = assumed_definitions(Ok(&json!({"error": "x"})));
+    assert_eq!(malformed["ran"], false, "{malformed}");
+}
+
+/// A threaded program is analyzed sequentially; the gap says so and the next
+/// call goes to the one tool that looks at interleavings.
+#[test]
+fn a_program_that_creates_threads_is_a_gap() {
+    use frama_c_mcp::mcp::server::checkgaps::concurrent_program_gap;
+    assert!(concurrent_program_gap(&[]).is_none());
+    let gap = concurrent_program_gap(&["pthread_create"]).expect("gap");
+    assert_eq!(gap["code"], incomplete_code::CONCURRENT_PROGRAM);
+    assert!(!gap_guidance(incomplete_code::CONCURRENT_PROGRAM).is_null());
+
+    let incomplete = vec![gap];
+    let next = check_next_call(NextCallInputs {
+        backend_diagnosis: &json!({}),
+        anomaly_left_goals_unjudged: false,
+        eva_alarms: &json!([]),
+        wp_goals: &json!([]),
+        incomplete: &incomplete,
+        wanted: WantedAnalyses::BOTH,
+        function: None,
+    });
+    assert_eq!(next["tool"], "analyze_concurrency", "{next}");
+
+    // With EVA left out, the next call is the check that runs it.
+    let next = check_next_call(NextCallInputs {
+        backend_diagnosis: &json!({}),
+        anomaly_left_goals_unjudged: false,
+        eva_alarms: &json!([]),
+        wp_goals: &json!([]),
+        incomplete: &incomplete,
+        wanted: WantedAnalyses { eva: false, wp: true },
+        function: None,
+    });
+    assert_eq!(next["tool"], "check", "{next}");
+}
+
+/// Frama-C keeps only include and define flags from a compilation database.
+/// The ones that change meaning are counted per entry and become a gap; -std
+/// and optimisation flags are not among them.
+#[test]
+fn dropped_semantic_compile_flags_are_a_gap() {
+    use frama_c_mcp::mcp::server::checkgaps::compile_flags_dropped_gap;
+    use frama_c_mcp::mcp::server::project::compile_database_dropped_flags;
+    let entries = json!([
+        {"file": "a.c", "arguments": ["cc", "-std=gnu11", "-O2", "-funsigned-char", "-funsigned-char", "-c", "a.c"]},
+        {"file": "b.c", "command": "cc -m32 -fwrapv -Iinc -DX=1 -c b.c"},
+        {"file": "c.c", "command": "clang --target=riscv64 -mabi=lp64 -c c.c"},
+        {"file": "d.c", "command": "cc -funsigned-char-not-a-flag -c d.c"},
+    ]);
+    let dropped = compile_database_dropped_flags(entries.as_array().unwrap());
+    let names: Vec<&String> = dropped.as_object().unwrap().keys().collect();
+    assert_eq!(names, ["--target", "-funsigned-char", "-fwrapv", "-m32", "-mabi"], "{dropped}");
+    assert_eq!(dropped["-funsigned-char"]["entries"], 1, "counted once per entry");
+
+    let gap = compile_flags_dropped_gap(&json!({"compilation_database_dropped_flags": dropped}))
+        .expect("gap");
+    assert_eq!(gap["code"], incomplete_code::COMPILE_FLAGS_DROPPED);
+    assert!(!gap_guidance(incomplete_code::COMPILE_FLAGS_DROPPED).is_null());
+
+    assert!(compile_flags_dropped_gap(&json!({"compilation_database_dropped_flags": {}})).is_none());
+    assert!(compile_flags_dropped_gap(&json!({"compilation_database_dropped_flags": null})).is_none());
+    assert!(compile_flags_dropped_gap(&json!({})).is_none());
+    assert!(compile_flags_dropped_gap(&json!({"compilation_database_dropped_flags": {"unreadable": "x"}})).is_none());
+    let unreadable = frama_c_mcp::mcp::server::project::CompileDatabase::read("/nonexistent/compile_commands.json");
+    assert!(unreadable.dropped_flags()["unreadable"].as_str().is_some(), "{}", unreadable.dropped_flags());
+}
+
+/// The kind of a doomed smoke goal comes from WP's JSON report, whose shape
+/// was measured on 33.0, and the gap counts each half separately.
+#[test]
+fn smoke_failures_are_split_into_vacuous_contracts_and_dead_code() {
+    use frama_c_mcp::mcp::server::wpcli::{parse_smoke_report, smoke_failure_kind};
+    assert_eq!(smoke_failure_kind("vac_wp_smoke_default_requires"), "contract_vacuous");
+    assert_eq!(smoke_failure_kind("dead_wp_smoke_dead_code_s5"), "unreachable_code");
+    assert_eq!(smoke_failure_kind("f_wp_smoke_dead_loop_s3"), "unreachable_code");
+    assert_eq!(smoke_failure_kind("f_wp_smoke_something_new"), "unclassified");
+    assert_eq!(smoke_failure_kind("f_ensures"), "unclassified");
+
+    let report = json!([
+        {"goal": "typed_dead_wp_smoke_default_requires", "property": "dead_wp_smoke_default_requires", "function": "dead", "file": "s.c", "line": 5, "smoke": true, "passed": true},
+        {"goal": "typed_dead_wp_smoke_dead_code_s5", "property": "dead_wp_smoke_dead_code_s5", "function": "dead", "file": "s.c", "line": 6, "smoke": true, "passed": false},
+        {"goal": "typed_vac_wp_smoke_default_requires", "property": "vac_wp_smoke_default_requires", "function": "vac", "file": "s.c", "line": 2, "smoke": true, "passed": false},
+        {"goal": "typed_vac_ensures", "property": "vac_ensures", "function": "vac", "file": "s.c", "line": 1, "smoke": false, "passed": true},
+    ]);
+    let detail = parse_smoke_report(&report);
+    assert_eq!(detail.len(), 2, "{detail:?}");
+
+    let wp = json!({"smoke_probe": {
+        "ran": true, "passed": 2, "total": 4, "failed": ["typed_dead_wp_smoke_dead_code_s5"],
+        "failed_detail": detail,
+    }});
+    let gaps = smoke_test_gaps(true, &wp);
+    assert_eq!(gaps[0]["code"], "SMOKE_TEST_FAILED");
+    assert_eq!(gaps[0]["by_kind"], json!({"contract_vacuous": 1, "unreachable_code": 1, "unclassified": 0}));
+
+    // Without a readable report the split is absent, not zero.
+    let wp = json!({"smoke_probe": {"ran": true, "passed": 3, "total": 4, "failed": [], "failed_detail": null}});
+    assert!(smoke_test_gaps(true, &wp)[0].get("by_kind").is_none());
+}
+
+/// The verdict by target never says more than the verdict: a whole-run gap
+/// blocks all three, and a goal-level gap blocks only its own target.
+#[test]
+fn established_splits_the_verdict_without_upgrading_it() {
+    use frama_c_mcp::mcp::server::checkgaps::{established_by_target, goal_target};
+    assert_eq!(goal_target("typed_f_assert_rte_mem_access"), "memory_safety");
+    assert_eq!(goal_target("typed_f_terminates"), "termination");
+    assert_eq!(goal_target("typed_f_loop_variant_decrease"), "termination");
+    assert_eq!(goal_target("typed_f_ensures"), "functional");
+
+    let goals = json!([
+        {"wpo": "typed_f_assert_rte_mem_access", "stable_goal_id": "a", "normalized_status": "valid"},
+        {"wpo": "typed_f_ensures", "stable_goal_id": "b", "normalized_status": "valid"},
+        {"wpo": "typed_f_terminates", "stable_goal_id": "c", "normalized_status": "timeout"},
+        {"wpo": "typed_f_wp_smoke_default_requires", "smoke": true, "normalized_status": "timeout"},
+    ]);
+    let timeout_on_c = json!({"code": "PROVER_TIMEOUT", "stable_goal_id": "c"});
+    let established = established_by_target(&goals, std::slice::from_ref(&timeout_on_c));
+    assert_eq!(established["memory_safety"]["holds"], true, "{established}");
+    assert_eq!(established["functional"]["holds"], true, "{established}");
+    assert_eq!(established["termination"]["holds"], false, "{established}");
+    assert_eq!(established["termination"]["open"], 1);
+
+    // An axiom is about the whole run.
+    let axiom = json!({"code": "ASSUMED_VALID"});
+    let established = established_by_target(&goals, &[timeout_on_c, axiom]);
+    for target in ["memory_safety", "functional", "termination"] {
+        assert_eq!(established[target]["holds"], false, "{target}: {established}");
+    }
+
+    // No goals shows nothing.
+    let none = established_by_target(&serde_json::Value::Null, &[]);
+    assert_eq!(none["functional"], json!({"goals": 0, "open": 0, "holds": false}));
+}
+
+/// A pin matches by predicate text up to whitespace and operator spelling, in
+/// the named scope and kind, and must be proved.
+#[test]
+fn pinned_properties_must_be_present_and_proved() {
+    use frama_c_mcp::mcp::server::checkgaps::{normalize_predicate, pinned_property_gaps};
+    use frama_c_mcp::mcp::types::PinnedProperty;
+    assert_eq!(normalize_predicate("\\result ≥ 0 ∧ x ≢ 1", &[]), normalize_predicate("\\result>=0 && x != 1;", &[]));
+    assert_eq!(normalize_predicate("\\result ≡ \\old(n) * \\old( n )", &["n"]), normalize_predicate("\\result == n * n", &["n"]));
+    // A global keeps its \old, so a weakened "g == g" does not match it.
+    assert_ne!(normalize_predicate("g ≡ \\old(g)", &["n"]), normalize_predicate("g == g", &["n"]));
+
+    let rows = vec![
+        json!({"predicate": "\\result ≥ 0", "kind": "ensures", "scope": "#F1", "status": "valid"}),
+        json!({"predicate": "x ≢ 0", "kind": "ensures", "scope": "#F1", "status": "unknown"}),
+    ];
+    let scopes: std::collections::HashMap<String, String> =
+        [("f".to_string(), "#F1".to_string()), ("g".to_string(), "#F2".to_string())].into();
+    let formals: std::collections::HashMap<String, Vec<String>> = [("#F1".to_string(), vec!["x".to_string()])].into();
+    let pin = |predicate: &str, function: Option<&str>, kind: Option<&str>| PinnedProperty {
+        predicate: predicate.to_string(),
+        function: function.map(str::to_string),
+        kind: kind.map(str::to_string),
+    };
+
+    assert!(pinned_property_gaps(&[pin("\\result >= 0", Some("f"), Some("ensures"))], &rows, &scopes, &formals).is_empty());
+    let codes = |pins: &[PinnedProperty]| -> Vec<String> {
+        pinned_property_gaps(pins, &rows, &scopes, &formals)
+            .iter()
+            .map(|g| g["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(codes(&[pin("x != 0", None, None)]), ["PINNED_PROPERTY_NOT_PROVED"]);
+    // "\old" is unwrapped only in a postcondition, where the printer adds it.
+    let asserted = vec![json!({"predicate": "x ≡ x", "kind": "assert", "scope": "#F1", "status": "valid"})];
+    assert_eq!(
+        pinned_property_gaps(&[pin("x == \\old(x)", Some("f"), None)], &asserted, &scopes, &formals)[0]["code"],
+        "PINNED_PROPERTY_MISSING",
+        "a weakened assert must not match"
+    );
+    assert_eq!(codes(&[pin("\\result > 0", None, None)]), ["PINNED_PROPERTY_MISSING"]);
+    assert_eq!(codes(&[pin("\\result >= 0", Some("g"), None)]), ["PINNED_PROPERTY_MISSING"], "wrong scope");
+    assert_eq!(codes(&[pin("\\result >= 0", Some("nope"), None)]), ["PINNED_PROPERTY_MISSING"], "unknown function");
+    assert_eq!(codes(&[pin("\\result >= 0", None, Some("requires"))]), ["PINNED_PROPERTY_MISSING"], "wrong kind");
+}
+
+/// A harness property is encoded by what its precondition says: an error
+/// function by "requires \false", __VERIFIER_assert by its own parameter
+/// being nonzero. Codex found both weaker rules unsound: "cond >= 0" lets
+/// "__VERIFIER_assert(0)" through, and "1 == 1" constrains nothing.
+#[test]
+fn a_harness_property_is_encoded_only_by_a_precondition_that_states_it() {
+    use frama_c_mcp::mcp::server::checkgaps::harness_encoding;
+    let error = vec![("reach_error".to_string(), "#F1".to_string(), vec![])];
+    let assert = vec![("__VERIFIER_assert".to_string(), "#F2".to_string(), vec!["cond".to_string()])];
+    let requires = |scope: &str, predicate: &str| json!({"kind": "requires", "scope": scope, "predicate": predicate});
+    let encoded = |present: &[(String, String, Vec<String>)], rows: &[serde_json::Value]| {
+        harness_encoding(present, rows)[0].1
+    };
+
+    assert!(encoded(&error, &[requires("#F1", "\\false")]));
+    assert!(!encoded(&error, &[requires("#F1", "\\true")]), "trivially true");
+    assert!(!encoded(&error, &[requires("#F1", "1 ≡ 1")]), "a tautology");
+    assert!(!encoded(&error, &[]), "no requires");
+    assert!(!encoded(&error, &[requires("#F2", "\\false")]), "another function's requires");
+
+    for spelling in ["cond ≢ 0", "\\old(cond) != 0", "cond", "0 != cond"] {
+        assert!(encoded(&assert, &[requires("#F2", spelling)]), "{spelling}");
+    }
+    assert!(!encoded(&assert, &[requires("#F2", "cond ≥ 0")]), "lets __VERIFIER_assert(0) through");
+    assert!(!encoded(&assert, &[requires("#F2", "1 ≡ 1")]), "a tautology");
+}
+
+/// The error functions decide, and all of them must be encoded: an encoded
+/// assert says nothing about a direct "reach_error()" elsewhere.
+#[test]
+fn an_encoded_assert_does_not_cover_a_direct_error_call() {
+    use frama_c_mcp::mcp::server::checkgaps::reachability_property_gap;
+    let pairs = |items: &[(&str, bool)]| -> Vec<(String, bool)> {
+        items.iter().map(|(n, e)| (n.to_string(), *e)).collect()
+    };
+    assert!(reachability_property_gap(&pairs(&[("__VERIFIER_assert", true), ("reach_error", false)])).is_some());
+    assert!(reachability_property_gap(&pairs(&[("__VERIFIER_assert", false), ("reach_error", true)])).is_none());
+    assert!(reachability_property_gap(&pairs(&[("__VERIFIER_assert", true)])).is_none(), "no error function to reach");
+    assert!(reachability_property_gap(&pairs(&[("__VERIFIER_assert", false)])).is_some());
+    let gap = reachability_property_gap(&pairs(&[("reach_error", true), ("__VERIFIER_error", false)])).expect("one error function unencoded");
+    let names: Vec<&str> = gap["functions"].as_array().unwrap().iter().filter_map(|f| f["function"].as_str()).collect();
+    assert_eq!(names, ["__VERIFIER_error"]);
+}
+
+/// A compilation database "command" is a shell command line, so a quoted
+/// flag is still the flag. Split on whitespace, "'-fwrapv'" kept its quotes
+/// and the dropped-flag gap went unreported.
+#[test]
+fn a_quoted_flag_in_a_compile_command_is_still_seen() {
+    use frama_c_mcp::mcp::server::project::{compile_database_dropped_flags, shell_words};
+    assert_eq!(shell_words(r#"cc '-fwrapv' "-DNAME=a b" -I\ dir x.c"#), ["cc", "-fwrapv", "-DNAME=a b", "-I dir", "x.c"]);
+    assert_eq!(shell_words(r#"cc -D'X="1"' """#), ["cc", r#"-DX="1""#, ""]);
+    let entries = json!([{"file": "a.c", "command": "cc '-fwrapv' \"-funsigned-char\" -c a.c"}]);
+    let dropped = compile_database_dropped_flags(entries.as_array().unwrap());
+    let names: Vec<&String> = dropped.as_object().unwrap().keys().collect();
+    assert_eq!(names, ["-funsigned-char", "-fwrapv"], "{dropped}");
 }

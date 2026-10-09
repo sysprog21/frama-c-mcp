@@ -54,6 +54,8 @@ fn reload_params(files: Option<Vec<String>>) -> Parameters<ReloadProjectParams> 
         compilation_database: None,
         rte: None,
         rte_unsigned: None,
+        rte_pointer: None,
+        builtin_models: None,
         verify_profiles: None,
         verify_profiles_source: None,
         verify_profile: None,
