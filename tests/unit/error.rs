@@ -239,3 +239,36 @@ fn project_lock_schema() {
         serde_json::json!({"lock_project": false})
     );
 }
+
+#[test]
+fn function_not_found_names_the_parse_time_discard() {
+    let payload = data(FramaCError::FunctionNotFound("pop".into()).into());
+    assert_base(&payload, "FunctionNotFound", false);
+    let message = payload["message"].as_str().unwrap();
+    assert!(message.starts_with("function not found: pop."));
+    assert!(message.contains("discards it at parse time"));
+    assert!(message.contains("-keep-unused-functions=specified"), "names the default it depends on");
+}
+
+/// A retry started near the deadline is cut to what is left of it, and never
+/// below the floor or above the usual GET budget.
+#[test]
+fn a_drain_poll_is_never_given_more_than_the_drain_has_left() {
+    use frama_c_mcp::mcp::server::drain_poll_budget;
+    use std::time::Instant;
+    let now = Instant::now();
+    assert_eq!(drain_poll_budget(now, now + Duration::from_secs(60)), Duration::from_secs(10));
+    assert_eq!(drain_poll_budget(now, now + Duration::from_secs(3)), Duration::from_secs(3));
+    assert_eq!(drain_poll_budget(now + Duration::from_secs(5), now), Duration::from_millis(250));
+}
+
+/// A drain whose last poll timed out at the deadline hands back an unfinished
+/// reply rather than an error, with the pending count unknown.
+#[test]
+fn a_drain_that_runs_out_of_time_mid_poll_says_so() {
+    use frama_c_mcp::mcp::server::drain_deadline_reply;
+    let reply = drain_deadline_reply(Duration::from_secs(30));
+    assert_eq!(reply["drained"], false);
+    assert!(reply["left_running"]["pending"].is_null());
+    assert_eq!(reply["left_running"]["waited_seconds"], 30);
+}

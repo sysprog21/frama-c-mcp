@@ -1730,13 +1730,10 @@ impl Walk {
     ///
     /// Restoring the enclosing set was symmetric, and locking is not. A lock
     /// taken inside a block must not escape it, which restoring does correctly;
-    /// a lock released inside one must escape, and restoring resurrected it. So
-    ///
-    ///     pthread_mutex_lock(&m);
-    ///     if (1) { pthread_mutex_unlock(&m); }
-    ///     shared = 1;
-    ///
-    /// reported the write as holding m, and unlock-in-both-branches is the
+    /// a lock released inside one must escape, and restoring resurrected it. So the
+    /// sequence "pthread_mutex_lock(&m); if (1) { pthread_mutex_unlock(&m); }
+    /// shared = 1;" reported the write as holding m, and
+    /// unlock-in-both-branches is the
     /// shape real code takes. That is this pass manufacturing its own primary
     /// evidence, which is worse than missing a lock: lock_note then tells the
     /// caller both accesses hold a mutex that was released.

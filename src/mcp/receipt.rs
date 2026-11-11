@@ -214,6 +214,33 @@ pub fn receipt_goals_record_owner(goals: &[serde_json::Value]) -> bool {
     goals.iter().all(|goal| goal.get("fct").is_some())
 }
 
+/// How to get back the goal list a trimmed receipt dropped. One sentence for
+/// both tools, so the retention facts it states cannot drift apart.
+pub const RECEIPT_RECOVERY_NOTE: &str = "pass this receipt's sha256 as proof_receipt_sha256 (the session keeps the last 32 receipts and forgets them all on the next reload, which every check performs), or run check {detail: \"full\"}";
+
+/// Replace the per-goal list of a receipt with its counts, for a summary
+/// response. The session stores the full body under its sha256 (remember_receipt),
+/// which this leaves in place so it still names that body; "goals_trimmed" marks
+/// the object as no longer the hashed one.
+pub fn trim_receipt_goals(receipt: &mut serde_json::Value) {
+    let Some(object) = receipt.as_object_mut() else {
+        return;
+    };
+    let Some(serde_json::Value::Array(goals)) = object.remove("goals") else {
+        return;
+    };
+    let mut by_status: BTreeMap<&str, u64> = BTreeMap::new();
+    for goal in &goals {
+        *by_status.entry(goal["status"].as_str().unwrap_or("unknown")).or_default() += 1;
+    }
+    let trimmed = json!({
+        "count": goals.len(),
+        "by_status": by_status,
+        "full_body": RECEIPT_RECOVERY_NOTE,
+    });
+    object.insert("goals_trimmed".to_string(), trimmed);
+}
+
 pub fn proof_receipt_with_hash(mut body: serde_json::Value) -> serde_json::Value {
     let digest_input = serde_json::to_vec(&body).unwrap_or_default();
     if let Some(object) = body.as_object_mut() {

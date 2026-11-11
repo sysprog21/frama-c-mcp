@@ -4,6 +4,7 @@ use super::*;
 
 // The gap machinery, which used to be 900 lines of this file.
 use super::checkgaps::*;
+use super::receipt::trim_receipt_goals;
 // The verdict predicates, which used to be 583 more.
 use super::verdicts::*;
 
@@ -1815,6 +1816,48 @@ pub struct RunEvidenceGates {
     pub anomaly_left_goals_unjudged: bool,
 }
 
+/// Shorten a built check payload for a summary response: hypotheses in
+/// VALID_UNDER_HYP entries and the goal lists of the receipts. Everything the
+/// verdict read was read before this runs.
+fn trim_check_payload_for_summary(payload: &mut serde_json::Value) {
+    // get_mut, not indexing: indexing an absent key for writing would add it
+    // as null.
+    if let Some(incomplete) = payload.get_mut("incomplete") {
+        slim_valid_under_hyp(incomplete);
+    }
+    // "wp" carries the run_wp receipt, a second copy of the goal list.
+    // pointer_mut, because indexing a null "wp" for writing would turn it into
+    // an object.
+    for pointer in ["/proof_receipt", "/wp/proof_receipt"] {
+        if let Some(receipt) = payload.pointer_mut(pointer) {
+            trim_receipt_goals(receipt);
+        }
+    }
+}
+
+impl FramaCMcpServer {
+    /// The axioms and lemmas a WP-only run assumed, judged from the property
+    /// table. EVA not requested leaves eva_alarms null, and with it the trusted
+    /// base, so the table is read here and its gaps appended to incomplete. A
+    /// failed read is an error, never a verdict without the audit. Returns the
+    /// table so the receipt reads it in place of the null eva_alarms, or None
+    /// when this is not a WP-only run.
+    async fn wp_only_assumption_audit(
+        &self,
+        wanted: WantedAnalyses,
+        function: Option<&str>,
+        wp_goals: &serde_json::Value,
+        incomplete: &mut Vec<serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, McpError> {
+        if !wanted.wp || wanted.eva {
+            return Ok(None);
+        }
+        let table = self.eva_alarms_payload(function, None, None).await?;
+        incomplete.extend(unreviewed_assumption_gaps(&table, wp_goals));
+        Ok(Some(table))
+    }
+}
+
 #[tool_router(router = analysis_router, vis = "pub(crate)")]
 impl FramaCMcpServer {
     fn expand_eva_profile(
@@ -2202,18 +2245,38 @@ impl FramaCMcpServer {
         &self,
         wp_params: RunWpParams,
         function: Option<&str>,
+        keep_full_receipt: bool,
     ) -> (serde_json::Value, serde_json::Value) {
         // run_wp puts the entry point and -lib-entry back before proving; see
         // reset_wp_entry_state for why it is there rather than here.
-        let wp = match self.run_wp(Parameters(wp_params)).await {
+        let mut wp = match self.run_wp(Parameters(wp_params)).await {
             Ok(result) => tool_result_json(result),
             Err(error) => check_step_error(&error),
         };
+        if keep_full_receipt {
+            self.restore_full_wp_receipt(&mut wp).await;
+        }
         let goals = match self.wp_goals_payload(function, None, None).await {
             Ok(payload) => payload,
             Err(error) => check_step_error(&error),
         };
         (wp, goals)
+    }
+
+    /// Put back the goal list run_wp trimmed from a large run's receipt. A direct
+    /// run_wp caps its response, but check with detail "full" promises every
+    /// goal, and the session holds the whole body under the receipt's sha256.
+    /// Left as is when the receipt is not trimmed or the body is gone.
+    async fn restore_full_wp_receipt(&self, wp: &mut serde_json::Value) {
+        let Some(receipt) = wp.get_mut("proof_receipt").filter(|r| r.get("goals_trimmed").is_some()) else {
+            return;
+        };
+        let Some(sha) = receipt.get("sha256").and_then(|value| value.as_str()) else {
+            return;
+        };
+        if let Some(full) = self.state.read().await.receipt_body(sha) {
+            *receipt = full.clone();
+        }
     }
 
     /// The payload for a check whose project would not load.
@@ -3196,6 +3259,7 @@ impl FramaCMcpServer {
                     verify_profile: params.verify_profile.clone(),
                 },
                 params.function.as_deref(),
+                params.detail.unwrap_or_default().is_full(),
             )
             .await
         } else {
@@ -3243,6 +3307,9 @@ impl FramaCMcpServer {
             &wp_goals,
             wanted,
         );
+        let wp_only_table = self
+            .wp_only_assumption_audit(wanted, params.function.as_deref(), &wp_goals, &mut incomplete)
+            .await?;
 
         let RunEvidenceGates {
             gaps,
@@ -3295,8 +3362,14 @@ impl FramaCMcpServer {
         // Built before summarizing takes ownership of `eva_alarms`, which is
         // the kernel property table and the only place a goal digest can reach
         // a predicate.
-        let receipt_properties =
-            property_status_map(eva_alarms.as_array().map(Vec::as_slice).unwrap_or_default());
+        let receipt_properties = property_status_map(
+            wp_only_table
+                .as_ref()
+                .unwrap_or(&eva_alarms)
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
 
         // Everything above this line reads the complete arrays, so summarizing
         // cannot change the verdict, incomplete[], or the recommended call.
@@ -3347,6 +3420,9 @@ impl FramaCMcpServer {
                 properties: &receipt_properties,
             })
             .await;
+        if summarize {
+            trim_check_payload_for_summary(&mut payload);
+        }
         Ok(payload)
     }
 

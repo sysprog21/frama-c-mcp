@@ -95,3 +95,73 @@ fn pinned_accepts_a_stringified_array() {
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].function.as_deref(), Some("f"));
 }
+
+/// A misspelled setting is an error, not a run under defaults. timeout_seconds
+/// and parallel are the names a caller reaches for, and run_wp's are timeout
+/// and par.
+#[test]
+fn run_wp_refuses_unknown_fields() {
+    use frama_c_mcp::mcp::types::RunWpParams;
+    let err = serde_json::from_value::<RunWpParams>(serde_json::json!({
+        "timeout_seconds": 30,
+    }))
+    .expect_err("unknown field must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("timeout_seconds"), "{msg}");
+    assert!(msg.contains("timeout"), "accepted fields are listed: {msg}");
+    serde_json::from_value::<RunWpParams>(serde_json::json!({"timeout": 30, "par": 8}))
+        .expect("the real names parse");
+}
+
+#[test]
+fn check_refuses_unknown_fields() {
+    use frama_c_mcp::mcp::types::CheckParams;
+    let err = serde_json::from_value::<CheckParams>(serde_json::json!({
+        "file": "a.c",
+    }))
+    .expect_err("`file` is not `files`");
+    assert!(err.to_string().contains("file"), "{err}");
+}
+
+/// Summary lists three stale markers and full lists twenty; the count beside
+/// them covers the rest.
+#[test]
+fn the_stale_marker_sample_depends_on_detail() {
+    use frama_c_mcp::mcp::server::project::stale_marker_sample_size;
+    use frama_c_mcp::mcp::types::Detail;
+    assert_eq!(stale_marker_sample_size(None), 3);
+    assert_eq!(stale_marker_sample_size(Some(Detail::Summary)), 3);
+    assert_eq!(stale_marker_sample_size(Some(Detail::Full)), 20);
+}
+
+/// The structs nested in a check call refuse unknown fields too: a pin spelled
+/// pred would otherwise drop out and weaken what the verdict must contain.
+#[test]
+fn nested_check_params_refuse_unknown_fields() {
+    use frama_c_mcp::mcp::types::CheckParams;
+    let pin = serde_json::from_value::<CheckParams>(serde_json::json!({
+        "pinned": [{"pred": "x > 0"}]
+    }))
+    .unwrap_err()
+    .to_string();
+    assert!(pin.contains("unknown field `pred`"), "{pin}");
+    let variant = serde_json::from_value::<CheckParams>(serde_json::json!({
+        "variants": [{"define": ["A"]}]
+    }))
+    .unwrap_err()
+    .to_string();
+    assert!(variant.contains("define"), "{variant}");
+}
+
+/// The server refuses unknown parameters, but the hidden tuning knobs are
+/// still accepted, so the published schema must not forbid additional
+/// properties: a client that validates against it would reject calls the
+/// server takes.
+#[test]
+fn published_schemas_do_not_forbid_the_hidden_knobs() {
+    use frama_c_mcp::mcp::types::{CheckParams, RunWpParams};
+    for schema in [schemars::schema_for!(CheckParams), schemars::schema_for!(RunWpParams)] {
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_ne!(value.get("additionalProperties"), Some(&serde_json::json!(false)), "{value}");
+    }
+}

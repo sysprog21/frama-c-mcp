@@ -560,3 +560,59 @@ reports `from_cache` as `true`, `false` or `null` for unknown.
 | Whether a contract is vacuous | `check {files, smoke: true}`, which reports `SMOKE_TEST_FAILED`; see [the playbook](agent-playbook.md#definition-of-done) |
 | What a variable can hold at a line | `context {want: ["marker_at"]}` then `eva_value` |
 | Your contract as WP sees it | `context {want: ["contract_context"]}` |
+
+## Bit operators and wrapping casts
+
+WP's Typed model leaves `<<`, `>>`, `&` and the casts to `uint32_t` and
+`uint64_t` uninterpreted. A contract written in integer arithmetic (`lo(a * b)`,
+`x / 2^n`) then times out under every prover, and the timeout reads like a hard
+nonlinear goal when it is a missing definition. Before raising the budget, read
+the goal with `get_wp_goals {want: ["vc"], function}`: a bare `lsr`, `lsl`,
+`land` or `to_uint64` in it is the sign.
+
+What worked on a RISC-V ALU (`tests/formal/rv32-alu.c` in rv32emu, 74 goals):
+
+- State the bridge once, in an `axiomatic` block, and nothing else in it:
+  wrap casts as floor-modulus (`(uint32_t) x == lo(x)`), left shifts as multiply
+  by `pow2(n)`, and right shifts of a non-negative value as floor-divide by
+  `pow2(n)`. Each axiom holds only on a stated domain, so write the domain into
+  it: `0 <= n < 32` for the shift amount, and `x >= 0` for the right shift (a
+  signed right shift of a negative value is implementation-defined, so leave it
+  out or state the target's rule explicitly). A mask is a modulus only for a
+  contiguous low-bit mask: `x & (2^k - 1) == x % 2^k` for `x >= 0`, while
+  `10 & 5` is `0` and `10 % 6` is `4`, so any other mask needs its own
+  argument. Frama-C will report each axiom as `ASSUMED_VALID`; that is accurate,
+  and a false axiom lets a wrong contract prove. Re-check every one outside
+  Frama-C, for example with Z3's bit-vector theory over a vector wider than any
+  operand, over exactly the domain the axiom states, and keep that script beside
+  the proof.
+- Keep a declared symbol out of the bridge block. WP includes an `axiomatic`
+  block's axioms when the symbols it declares are used, so putting
+  `logic integer pow2(integer n);` beside the wrap and shift axioms made all of
+  them vanish from unrelated goals (a plain multiply stopped proving). Declare
+  such a symbol in its own block with a base axiom and a positivity axiom. Do not
+  define it recursively: that is an unchecked axiom too, and `check` lists it
+  under `assumed_definitions`.
+- Give `pow2` of each constant shift amount as its own axiom. The recursive
+  definition cannot be used here, since it is an unchecked axiom too, and no prover unfolds a recursive one 32 times.
+- Write specs as floor division (`hi(p)`, `a * b / 2^32`) rather than
+  `\exists l; ... == r * 2^32 + l`; the existential has no witness the provers
+  can find.
+- Add range lemmas for each product (`prod_u32`, `prod_s32`) so overflow
+  obligations and `to_uint64` identities close, and one identity lemma per wrap
+  (`lo64(x) == x` in range). Lemmas are global hypotheses, so a large pile can
+  slow the goals that were already closing; keep each one to a fact a goal
+  needed.
+- Find the missing step by putting `//@ assert` lines in a scratch copy of the
+  function, one per step of the argument. The one that fails names the lemma
+  you lack.
+- Use a prover portfolio: `run_wp {prover: "alt-ergo,z3,cvc5"}`. Across this
+  file Alt-Ergo, Z3 and CVC4 each timed out on a different subset, and
+  `timeout`/`par` are the parameter names (`timeout_seconds` is refused).
+- Run `check` on a library with no `main` using `want: ["wp"]`; the default also
+  runs EVA, which fails with `EVA_NOT_RUN` and marks the result incomplete. A
+  WP-only check is still reported incomplete, with `EVA_NOT_REQUESTED`: it says
+  the runtime alarms EVA would find were not looked at, not that WP failed. A
+  model whose arithmetic wraps by design also wants `rte_unsigned: false`, which
+  `check` reports as `RTE_REDUCED`; the signed-overflow and shift obligations
+  still run.

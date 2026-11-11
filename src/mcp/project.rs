@@ -347,6 +347,16 @@ async fn ast_reload_health(
     Ok(AstReloadHealth { functions, payload })
 }
 
+/// How many stale marker pairs a reload_project reply lists: three by default
+/// and twenty under detail "full". The count beside them says the rest.
+pub fn stale_marker_sample_size(detail: Option<Detail>) -> usize {
+    if detail.unwrap_or_default().is_full() {
+        20
+    } else {
+        3
+    }
+}
+
 #[tool_router(router = project_router, vis = "pub(crate)")]
 impl FramaCMcpServer {
     #[tool(description = "Run environment, capability, and Frama-C request compatibility checks before verification. canary=true additionally proves the backend can still tell a known bug from its fix, in a separate Frama-C process that does not touch the loaded project.")]
@@ -727,12 +737,14 @@ impl FramaCMcpServer {
         // tool-result budget before any analysis ran. The count is the signal;
         // the full set stays in session state for whatever needs it.
         //
-        // stale_markers is a BTreeMap, so this is the first twenty by marker
-        // and the same twenty on the next run of the same reload.
-        const STALE_MARKER_SAMPLE: usize = 20;
+        // stale_markers is a BTreeMap, so the sample is the first few by marker
+        // and the same ones on the next run of the same reload.
+        //
+        // The sample size depends on detail; see stale_marker_sample_size.
+        let stale_marker_sample = stale_marker_sample_size(params.detail);
         let stale_marker_values = stale_markers
             .values()
-            .take(STALE_MARKER_SAMPLE)
+            .take(stale_marker_sample)
             .map(|marker| serde_json::to_value(marker).unwrap_or(serde_json::Value::Null))
             .collect::<Vec<_>>();
         let stale_markers_omitted = stale_marker_count.saturating_sub(stale_marker_values.len());

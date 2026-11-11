@@ -2236,3 +2236,11 @@ fn sandbox_metadata_without_rte_reads_back_as_the_old_fixed_switches() {
     let metadata: SandboxMetadata = serde_json::from_value(old).expect("old metadata parses");
     assert_eq!(metadata.rte, rte);
 }
+
+#[test]
+fn a_trimmed_summary_receipt_is_refused_with_the_sha256_route() {
+    let trimmed = json!({"sha256": "abc", "goals_trimmed": {"count": 3}});
+    let error = proof_receipt_evidence_error(&trimmed, 3, "f").expect("a trimmed receipt is not evidence");
+    assert!(error.contains("proof_receipt_sha256"), "no route given: {error}");
+    assert!(!error.contains("field shape"), "blamed the shape instead: {error}");
+}

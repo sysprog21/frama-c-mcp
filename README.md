@@ -246,7 +246,7 @@ the right is the trap that makes the obvious call the wrong one.
 | *"Type-check this ACSL against the real AST but change nothing."* | `inject_all_annotations({function:"bar", dry_run:true, annotations:[...]})` | Invariants, asserts, `assigns`, ghost code and lemmas all inject on main. `requires` and `ensures` are the exception, refused there whatever `dry_run` says |
 | *"Try requiring `n >= 0` without touching the main project."* | `create_sandbox({function:"bar", experiment_id:"exp42"})` → `inject_all_annotations({sandbox_name:"exp42:bar", annotations:[...]})` → `run_wp({functions:["exp42:bar"]})` | Contracts belong to whoever reviews the source, so main refuses them and the sandbox is where one gets tried. Merge back explicitly |
 | *"Prove `bar` now, and tell me what my last change actually bought."* | `run_wp({functions:["bar"], cache:"None"})` → `get_wp_goals({function:"bar", since:"<earlier receipt sha256>"})` | `-wp-cache` defaults to `update`, so a valid verdict may be replayed rather than computed. `progress.fraction_delta` measures the goals both runs share, so the ones your edit added show up under `appeared` instead. `since` requires the same function scope and only names receipts from this session |
-| *"Prove the ready functions, one bounded batch at a time, then record what `bar` assumed."* | `run_wp({functions:["bar"], retry_unproved:true})` → `store_function_conclusion({function:"bar", status:"verified", proof_receipt, wp_summary})` → `list({kind:"conclusions", function:"bar"})` | WP's budget is per call, so an oversized batch returns nothing at all. `verified` is refused unless the receipt's goals are all valid and their count matches `wp_summary` |
+| *"Prove the ready functions, one bounded batch at a time, then record what `bar` assumed."* | `run_wp({functions:["bar"], retry_unproved:true})` → `store_function_conclusion({function:"bar", status:"verified", proof_receipt_sha256, wp_summary})` → `list({kind:"conclusions", function:"bar"})` | WP's budget is per call, so an oversized batch returns nothing at all. `verified` is refused unless the receipt's goals are all valid and their count matches `wp_summary`. Past 200 goals `run_wp` trims its receipt object, so pass its sha256 as `proof_receipt_sha256` rather than the object |
 | *"Verify the file bottom up and tell me what to do next."* | `verify_program_step({lock_project:false})` | The lock defaults on and blocks every later `run_wp` on main |
 | *"Does it actually break when it runs?"* | `run_e_acsl({use_current_ast:true, args:[...]})` | Compiles and executes the code with your privileges; trusted source only. Without `use_current_ast` it runs the files on disk, which do not carry this session's annotations |
 | *"Write out the annotated source."* | `context({want:["source"], output:"out/annotated.c"})` | Whole program, every contract and generated RTE assert. The path must stay inside the working directory |
@@ -901,6 +901,13 @@ check {files or source, function?, detail?}
 # plus the first few entries that need attention. Pass detail: "full" for every
 # goal and alarm, which runs to hundreds of kilobytes on a real file. The
 # verdict and incomplete[] are computed from the complete data either way.
+# The receipt in a summary response has counts (goals_trimmed) in place of its
+# goal list; pass its sha256 as proof_receipt_sha256 where a whole receipt is
+# wanted, since the session keeps the full body (the last 32 receipts, dropped
+# at the next reload, which every check does; after that, re-run with
+# detail: "full"). VALID_UNDER_HYP entries report how many
+# established hypotheses they dropped as hypotheses_established.
+# check and run_wp reject unknown parameters, nested ones included.
 
 # reload_project takes a detail of its own, with the same two words and a
 # different subject: its own function list, not goals and alarms. Summary gives
