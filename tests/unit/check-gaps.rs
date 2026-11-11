@@ -2600,3 +2600,85 @@ fn a_quoted_flag_in_a_compile_command_is_still_seen() {
     let names: Vec<&String> = dropped.as_object().unwrap().keys().collect();
     assert_eq!(names, ["-funsigned-char", "-fwrapv"], "{dropped}");
 }
+
+#[test]
+fn summary_keeps_one_valid_under_hyp_entry_per_goal_with_only_open_hypotheses() {
+    let rests_on = |id: &str, root: &str| {
+        json!({
+            "code": "VALID_UNDER_HYP",
+            "reason": "r",
+            "stable_goal_id": id,
+            "hypotheses": [
+                {"property": root, "raw_status": "unknown", "normalized_status": "unknown",
+                 "counts_as_progress": false, "vacuous": false},
+                {"property": "#p9", "raw_status": "valid", "normalized_status": "valid",
+                 "counts_as_progress": true, "vacuous": false},
+            ],
+        })
+    };
+    let mut incomplete = json!([
+        {"code": "EVA_NOT_REQUESTED"},
+        rests_on("sg_a", "#p1"),
+        rests_on("sg_b", "#p2"),
+    ]);
+    frama_c_mcp::mcp::server::checkgaps::slim_valid_under_hyp(&mut incomplete);
+
+    // Same entries in the same order: only the hypotheses shrink.
+    let entries = incomplete.as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], json!({"code": "EVA_NOT_REQUESTED"}));
+    assert_eq!(entries[1]["stable_goal_id"], "sg_a");
+    assert_eq!(
+        entries[1]["hypotheses"],
+        json!([{"property": "#p1", "normalized_status": "unknown"}])
+    );
+    assert_eq!(entries[2]["hypotheses"][0]["property"], "#p2");
+
+    // The dropped established hypothesis is counted, so an empty or short list
+    // cannot be read as "there were none".
+    assert_eq!(entries[1]["hypotheses_established"], 1);
+}
+
+/// With EVA not requested the alarms table is null, and check used to judge no
+/// axiom at all. The trusted base is read from the property table instead.
+#[test]
+fn a_wp_only_run_still_reports_assumed_axioms() {
+    use frama_c_mcp::mcp::server::checkgaps::unreviewed_assumption_gaps;
+    let table = json!([
+        {"kind": "axiom", "descr": "axiom\nshl_mul", "status": "considered_valid", "property": "#p1"},
+        {"kind": "assert", "descr": "assert rte,mem_access", "status": "unknown", "property": "#p2"},
+        {"kind": "ensures", "descr": "ensures", "status": "valid", "property": "#p3"},
+    ]);
+    let gaps = unreviewed_assumption_gaps(&table, &json!([]));
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0]["code"], "ASSUMED_VALID");
+    assert_eq!(gaps[0]["property"], "#p1");
+    assert!(unreviewed_assumption_gaps(&json!(null), &json!([])).is_empty());
+}
+
+/// A WP-only run reads the rest of what the table says WP will not revisit: a
+/// disproved clause, an inconsistent one, and a lemma nothing proved. A lemma a
+/// goal discharged, and a valid clause, stay quiet.
+#[test]
+fn a_wp_only_run_reports_disproved_inconsistent_and_unproved_lemma_rows() {
+    use frama_c_mcp::mcp::server::checkgaps::unreviewed_assumption_gaps;
+    let table = json!([
+        {"kind": "ensures", "descr": "ensures", "status": "invalid", "property": "#p1"},
+        {"kind": "assert", "descr": "assert", "status": "inconsistent", "property": "#p2"},
+        {"kind": "lemma", "descr": "lemma l", "status": "unknown", "property": "#p3"},
+        {"kind": "lemma", "descr": "lemma ok", "status": "valid", "property": "#p4"},
+        {"kind": "ensures", "descr": "ensures", "status": "valid", "property": "#p5"},
+    ]);
+    let gaps = unreviewed_assumption_gaps(&table, &json!([]));
+    let codes: Vec<_> = gaps.iter().map(|gap| gap["code"].as_str().unwrap()).collect();
+    assert_eq!(codes, ["PROPERTY_DISPROVED", "PROPERTY_INCONSISTENT", "LEMMA_NOT_PROVED"], "{gaps:?}");
+}
+
+/// A VALID_UNDER_HYP entry with no resolved hypothesis list still says how many
+/// it dropped, so the field is on every summary entry.
+#[test]
+fn a_summary_entry_without_a_hypothesis_list_reports_zero_established() {
+    let mut incomplete = json!([{"code": "VALID_UNDER_HYP", "hypotheses": null}]);
+    frama_c_mcp::mcp::server::checkgaps::slim_valid_under_hyp(&mut incomplete);
+    assert_eq!(incomplete[0]["hypotheses_established"], 0);
+}

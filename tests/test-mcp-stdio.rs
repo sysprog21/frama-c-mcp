@@ -977,7 +977,7 @@ async fn check_fails_closed_on_an_undischarged_lemma() {
     // One client per scope. A second `check` in the same session reloads, and
     // this fixture then comes back EVA_NOT_RUN plus WP_NOT_RUN, which would
     // satisfy "not proved" without ever exercising the lemma path.
-    for scope in [None, Some("lemma_dependent")] {
+    for (scope, wp_only) in [(None, false), (Some("lemma_dependent"), false), (None, true), (Some("lemma_dependent"), true)] {
         let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
         let mut args = json!({
             "files": [fixture.to_str().unwrap()],
@@ -985,6 +985,9 @@ async fn check_fails_closed_on_an_undischarged_lemma() {
         });
         if let Some(function) = scope {
             args["function"] = json!(function);
+        }
+        if wp_only {
+            args["want"] = json!(["wp"]);
         }
         let result = call_tool_json(&client, "check", args).await.unwrap();
 
@@ -1104,7 +1107,7 @@ async fn check_reports_an_axiom_as_an_assumption() {
     // One client per scope, for the reason given by
     // check_fails_closed_on_an_undischarged_lemma: a second check in one
     // session reloads and fails for another reason.
-    for scope in [None, Some("uncalled")] {
+    for (scope, wp_only) in [(None, false), (Some("uncalled"), false), (None, true), (Some("uncalled"), true)] {
         let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
 
         // Full detail, because the assertion below reads the goals themselves.
@@ -1117,6 +1120,9 @@ async fn check_reports_an_axiom_as_an_assumption() {
         });
         if let Some(function) = scope {
             args["function"] = json!(function);
+        }
+        if wp_only {
+            args["want"] = json!(["wp"]);
         }
         let result = call_tool_json(&client, "check", args).await.unwrap();
 
@@ -5004,7 +5010,6 @@ async fn tutorial_sandbox_preserves_logic_dependencies() {
         let client = spawn_mcp_client(tutorial_c(fixture).to_str().unwrap()).await;
         call_tool_json(&client, "run_wp", json!({
             "functions": [function],
-            "rte": true,
             "timeout": 5,
         }))
         .await
@@ -5124,7 +5129,6 @@ async fn tutorial_loops_expose_named_invariants_and_termination_clauses() {
     let client = spawn_mcp_client(tutorial_c("loops.c").to_str().unwrap()).await;
     let wp = call_tool_json(&client, "run_wp", json!({
         "functions": ["find", "max_element"],
-        "rte": true,
         "timeout": 5,
     }))
     .await
@@ -5177,7 +5181,6 @@ async fn tutorial_bsearch_reports_rte_obligation_metadata() {
     let client = spawn_mcp_client(tutorial_c("bsearch.c").to_str().unwrap()).await;
     let wp = call_tool_json(&client, "run_wp", json!({
         "functions": ["bsearch_tut"],
-        "rte": true,
         "timeout": 5,
     }))
     .await
@@ -5868,16 +5871,16 @@ async fn two_identical_runs_produce_one_receipt() {
     let cache_env = [("FRAMAC_WP_CACHEDIR", cache.path().to_str().unwrap())];
 
     let first_client = spawn_mcp_client_with_env(c_file.to_str().unwrap(), &cache_env).await;
-    let first = call_tool_json(&first_client, "check", json!({}))
+    let first = call_tool_json(&first_client, "check", json!({"detail": "full"}))
         .await
         .unwrap();
-    let repeated = call_tool_json(&first_client, "check", json!({}))
+    let repeated = call_tool_json(&first_client, "check", json!({"detail": "full"}))
         .await
         .unwrap();
     let _ = first_client.cancel().await;
 
     let second_client = spawn_mcp_client_with_env(c_file.to_str().unwrap(), &cache_env).await;
-    let second = call_tool_json(&second_client, "check", json!({}))
+    let second = call_tool_json(&second_client, "check", json!({"detail": "full"}))
         .await
         .unwrap();
     let _ = second_client.cancel().await;
@@ -9383,7 +9386,7 @@ async fn clause_origin_comes_from_the_emitter_not_the_label() {
 
     // A goal inherits authorship from the clause it discharges, carried across
     // by the same property row the goal already takes its status from.
-    call_tool_json(&client, "run_wp", json!({"function": "keep", "cache": "None"}))
+    call_tool_json(&client, "run_wp", json!({"functions": ["keep"], "cache": "None"}))
         .await
         .unwrap();
     let goal_named = |goals: &Value, name_part: &str| {
@@ -9969,7 +9972,7 @@ async fn work_after_an_inline_source_check_still_finds_the_source() {
     );
     assert_eq!(goals["session"]["project_loaded"], true, "{:?}", goals);
 
-    let rerun = call_tool_json(&client, "run_wp", json!({"function": "id", "timeout": 1}))
+    let rerun = call_tool_json(&client, "run_wp", json!({"functions": ["id"], "timeout": 1}))
         .await
         .unwrap();
     assert!(
@@ -10929,7 +10932,7 @@ async fn a_truncated_check_still_resolves_every_advice_key() {
     let checked = call_tool_json(
         &client,
         "check",
-        json!({"function": "isolated_loop_1", "want": ["wp"], "wp": {"timeout": 5}}),
+        json!({"function": "isolated_loop_1", "want": ["wp"], "timeout": 5}),
     )
     .await
     .unwrap();
@@ -13116,4 +13119,113 @@ async fn a_sandbox_inherits_the_projects_pointer_checks() {
     );
     call_tool_json(&client, "delete_sandbox", json!({"sandbox_name": &sandbox})).await.unwrap();
     let _ = client.cancel().await;
+}
+
+/// A direct run_wp caps the goal list in its receipt past 200 goals, so the
+/// response stays readable, but check with detail "full" promises every goal and
+/// gets the stored body back: the cap is a run_wp response limit, not a change to
+/// what full means.
+#[tokio::test]
+async fn a_large_run_wp_receipt_is_capped_and_check_full_keeps_every_goal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut source = String::from("int f(int x)\n{\n");
+    for i in 0..210 {
+        source.push_str(&format!("    //@ assert x + {i} == {i} + x;\n"));
+    }
+    source.push_str("    return x;\n}\n");
+    let c_file = dir.path().join("many_goals.c");
+    std::fs::write(&c_file, source).unwrap();
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let full = call_tool_json(&client, "check", json!({
+        "files": [c_file.to_str().unwrap()],
+        "detail": "full",
+    }))
+    .await
+    .unwrap();
+    let direct = call_tool_json(&client, "run_wp", json!({})).await.unwrap();
+    let _ = client.cancel().await;
+
+    let kept = full["wp"]["proof_receipt"]["goals"].as_array().expect("check full keeps the wp receipt goals");
+    assert!(kept.len() > 200, "expected more than 200 goals, got {}", kept.len());
+    assert!(full["wp"]["proof_receipt"].get("goals_trimmed").is_none());
+    assert!(direct["proof_receipt"].get("goals").is_none(), "a direct run_wp past the cap drops the list");
+    assert!(direct["proof_receipt"]["goals_trimmed"]["count"].as_u64().unwrap() > 200);
+}
+
+/// The hash in a summary check is the way to hand its receipt on: the trimmed
+/// object cannot be passed back, but the sha256 it keeps names the full body the
+/// session stored, and store_function_conclusion accepts it.
+#[tokio::test]
+async fn a_summary_receipt_hash_is_accepted_as_evidence() {
+    let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let run = call_tool_json(&client, "check", json!({
+        "files": [c_file.to_str().unwrap()],
+        "timeout": 10,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(run["detail"], "summary");
+    assert_eq!(run["verdict"], "proved", "the fixture no longer proves clean: {run:?}");
+    let receipt = &run["proof_receipt"];
+    assert!(receipt.get("goals").is_none(), "a summary receipt carries no goal list");
+    let sha = receipt["sha256"].as_str().expect("a summary receipt keeps its hash").to_string();
+    let total = receipt["goals_trimmed"]["count"].as_u64().expect("trimmed count");
+    let valid = receipt["goals_trimmed"]["by_status"]["valid"].as_u64().unwrap_or(0);
+
+    let stored = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {
+                "total": total, "valid": valid,
+                "unknown": total - valid, "timeout": 0, "failed": 0
+            },
+            "proof_receipt_sha256": sha,
+        }),
+    )
+    .await;
+    let _ = client.cancel().await;
+    assert!(stored.is_ok(), "a summary check's hash must be accepted: {stored:?}");
+}
+
+
+/// A summary check returns the receipt without its goal list, and the full
+/// body stays reachable: by hash for the conclusion door, in place under
+/// detail "full". The receipt in the response used to be about 20 KB of the
+/// summary, repeated once more inside "wp".
+#[tokio::test]
+async fn summary_receipt_drops_goals_and_full_keeps_them() {
+    let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let summary = call_tool_json(&client, "check", json!({})).await.unwrap();
+    let full = call_tool_json(&client, "check", json!({"detail": "full"}))
+        .await
+        .unwrap();
+    let _ = client.cancel().await;
+
+    for pointer in ["/proof_receipt", "/wp/proof_receipt"] {
+        // "/wp/proof_receipt" is absent when WP did not run through run_wp, but
+        // the top-level receipt must exist or this test would pass vacuously.
+        let receipt = summary.pointer(pointer).filter(|r| r.is_object());
+        if pointer == "/proof_receipt" {
+            assert!(receipt.is_some(), "check produced no receipt: {summary}");
+        }
+        let Some(receipt) = receipt else {
+            continue;
+        };
+        assert!(receipt.get("goals").is_none(), "{pointer} kept its goals: {receipt}");
+        assert_eq!(
+            receipt["goals_trimmed"]["count"].as_u64().unwrap(),
+            summary["wp_goals"]["total"].as_u64().unwrap(),
+            "{pointer} count must match the goals the run produced"
+        );
+        assert!(receipt["sha256"].is_string(), "{pointer} lost the hash that names the stored body");
+    }
+    let kept = full["proof_receipt"]["goals"].as_array().expect("full keeps goals");
+    assert!(!kept.is_empty());
+    assert!(full["proof_receipt"].get("goals_trimmed").is_none());
 }

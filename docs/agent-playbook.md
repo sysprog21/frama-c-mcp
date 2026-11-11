@@ -64,6 +64,23 @@ entries that need attention. Read `incomplete[]` for the findings and
 `counts` for the shape; call again with `detail: "full"` only when you need
 every goal.
 
+A summary response trims the same detail from the rest of the payload. The
+`proof_receipt` (and the one inside `wp`) carries `goals_trimmed`, the goal
+count by status, instead of the goal list; its `sha256` still names the full
+body the session stored, so hand that to `store_function_conclusion` as
+`proof_receipt_sha256`. The session keeps the last 32 receipts and forgets them
+all on the next reload, which every `check` performs, so store the conclusion
+before the next `check`; after that, re-run with `detail: "full"`. A `VALID_UNDER_HYP` entry lists only the
+hypotheses that are not established and says how many it dropped in
+`hypotheses_established`. `incomplete[]` has the same entries, in the same
+order, in both modes. `reload_project` lists three stale markers in a summary
+and twenty under `detail: "full"`; `stale_markers_omitted` counts the rest.
+
+`check` and `run_wp` refuse a parameter they do not know, including inside
+`pinned` and `variants`, and name the offending field. A call that used to be
+accepted with a misspelled or unsupported setting, such as `timeout_seconds` or
+`rte` on `run_wp`, now fails instead of running under defaults.
+
 Each `incomplete[]` entry carries a `code`, and the codes are tabulated in
 [README.md](../README.md). The set is additive, so treat a code you do not
 recognise as a gap rather than as noise.
@@ -183,7 +200,7 @@ receipt runs to kilobytes, most of it a goal array, and a single altered field
 is rejected without saying which. Pass `proof_receipt_sha256` instead. The
 server resolves the hash against the receipt this process produced, so the
 same coherence check runs against the same bytes and nothing has to be
-transcribed. The same rule as `since` applies: only a run from this session can
+transcribed. `run_wp` trims its own receipt the same way once a run has more than 200 goals, so the hash is the only form that works there. The same rule as `since` applies: only a run from this session can
 be named, and an unknown hash is an error rather than a shrug.
 
 A goal that failed carries `failure_classification`. Most of it is that goal's

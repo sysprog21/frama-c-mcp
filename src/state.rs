@@ -27,6 +27,16 @@ pub fn proof_receipt_evidence_error(
 ) -> Option<String> {
     let schema = receipt.get("schema").and_then(|v| v.as_str());
     let shape = crate::mcp::server::receipt::schema_of(receipt);
+    // A summary check trims the goal list out of the receipt it returns, so the
+    // object in hand has neither the field shape nor the hash of the one stored.
+    // Say what to pass instead of blaming the caller for editing it.
+    if receipt.get("goals_trimmed").is_some() {
+        return Some(format!(
+            "proof_receipt came from a summary response, which drops the goal list the hash \
+             covers; {}",
+            crate::mcp::server::receipt::RECEIPT_RECOVERY_NOTE
+        ));
+    }
     let expected_shape = crate::mcp::server::receipt::receipt_shape();
     if schema != Some(RECEIPT_SCHEMA) || shape != expected_shape {
         return Some(format!(

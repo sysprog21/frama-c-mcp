@@ -3284,6 +3284,32 @@ pub fn wp_pending_task_count(tasks: &serde_json::Value) -> Option<u64> {
     Some(object.get("todo")?.as_u64()? + object.get("active")?.as_u64()?)
 }
 
+/// The budget for one scheduler poll: the usual GET budget, cut to what is left
+/// of the drain, so a retry started near the deadline cannot run past it. A
+/// small floor keeps the last poll from being asked with a zero timeout.
+pub fn drain_poll_budget(now: std::time::Instant, deadline: std::time::Instant) -> Duration {
+    deadline
+        .saturating_duration_since(now)
+        .clamp(Duration::from_millis(250), Duration::from_secs(10))
+}
+
+/// Past this many goals a direct run_wp response carries counts in place of
+/// the receipt's goal list. check with detail "full" restores the list.
+const RUN_WP_RECEIPT_GOAL_CAP: usize = 200;
+
+/// The reply for a drain whose final poll got no answer before the deadline.
+/// The pending count is null because it is unknown, not zero.
+pub fn drain_deadline_reply(budget: Duration) -> serde_json::Value {
+    json!({
+        "drained": false,
+        "left_running": {
+            "pending": null,
+            "waited_seconds": budget.as_secs(),
+            "note": "WP may still be proving. The scheduler did not answer its last poll before the wait ran out.",
+        },
+    })
+}
+
 /// Wait for WP's scheduler to go idle, then return its final state.
 ///
 /// `startProofs` returns once the goals are scheduled, not once they are
@@ -3299,10 +3325,38 @@ async fn drain_wp_tasks(
     let deadline = std::time::Instant::now() + budget;
     let mut backoff = Duration::from_millis(50);
     loop {
-        let mut tasks = client
-            .get("plugins.wp.getScheduledTasks", json!(null))
-            .await
-            .map_err(McpError::from)?;
+        // A poll that gets no reply inside the GET budget is not a failed run.
+        // Frama-C answers from one thread, and while a prover portfolio holds
+        // every core the answer can arrive late: on a 64-core host with three
+        // provers and 200 goals one such poll aborted a run whose proofs were
+        // all finishing, and check reported WP_NOT_RUN on a file it proves.
+        // The reply carries the poll's own id and is discarded when it lands, so
+        // asking again is safe; only the drain's deadline ends the wait.
+        let now = std::time::Instant::now();
+        let polled = client
+            .get_with_timeout(
+                "plugins.wp.getScheduledTasks",
+                json!(null),
+                drain_poll_budget(now, deadline),
+            )
+            .await;
+        let mut tasks = match polled {
+            Ok(tasks) => tasks,
+            // A timed-out poll is asked again until the deadline. One that
+            // times out at the deadline, having been cut to what the drain had
+            // left, hands the caller its turn back with drained false, as when
+            // pending stayed above zero, instead of an error that discards the
+            // run. A poisoned transport is a real failure, not a late reply.
+            Err(FramaCError::Timeout(_)) if !client.is_poisoned() => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(drain_deadline_reply(budget));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(500));
+                continue;
+            }
+            Err(error) => return Err(McpError::from(error)),
+        };
 
         // Not an object with both counters: nothing to wait on and nothing to
         // claim, so hand it back with `drained` absent.
@@ -3382,6 +3436,16 @@ impl FramaCMcpServer {
                 ast_digest: None,
             })
             .await;
+
+        // A large run's receipt is mostly its per-goal list: 110KB of a 126KB
+        // run_wp response at 853 goals, past what a client with a tool-result
+        // budget accepts, so the run could finish and its answer still be
+        // unreadable. check trims the same list in a summary. The session keeps
+        // the full body under the receipt's sha256, so only the response
+        // shrinks; small runs keep the list.
+        if wp_goals.len() > RUN_WP_RECEIPT_GOAL_CAP {
+            trim_receipt_goals(&mut response["proof_receipt"]);
+        }
         Ok(())
     }
 
@@ -4989,7 +5053,7 @@ pub mod propose;
 pub mod receipt;
 use receipt::{
     eva_config_absent, incomplete_digest, proof_receipt_goals, receipt_goal_is_progress,
-    ProofReceiptRequest,
+    trim_receipt_goals, ProofReceiptRequest,
 };
 
 #[path = "eacsl.rs"]

@@ -349,7 +349,15 @@ pub struct RunEAcslParams {
 // so a literal naming all nine carries no information, and adding one broke
 // every hand-written literal at once. Clone so the timeout retry can re-run
 // with one field changed and everything else the caller asked for left alone.
+// An unrecognized field is refused rather than dropped. check and run_wp carry
+// the settings a proof receipt is evidence under, and a misspelled timeout or
+// prover list (timeout_seconds for timeout, parallel for par) that is silently
+// ignored leaves the caller believing a run used a budget it never had. serde
+// names the offending field and lists the accepted ones. The same holds for the
+// structs nested in CheckParams: a pin spelled pred for predicate would
+// otherwise drop out and weaken what the verdict must contain.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunWpParams {
     /// Function name(s) to verify. If omitted, verifies all annotated
     /// functions.
@@ -358,7 +366,11 @@ pub struct RunWpParams {
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub functions: Option<Vec<String>>,
     /// SMT prover override. The default is Alt-Ergo, plus CVC5 and Z3 when
-    /// each is on PATH. Only set to restrict to a single prover if needed.
+    /// each is on PATH. Comma-separated names ("alt-ergo,z3,cvc5") form a
+    /// portfolio: WP tries each in turn on every goal, so a goal any one of
+    /// them closes is proved. Nonlinear and bit-operator goals often close
+    /// under one prover and time out under another, and no single prover
+    /// closed all of them in one RISC-V ALU proof.
     pub prover: Option<String>,
     /// Isolated retry prover list. When provided, each prover is run through a
     /// separate Frama-C CLI attempt so server WP settings are not mutated.
@@ -461,7 +473,9 @@ impl Detail {
 }
 
 /// One configuration in a `check {variants: [...]}` call.
+// Refuses unrecognized fields, for the reason given on RunWpParams.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CheckVariant {
     /// Name for this configuration in the result. Defaults to its index.
     pub label: Option<String>,
@@ -475,7 +489,9 @@ pub struct CheckVariant {
 }
 
 /// One property check must find, unchanged and proved. See CheckParams::pinned.
+// Refuses unrecognized fields, for the reason given on RunWpParams.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PinnedProperty {
     /// The ACSL predicate, without the clause keyword or the trailing ";".
     pub predicate: String,
@@ -486,7 +502,9 @@ pub struct PinnedProperty {
     pub kind: Option<String>,
 }
 
+// Refuses unrecognized fields, for the reason given on RunWpParams.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CheckParams {
     // The analysis tuning knobs below stay accepted but are hidden from the
     // generated schema: a first call needs a file and maybe a function, not

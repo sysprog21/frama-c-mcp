@@ -600,10 +600,19 @@ impl FramaCClient {
             {
                 all_entries.clear();
             }
-            if let Some(updated) = data.get("updated").and_then(|v| v.as_array()) {
-                all_entries.extend(updated.iter().cloned());
-            }
-            let pending = data.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
+            // A reply without an updated array and a pending count is not a
+            // page of the table. Reading it as an empty, finished one made a
+            // malformed answer look like a project with no properties, which
+            // is a verdict of "nothing assumed".
+            let (Some(updated), Some(pending)) = (
+                data.get("updated").and_then(|v| v.as_array()),
+                data.get("pending").and_then(|v| v.as_u64()),
+            ) else {
+                return Err(FramaCError::UnexpectedResponse(format!(
+                    "{request}: expected an object with an updated array and a pending count, got {data}"
+                )));
+            };
+            all_entries.extend(updated.iter().cloned());
             if pending == 0 {
                 break;
             }

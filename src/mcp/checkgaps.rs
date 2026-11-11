@@ -1458,9 +1458,9 @@ pub fn memory_model_unchecked_gap(
 
 /// Gaps carried by rows of the property table itself, which is where EVA
 /// alarms and every consolidated verdict live.
-fn property_row_gaps(
+fn property_row_gaps<'a>(
     incomplete: &mut Vec<serde_json::Value>,
-    eva_alarms: &serde_json::Value,
+    rows: impl IntoIterator<Item = &'a serde_json::Value>,
     wp_goals: &serde_json::Value,
 ) {
     // An undischarged runtime-error alarm is as much of a gap as a non-valid WP
@@ -1476,53 +1476,77 @@ fn property_row_gaps(
     // alarm_is_undischarged, so anything reported here also gets a recommended
     // next call. That excludes `noresult`, which is Frama-C's never_tried
     // rather than a failure.
-    if let Some(alarms) = eva_alarms.as_array() {
-        for alarm in alarms {
-            // Both findings describe the same property row, so they carry the
-            // same fields and only the code and reason differ.
-            let (code, reason) = if property_is_inconsistent(alarm) {
-                (
-                    incomplete_code::PROPERTY_INCONSISTENT,
-                    "Frama-C consolidated contradictory statuses for this property, so the verdict cannot be trusted in either direction.",
-                )
-            } else if alarm_is_undischarged(alarm) {
-                (
-                    incomplete_code::ALARM_NOT_VALID,
-                    "EVA reported a runtime-error alarm it could not discharge.",
-                )
-            } else if property_is_disproved_reachability(alarm) {
-                (
-                    incomplete_code::PROPERTY_DEAD,
-                    "EVA proved this code unreachable, so nothing proved about it constrains a run.",
-                )
-            } else if property_is_unproved_lemma(alarm, wp_goals) {
-                (
-                    incomplete_code::LEMMA_NOT_PROVED,
-                    "WP assumes every lemma while discharging other goals, so an undischarged one makes the proofs around it worthless.",
-                )
-            } else if property_is_disproved(alarm, wp_goals) {
-                (
-                    incomplete_code::PROPERTY_DISPROVED,
-                    "Frama-C disproved this property, and WP emits no goal for a property that already carries a status, so nothing downstream reports it.",
-                )
-            } else if property_is_assumed_valid(alarm) {
-                (
-                    incomplete_code::ASSUMED_VALID,
-                    "Frama-C recorded this property as valid by external assumption rather than by proof. WP uses it as a hypothesis everywhere without ever checking it.",
-                )
-            } else {
-                continue;
-            };
-            incomplete.push(json!({
-                "code": code,
-                "reason": reason,
-                "property": value_marker(alarm).map(|m| json!(m)).unwrap_or_else(|| json!(null)),
-                "descr": alarm.get("descr").cloned().unwrap_or_else(|| json!(null)),
-                "source_location": alarm.get("source_location").cloned().unwrap_or_else(|| json!(null)),
-                "status": property_normalized_status(alarm),
-            }));
-        }
+    for alarm in rows {
+        // Both findings describe the same property row, so they carry the
+        // same fields and only the code and reason differ.
+        let (code, reason) = if property_is_inconsistent(alarm) {
+            (
+                incomplete_code::PROPERTY_INCONSISTENT,
+                "Frama-C consolidated contradictory statuses for this property, so the verdict cannot be trusted in either direction.",
+            )
+        } else if alarm_is_undischarged(alarm) {
+            (
+                incomplete_code::ALARM_NOT_VALID,
+                "EVA reported a runtime-error alarm it could not discharge.",
+            )
+        } else if property_is_disproved_reachability(alarm) {
+            (
+                incomplete_code::PROPERTY_DEAD,
+                "EVA proved this code unreachable, so nothing proved about it constrains a run.",
+            )
+        } else if property_is_unproved_lemma(alarm, wp_goals) {
+            (
+                incomplete_code::LEMMA_NOT_PROVED,
+                "WP assumes every lemma while discharging other goals, so an undischarged one makes the proofs around it worthless.",
+            )
+        } else if property_is_disproved(alarm, wp_goals) {
+            (
+                incomplete_code::PROPERTY_DISPROVED,
+                "Frama-C disproved this property, and WP emits no goal for a property that already carries a status, so nothing downstream reports it.",
+            )
+        } else if property_is_assumed_valid(alarm) {
+            (
+                incomplete_code::ASSUMED_VALID,
+                "Frama-C recorded this property as valid by external assumption rather than by proof. WP uses it as a hypothesis everywhere without ever checking it.",
+            )
+        } else {
+            continue;
+        };
+        incomplete.push(json!({
+            "code": code,
+            "reason": reason,
+            "property": value_marker(alarm).map(|m| json!(m)).unwrap_or_else(|| json!(null)),
+            "descr": alarm.get("descr").cloned().unwrap_or_else(|| json!(null)),
+            "source_location": alarm.get("source_location").cloned().unwrap_or_else(|| json!(null)),
+            "status": property_normalized_status(alarm),
+        }));
     }
+}
+
+/// The trusted base of a run that did not request EVA.
+///
+/// check reads the property table only through eva_alarms, which is null
+/// when EVA was not requested, so want ["wp"] judged no axiom and no lemma at
+/// all: a file whose bridge between C bit operators and integer arithmetic
+/// was a set of axioms reported nothing in incomplete[] for them, while the same
+/// file checked with EVA reported each as ASSUMED_VALID. The table is a
+/// property of the loaded project, not of EVA, so every row that decides what
+/// WP is allowed to assume, or that carries a status WP will not revisit
+/// (disproved, inconsistent, an unproved lemma), is judged from it whichever
+/// analyses ran. Undischarged runtime-error rows are left out: the WP goal loop
+/// already reports those, and including them would count each one twice.
+pub fn unreviewed_assumption_gaps(
+    table: &serde_json::Value,
+    wp_goals: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let rows = table
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| property_is_inconsistent(row) || !alarm_is_undischarged(row));
+    let mut gaps = Vec::new();
+    property_row_gaps(&mut gaps, rows, wp_goals);
+    gaps
 }
 
 /// The guidance for the codes an incomplete[] actually carries, keyed by code.
@@ -1625,6 +1649,34 @@ fn proved_goal_gap(goal: &serde_json::Value, status: &str) -> Option<serde_json:
         }));
     }
     None
+}
+
+/// Shorten the hypotheses of every VALID_UNDER_HYP entry for a summary: drop the
+/// established ones (counted in hypotheses_established) and keep only the
+/// property and its status. Entries stay one per goal, because summary and full
+/// agree on incomplete[] and callers join on stable_goal_id. The receipt is built from the unshortened array first, and
+/// detail "full" never calls this.
+pub fn slim_valid_under_hyp(incomplete: &mut serde_json::Value) {
+    for entry in incomplete.as_array_mut().into_iter().flatten() {
+        if entry.get("code").and_then(|code| code.as_str()) != Some(incomplete_code::VALID_UNDER_HYP) {
+            continue;
+        }
+        let Some(hypotheses) = entry.get_mut("hypotheses").and_then(|value| value.as_array_mut()) else {
+            // No resolved list (null or absent): nothing was dropped, and the
+            // count is still said so the field is on every summary entry.
+            entry["hypotheses_established"] = serde_json::json!(0);
+            continue;
+        };
+        let before = hypotheses.len();
+        hypotheses.retain(|hypothesis| !check_goal_counts_as_progress(hypothesis));
+        let established = before - hypotheses.len();
+        for hypothesis in hypotheses.iter_mut().filter_map(|value| value.as_object_mut()) {
+            hypothesis.retain(|key, _| key == "property" || key == "normalized_status");
+        }
+        // Without the count, an empty list cannot say whether the goal had no
+        // hypotheses or all of them were established.
+        entry["hypotheses_established"] = serde_json::json!(established);
+    }
 }
 
 pub fn wp_goal_gaps<'a>(
@@ -2001,7 +2053,7 @@ pub fn check_incomplete_items(
         wp_goals,
         wanted,
     );
-    property_row_gaps(&mut incomplete, eva_alarms, wp_goals);
+    property_row_gaps(&mut incomplete, eva_alarms.as_array().into_iter().flatten(), wp_goals);
     let judged_goals = wp_goal_gaps(&mut incomplete, eva_alarms, wp_goals);
     proofread_finding_gaps(&mut incomplete, wp, &judged_goals);
     incomplete

@@ -573,7 +573,18 @@ impl From<FramaCError> for McpError {
             ),
             FramaCError::FunctionNotFound(name) => structured_invalid_params(
                 "FunctionNotFound",
-                format!("function not found: {name}"),
+                // Under the default -keep-unused-functions=specified, Frama-C
+                // drops an unused function that has no specification while
+                // parsing, so a static inline helper that nothing calls is
+                // absent from the project and looks exactly like a misspelled
+                // name. A load that kept unused functions does not drop it, so the
+                // text says "if" and tells the caller to check the spelling first.
+                format!(
+                    "function not found: {name}. Check the spelling; if it exists in the \
+                     source, nothing loaded calls it and it has no ACSL contract, Frama-C's \
+                     default -keep-unused-functions=specified discards it at parse time: give \
+                     it a contract or call it from a function in the loaded files"
+                ),
                 false,
                 None,
             ),

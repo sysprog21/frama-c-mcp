@@ -3937,3 +3937,24 @@ fn signature_parameters_survive_function_pointers_and_arrays() {
     let mutants: Vec<String> = contract_mutants("int f(int p[10], int n);", "f").into_iter().map(|(m, _)| m).collect();
     assert_eq!(mutants, ["empty", "return_n"], "an array is not a return candidate");
 }
+
+#[test]
+fn summary_receipt_trims_goals_but_keeps_the_hash() {
+    let mut receipt = json!({
+        "sha256": "abc",
+        "goals": [{"status": "valid"}, {"status": "valid"}, {"status": "timeout"}],
+    });
+    frama_c_mcp::mcp::server::receipt::trim_receipt_goals(&mut receipt);
+    assert!(receipt.get("goals").is_none());
+    assert_eq!(receipt["sha256"], "abc");
+    assert!(receipt["goals_trimmed"]["full_body"].as_str().unwrap().contains("proof_receipt_sha256"));
+    assert_eq!(receipt["goals_trimmed"]["count"], 3);
+    assert_eq!(receipt["goals_trimmed"]["by_status"]["valid"], 2);
+    assert_eq!(receipt["goals_trimmed"]["by_status"]["timeout"], 1);
+
+    // A value without a goal list, such as the null a skipped run leaves, is
+    // left alone.
+    let mut absent = json!(null);
+    frama_c_mcp::mcp::server::receipt::trim_receipt_goals(&mut absent);
+    assert!(absent.is_null());
+}
