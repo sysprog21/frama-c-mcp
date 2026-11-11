@@ -358,6 +358,7 @@ pub struct RunEAcslParams {
 // otherwise drop out and weaken what the verdict must contain.
 #[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("additionalProperties" = true))]
 pub struct RunWpParams {
     /// Function name(s) to verify. If omitted, verifies all annotated
     /// functions.
@@ -505,6 +506,7 @@ pub struct PinnedProperty {
 // Refuses unrecognized fields, for the reason given on RunWpParams.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("additionalProperties" = true))]
 pub struct CheckParams {
     // The analysis tuning knobs below stay accepted but are hidden from the
     // generated schema: a first call needs a file and maybe a function, not

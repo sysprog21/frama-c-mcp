@@ -65,9 +65,9 @@ entries that need attention. Read `incomplete[]` for the findings and
 every goal.
 
 A summary response trims the same detail from the rest of the payload. The
-`proof_receipt` (and the one inside `wp`) carries `goals_trimmed`, the goal
-count by status, instead of the goal list; its `sha256` still names the full
-body the session stored, so hand that to `store_function_conclusion` as
+`proof_receipt` (and the one inside `wp`) carries `goals_trimmed` (`count`,
+`by_status` and a `full_body` note on getting the goals back) instead of the
+goal list; its `sha256` still names the full body the session stored, so hand that to `store_function_conclusion` as
 `proof_receipt_sha256`. The session keeps the last 32 receipts and forgets them
 all on the next reload, which every `check` performs, so store the conclusion
 before the next `check`; after that, re-run with `detail: "full"`. A `VALID_UNDER_HYP` entry lists only the

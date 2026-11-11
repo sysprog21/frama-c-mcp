@@ -594,7 +594,7 @@ What worked on a RISC-V ALU (`tests/formal/rv32-alu.c` in rv32emu, 74 goals):
   define it recursively: that is an unchecked axiom too, and `check` lists it
   under `assumed_definitions`.
 - Give `pow2` of each constant shift amount as its own axiom. The recursive
-  definition is not unfolded 32 times by any prover.
+  definition cannot be used here, since it is an unchecked axiom too, and no prover unfolds a recursive one 32 times.
 - Write specs as floor division (`hi(p)`, `a * b / 2^32`) rather than
   `\exists l; ... == r * 2^32 + l`; the existential has no witness the provers
   can find.

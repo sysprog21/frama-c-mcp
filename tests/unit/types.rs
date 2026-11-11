@@ -152,3 +152,16 @@ fn nested_check_params_refuse_unknown_fields() {
     .to_string();
     assert!(variant.contains("define"), "{variant}");
 }
+
+/// The server refuses unknown parameters, but the hidden tuning knobs are
+/// still accepted, so the published schema must not forbid additional
+/// properties: a client that validates against it would reject calls the
+/// server takes.
+#[test]
+fn published_schemas_do_not_forbid_the_hidden_knobs() {
+    use frama_c_mcp::mcp::types::{CheckParams, RunWpParams};
+    for schema in [schemars::schema_for!(CheckParams), schemars::schema_for!(RunWpParams)] {
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_ne!(value.get("additionalProperties"), Some(&serde_json::json!(false)), "{value}");
+    }
+}

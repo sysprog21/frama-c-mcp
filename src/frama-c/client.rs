@@ -609,7 +609,7 @@ impl FramaCClient {
                 data.get("pending").and_then(|v| v.as_u64()),
             ) else {
                 return Err(FramaCError::UnexpectedResponse(format!(
-                    "{request}: expected an object with an updated array and a pending count, got {data}"
+                    "{request}: expected an object with an updated array and a pending count"
                 )));
             };
             all_entries.extend(updated.iter().cloned());
